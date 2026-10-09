@@ -38,7 +38,7 @@ impl canvas::Program<Message, Theme, iced_renderer::Renderer> for Knob {
         use iced_core::mouse::{Button, Event as M, ScrollDelta};
         match event {
             iced_core::Event::Mouse(M::ButtonPressed(Button::Left)) => {
-                let pos = cursor.position_in(bounds)?;
+                let pos = cursor.position_over(bounds)?;
                 let now = Instant::now();
                 let double = state
                     .last_click
@@ -207,28 +207,8 @@ pub fn knob<'a, P: Param>(
     crate::tip(body, crate::help::param(param.name()))
 }
 
-/// Mouse-wheel nudging for sliders: one notch = 2% of the range.
-fn wheel_step(ptr: ParamPtr, value: f32) -> impl Fn(iced_core::mouse::ScrollDelta) -> Message {
-    move |delta| {
-        let step = match delta {
-            iced_core::mouse::ScrollDelta::Lines { y, .. } => y,
-            iced_core::mouse::ScrollDelta::Pixels { y, .. } => y / 40.0,
-        };
-        Message::ParamJump(ptr, (value + step * 0.02).clamp(0.0, 1.0))
-    }
-}
-
-fn slider_core<'a>(ptr: ParamPtr, value: f32, width: f32) -> Element<'a> {
-    let slider = iced_widget::slider(0.0..=1.0f32, value, move |v| Message::ParamSet(ptr, v))
-        .step(0.001f32)
-        .on_release(Message::ParamEnd(ptr))
-        .style(theme::slider_style)
-        .width(Length::Fixed(width));
-    iced_widget::mouse_area(slider)
-        .on_right_press(Message::ParamReset(ptr))
-        .on_double_click(Message::ParamReset(ptr))
-        .on_scroll(wheel_step(ptr, value))
-        .into()
+fn slider_core<'a>(ptr: ParamPtr, value: f32, width: f32, mode: theme::Mode) -> Element<'a> {
+    super::slider::slider(ptr, value, mode, theme::ACCENT, width)
 }
 
 /// Horizontal slider row for a parameter: label, slider, value.
@@ -238,7 +218,7 @@ pub fn param_slider<'a, P: Param>(param: &'a P, mode: theme::Mode, width: f32) -
     let readout = param.normalized_value_to_string(value, true);
     let row = iced_widget::row![
         container(text(param.name()).size(14).color(t.text_dim)).width(Length::Fixed(130.0)),
-        slider_core(param.as_ptr(), value, width),
+        slider_core(param.as_ptr(), value, width, mode),
         container(text(readout).size(13)).width(Length::Fixed(80.0)),
     ]
     .spacing(12)
@@ -271,7 +251,7 @@ pub fn param_slider_compact<'a, P: Param>(
     let value = param.unmodulated_normalized_value();
     let readout = param.normalized_value_to_string(value, true);
     let row = iced_widget::row![
-        slider_core(param.as_ptr(), value, width),
+        slider_core(param.as_ptr(), value, width, mode),
         container(text(readout).size(12).color(t.text_dim)).width(Length::Fixed(64.0))
     ]
     .spacing(8)

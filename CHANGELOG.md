@@ -3,6 +3,19 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.2] - 2026-10-09
+
+### Fixed
+- Knobs did not follow a vertical drag (the start position was measured relative to the
+  knob, the drag position absolutely, so the first move slammed the value to the minimum).
+- Sliders could not be reset: iced's slider swallowed the press before the double-click or
+  right-click wrapper saw it. Sliders are now drawn by the app with the same drag, click,
+  wheel and reset behaviour as the knobs.
+- The virtual microphone is held at 100% volume. Session managers restored a remembered
+  level for it (one user's was at 16%), which made the processed voice nearly inaudible.
+- Recording applications are listed by their process name when the stream is only called
+  "WEBRTC VoiceEngine", so Discord and browsers show up as Discord, chrome, firefox.
+
 ## [0.2.1] - 2026-10-09
 
 ### Fixed

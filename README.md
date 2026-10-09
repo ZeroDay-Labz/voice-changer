@@ -84,8 +84,10 @@ desktop. The GPU build additionally needs Fedora's `onnxruntime-rocm` package.
 | **Mixer** | Input and output gain, auto level, limiter, noise suppression, voice-only gate, noise gate |
 | **Settings** | Microphone, hear-myself, close to tray, start minimized, autostart, hotkey, theme, log |
 
-Knobs: drag up or down, roll the mouse wheel, double-click or right-click to reset. Sliders
-take the wheel and reset the same way. Hover any control for a moment and it explains itself.
+Knobs: drag up or down, roll the mouse wheel, double-click or right-click to go back to the
+default. Sliders: drag or click anywhere on the rail, wheel, and the same double-click or
+right-click reset. Hover any control for a moment and it explains itself (the top bar is left
+alone; it speaks for itself).
 
 **Where the voice goes.** Any app can pick **Voice Changer Mic** in its own settings. The
 Mixer page's *Send the voice to* section does it for you: **Use as the microphone for
@@ -221,6 +223,16 @@ interface copes; USB headsets usually do not.
   (e.g. −20 dB) so more passes between words.
 - **No "Voice Changer Mic" in an app.** The node exists only while the app runs. Flatpak
   apps need PipeWire access (`--filesystem=xdg-run/pipewire-0`).
+- **The app runs, the meters move, but nobody hears the changed voice.** The other app is
+  still using your real microphone. Either pick **Voice Changer Mic** in that app's own input
+  settings, tick the app under Mixer → *Send the voice to*, or turn on *Use as the microphone
+  for everything* and leave the app on "Default". `wpctl status` shows which source each
+  recording stream is linked to.
+- **Changed voice is very quiet.** Older session managers remembered a low volume for the
+  virtual mic. Since 0.2.2 the app holds it at 100% itself; on older versions run
+  `wpctl set-volume <id of Voice Changer Mic> 1.0`.
+- **Importing a `.pth` fails with "No module named …".** Update to 0.2.1 or later; the
+  converter environment repairs itself on the next import.
 - **Global shortcut does nothing.** Your desktop may lack the GlobalShortcuts portal. Bind
   `voice-changer toggle` to a key in System Settings → Shortcuts → Custom instead.
 - **AI "error" or "loading" forever.** Settings → Log shows why. Common causes: base models

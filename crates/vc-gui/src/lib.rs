@@ -72,6 +72,8 @@ pub enum Message {
     Go(Page),
     /// Parameter gestures (normalized 0..1).
     ParamBegin(ParamPtr),
+    /// Begin a gesture and set the first value in one go (click on a slider).
+    ParamPress(ParamPtr, f32),
     ParamSet(ParamPtr, f32),
     ParamEnd(ParamPtr),
     ParamReset(ParamPtr),
@@ -379,6 +381,10 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
             model.refresh_cache(host);
         }
         Message::ParamBegin(ptr) => unsafe { host.gui().raw_begin_set_parameter(ptr) },
+        Message::ParamPress(ptr, v) => {
+            unsafe { host.gui().raw_begin_set_parameter(ptr) };
+            set_normalized(host, ptr, v);
+        }
         Message::ParamSet(ptr, v) => set_normalized(host, ptr, v),
         Message::ParamEnd(ptr) => unsafe { host.gui().raw_end_set_parameter(ptr) },
         Message::ParamReset(ptr) => {

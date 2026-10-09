@@ -624,6 +624,7 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
     let metadata: Rc<RefCell<Option<pw::metadata::Metadata>>> = Rc::new(RefCell::new(None));
     let metadata_listener: Rc<RefCell<Option<pw::metadata::MetadataListener>>> =
         Rc::new(RefCell::new(None));
+    let source_node: Rc<RefCell<Option<pw::node::Node>>> = Rc::new(RefCell::new(None));
     let source_name = config.source_name.clone();
     let _registry_listener = registry
         .add_listener_local()
@@ -633,6 +634,7 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
             let routing = routing.clone();
             let metadata = metadata.clone();
             let metadata_listener = metadata_listener.clone();
+            let source_node = source_node.clone();
             let registry = registry.downgrade();
             let source_name = source_name.clone();
             move |global| match global.type_ {
@@ -645,11 +647,21 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                         list.sort_by(|a, b| a.description.cmp(&b.description));
                     }
                     let props = global.props.as_ref();
-                    if props.and_then(|p| p.get("node.name")) == Some(source_name.as_str())
-                        && let Some(serial) = props.and_then(|p| p.get("object.serial"))
-                        && let Ok(mut r) = routing.lock()
-                    {
-                        r.source_serial = Some(serial.to_string());
+                    if props.and_then(|p| p.get("node.name")) == Some(source_name.as_str()) {
+                        if let Some(serial) = props.and_then(|p| p.get("object.serial"))
+                            && let Ok(mut r) = routing.lock()
+                        {
+                            r.source_serial = Some(serial.to_string());
+                        }
+                        if let Some(registry) = registry.upgrade() {
+                            match registry.bind::<pw::node::Node, _>(global) {
+                                Ok(node) => {
+                                    set_unity_volume(&node);
+                                    *source_node.borrow_mut() = Some(node);
+                                }
+                                Err(e) => log::warn!("could not bind the virtual mic node: {e}"),
+                            }
+                        }
                     }
                     if let Some(app) = app_stream_from_global(global)
                         && let Ok(mut list) = app_streams.lock()
@@ -827,10 +839,63 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
         std::mem::forget(timer);
     }
 
+    // Keep the virtual mic at unity. The session manager restores whatever
+    // level it remembered for our node (one user's was at 16%) a moment after
+    // the node appears, so set it on the node once it is bound (registry
+    // handler) and re-assert it now and then.
+    {
+        let source_node = source_node.clone();
+        let timer = mainloop.loop_().add_timer(move |_| {
+            if let Some(node) = source_node.borrow().as_ref() {
+                set_unity_volume(node);
+            }
+        });
+        let _ = timer.update_timer(
+            Some(std::time::Duration::from_millis(1500)),
+            Some(std::time::Duration::from_secs(5)),
+        );
+        std::mem::forget(timer);
+    }
+
     let _ = ready.send(Ok(()));
     mainloop.run();
     log::info!("PipeWire loop stopped");
     Ok(())
+}
+
+/// Set a node's volume to 100% (channel volumes, master volume, unmuted).
+fn set_unity_volume(node: &pw::node::Node) {
+    use spa::pod::{Object, Property, PropertyFlags, Value, ValueArray};
+    let props = Value::Object(Object {
+        type_: spa::sys::SPA_TYPE_OBJECT_Props,
+        id: spa::sys::SPA_PARAM_Props,
+        properties: vec![
+            Property {
+                key: spa::sys::SPA_PROP_volume,
+                flags: PropertyFlags::empty(),
+                value: Value::Float(1.0),
+            },
+            Property {
+                key: spa::sys::SPA_PROP_mute,
+                flags: PropertyFlags::empty(),
+                value: Value::Bool(false),
+            },
+            Property {
+                key: spa::sys::SPA_PROP_channelVolumes,
+                flags: PropertyFlags::empty(),
+                value: Value::ValueArray(ValueArray::Float(vec![1.0])),
+            },
+        ],
+    });
+    match spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &props) {
+        Ok((cursor, _)) => {
+            let bytes = cursor.into_inner();
+            if let Some(pod) = Pod::from_bytes(&bytes) {
+                node.set_param(spa::param::ParamType::Props, 0, pod);
+            }
+        }
+        Err(e) => log::debug!("could not build the volume pod: {e:?}"),
+    }
 }
 
 /// Serialize an `EnumFormat` pod for mono 32-bit float at `rate`.
@@ -872,9 +937,13 @@ fn app_stream_from_global(global: &GlobalObject<&spa::utils::dict::DictRef>) -> 
     {
         return None;
     }
+    // Electron apps (Discord, browsers) all call their stream "WEBRTC
+    // VoiceEngine"; the process name says which one it really is.
     let app = props
         .get("application.name")
+        .filter(|n| !n.starts_with("WEBRTC"))
         .or_else(|| props.get("application.process.binary"))
+        .or_else(|| props.get("application.name"))
         .unwrap_or(node_name)
         .to_string();
     if app.is_empty() {

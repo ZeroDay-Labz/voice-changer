@@ -33,11 +33,7 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
         .style(theme::power_button(on))
         .padding(crate::pad(12.0, 20.0, 12.0, 16.0))
         .on_press(Message::TogglePower),
-        if on {
-            crate::help::POWER_ON
-        } else {
-            crate::help::POWER_OFF
-        },
+        "",
     );
 
     let mut left = row![power].spacing(10).align_y(Alignment::Center);
@@ -65,7 +61,7 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
             })
             .padding([10, 14])
             .on_press(Message::ToggleMonitor),
-            crate::help::HEAR_MYSELF,
+            "",
         ));
     }
 
@@ -105,10 +101,10 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
         )
         .padding([6, 12])
         .style(theme::pill),
-        crate::help::PRESET_PILL,
+        "",
     ));
     if host.capabilities().microphone {
-        right = right.push(mic_picker(model, host, 200.0));
+        right = right.push(mic_picker(model, host, 200.0, false));
     }
 
     container(
@@ -154,7 +150,7 @@ fn meter_line<'a>(
                 .size(16)
                 .on_toggle(move |b| Message::ParamBool(ptr, b))
                 .style(theme::toggler_style),
-            crate::help::param("Auto Level"),
+            "",
         ));
     }
     r.into()
@@ -168,7 +164,12 @@ fn peak_db(level: f32) -> String {
     }
 }
 
-pub fn mic_picker<'a>(model: &'a Model, host: &'a dyn Host, width: f32) -> Element<'a> {
+pub fn mic_picker<'a>(
+    model: &'a Model,
+    host: &'a dyn Host,
+    width: f32,
+    with_help: bool,
+) -> Element<'a> {
     let max_chars = ((width - 40.0) / 7.0) as usize;
     let devices: Vec<(String, String)> = model
         .cache
@@ -203,7 +204,11 @@ pub fn mic_picker<'a>(model: &'a Model, host: &'a dyn Host, width: f32) -> Eleme
         ]
         .spacing(6)
         .align_y(Alignment::Center),
-        crate::help::MIC_PICKER,
+        if with_help {
+            crate::help::MIC_PICKER
+        } else {
+            ""
+        },
     )
 }
 

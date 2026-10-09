@@ -276,5 +276,6 @@ pub fn param_slider_compact<'a, P: Param>(
     ]
     .spacing(8)
     .align_y(iced_core::Alignment::Center);
-    crate::tip(row, crate::help::param(param.name()))
+    // Top-bar gains are self-explanatory: no hover help here.
+    row.into()
 }

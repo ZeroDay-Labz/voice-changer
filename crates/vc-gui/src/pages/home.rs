@@ -1,7 +1,9 @@
 //! Home: presets, quick tweaks and the AI voice card, laid out to fit one
 //! window without scrolling.
 
-use super::{badge, dim, section_accent, section_with};
+#[cfg(feature = "ai")]
+use super::badge;
+use super::{dim, section_accent, section_with};
 use crate::help;
 use crate::host::Host;
 use crate::theme::{self, Mode};

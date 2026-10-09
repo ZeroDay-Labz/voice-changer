@@ -42,7 +42,7 @@ fn audio<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> {
         col = col.push(labelled(
             "Microphone",
             mode,
-            super::topbar::mic_picker(model, host, 320.0),
+            super::topbar::mic_picker(model, host, 320.0, true),
         ));
     }
     if let Some(on) = host.monitor() {

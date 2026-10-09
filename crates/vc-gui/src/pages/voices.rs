@@ -23,8 +23,9 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
     #[cfg(not(feature = "ai"))]
     {
         let _ = model;
-        section(
+        section_accent(
             "AI voices",
+            theme::INDIGO,
             mode,
             dim("This build has no AI support.", 13, mode),
         )

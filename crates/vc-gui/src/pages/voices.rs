@@ -1,4 +1,3 @@
-#![cfg_attr(not(feature = "ai"), allow(unused_imports))]
 //! Voices: import, list, delete AI voice models.
 
 use super::{badge, dim, section_accent, section_with};

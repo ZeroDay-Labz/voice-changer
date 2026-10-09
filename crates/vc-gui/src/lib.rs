@@ -2,6 +2,8 @@
 //! serves the standalone app and the plugin editor; host-specific abilities
 //! (microphone list, monitor, settings…) come through the [`Host`] trait.
 
+#![cfg_attr(not(feature = "ai"), allow(unused))]
+
 pub mod help;
 pub mod host;
 pub mod pages;

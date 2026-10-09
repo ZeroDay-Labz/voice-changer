@@ -22,9 +22,10 @@ if [[ ! -x "$VENV/bin/python" ]]; then
     python3 -m venv "$VENV"
     "$VENV/bin/pip" install --quiet --upgrade pip
 fi
-"$VENV/bin/python" -c "import torch, onnx, numpy" 2>/dev/null || \
-    "$VENV/bin/pip" install --quiet torch --index-url https://download.pytorch.org/whl/cpu && \
-    "$VENV/bin/pip" install --quiet onnx numpy onnxscript
+if ! "$VENV/bin/python" -c "import torch, onnx, numpy, onnxscript, scipy" 2>/dev/null; then
+    "$VENV/bin/pip" install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+    "$VENV/bin/pip" install --quiet onnx numpy scipy onnxscript
+fi
 
 OUT="$VOICES/$(echo "$NAME" | tr -c 'A-Za-z0-9._\n-' '_').onnx"
 VC_TOOLS="$TOOLS" "$VENV/bin/python" "$HERE/rvc_export.py" "$(realpath "$PTH")" "$OUT"

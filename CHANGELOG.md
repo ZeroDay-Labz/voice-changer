@@ -3,6 +3,14 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] - 2026-10-09
+
+### Fixed
+- Importing a `.pth` voice failed on a fresh machine with "No module named 'scipy'": the
+  converter environment now installs scipy (RVC's model code imports it). Existing
+  environments pick it up automatically on the next import.
+- No hover help on the top bar; its controls explain themselves.
+
 ## [0.2.0] - 2026-10-09
 
 ### Added

@@ -515,7 +515,7 @@ fn ensure_converter(status: &ImportStatus) -> Result<PathBuf> {
         )?;
     }
     let probe = Command::new(&python)
-        .args(["-c", "import torch, onnx, numpy, onnxscript"])
+        .args(["-c", "import torch, onnx, numpy, onnxscript, scipy"])
         .output();
     if !probe.map(|o| o.status.success()).unwrap_or(false) {
         status.set(Stage::PreparingConverter);
@@ -537,7 +537,7 @@ fn ensure_converter(status: &ImportStatus) -> Result<PathBuf> {
         )?;
         run_logged(
             status,
-            Command::new(&pip).args(["install", "--quiet", "onnx", "numpy", "onnxscript"]),
+            Command::new(&pip).args(["install", "--quiet", "onnx", "numpy", "scipy", "onnxscript"]),
         )?;
     }
     Ok(python)

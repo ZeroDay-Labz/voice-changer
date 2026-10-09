@@ -1,0 +1,12 @@
+(
+    name: "Demon",
+    description: "Deep, gritty and huge. Pitch down, saturated, slow growl, cavernous.",
+    values: {
+        "pitch": -9.0, "formant": -5.0, "pitch_engine": 4.0,
+        "drive": 0.4,
+        "ring_mix": 0.25, "ring_freq": 35.0,
+        "echo_mix": 0.12, "echo_time": 90.0, "echo_fb": 0.3,
+        "rev_mix": 0.3, "rev_size": 0.85, "rev_damp": 0.35,
+        "eq_low": 5.0, "eq_mid": -2.0, "eq_high": -5.0, "gate_on": 1.0, "gate_thresh": -55.0, "limiter": 1.0,
+    },
+)

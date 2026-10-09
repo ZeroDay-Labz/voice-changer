@@ -1,0 +1,30 @@
+[package]
+name = "vc-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Voice Changer CLAP/VST3 plugin"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["gpu-rocm"]
+ai = ["vc-core/ai", "vc-gui/ai"]
+gpu-rocm = ["ai", "vc-core/gpu-rocm", "vc-gui/gpu-rocm"]
+vst3 = ["nice-plug/vst3"]
+# Panics if `process()` allocates (debug builds only). Used in CI/validation.
+assert_process_allocs = ["nice-plug/assert_process_allocs"]
+standalone = ["nice-plug/standalone"]
+
+[[bin]]
+name = "vc-plugin-standalone"
+path = "src/main.rs"
+required-features = ["standalone"]
+
+[dependencies]
+vc-dsp = { path = "../vc-dsp" }
+vc-core = { path = "../vc-core" }
+vc-gui = { path = "../vc-gui" }
+nice-plug = { workspace = true }
+nice-plug-iced = { workspace = true }

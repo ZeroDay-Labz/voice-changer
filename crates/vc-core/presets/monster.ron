@@ -1,0 +1,11 @@
+(
+    name: "Monster",
+    description: "Very low with a growl from slow ring modulation.",
+    values: {
+        "pitch": -10.0, "formant": -6.0, "pitch_engine": 4.0,
+        "drive": 0.0, "ring_mix": 0.35, "ring_freq": 25.0,
+        "echo_mix": 0.0,
+        "rev_mix": 0.2, "rev_size": 0.7, "rev_damp": 0.6,
+        "eq_low": 6.0, "eq_mid": 0.0, "eq_high": -6.0, "limiter": 1.0,
+    },
+)

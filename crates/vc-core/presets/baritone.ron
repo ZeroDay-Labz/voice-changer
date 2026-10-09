@@ -1,0 +1,11 @@
+(
+    name: "Baritone",
+    description: "Warm, deep speaking voice: a little lower, more chest, rounder top.",
+    values: {
+        "pitch": -3.0, "formant": -2.5, "pitch_engine": 4.0,
+        "drive": 0.06, "ring_mix": 0.0, "echo_mix": 0.0,
+        "rev_mix": 0.05, "rev_size": 0.35, "rev_damp": 0.7,
+        "eq_low": 4.0, "eq_mid": -1.5, "eq_high": -2.5,
+        "limiter": 1.0,
+    },
+)

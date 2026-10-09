@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Voice Changer
+GenericName=Voice Changer
+Comment=Realtime voice changer that shows up as a microphone
+Exec=voice-changer
+Icon=io.github.zerodaylabz.VoiceChanger
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=voice;changer;microphone;pitch;ai;rvc;discord;
+StartupWMClass=io.github.zerodaylabz.VoiceChanger

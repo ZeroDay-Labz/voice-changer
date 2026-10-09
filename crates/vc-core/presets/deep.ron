@@ -1,0 +1,9 @@
+(
+    name: "Deep",
+    description: "Lower, bigger voice. Pitch and formants both down.",
+    values: {
+        "pitch": -5.0, "formant": -2.5, "pitch_engine": 4.0,
+        "drive": 0.0, "ring_mix": 0.0, "echo_mix": 0.0, "rev_mix": 0.0,
+        "eq_low": 3.0, "eq_mid": 0.0, "eq_high": -2.0, "limiter": 1.0,
+    },
+)

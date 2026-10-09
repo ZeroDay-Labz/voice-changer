@@ -1,0 +1,9 @@
+(
+    name: "Natural",
+    description: "Everything neutral. A clean starting point.",
+    values: {
+        "pitch": 0.0, "formant": 0.0, "pitch_engine": 4.0,
+        "drive": 0.0, "ring_mix": 0.0, "echo_mix": 0.0, "rev_mix": 0.0,
+        "eq_low": 0.0, "eq_mid": 0.0, "eq_high": 0.0, "gate_on": 0.0, "limiter": 1.0,
+    },
+)

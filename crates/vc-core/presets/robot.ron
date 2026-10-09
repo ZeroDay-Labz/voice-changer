@@ -1,0 +1,11 @@
+(
+    name: "Robot",
+    description: "Ring-modulated metallic voice with a touch of echo.",
+    values: {
+        "pitch": -2.0, "formant": 0.0, "pitch_engine": 4.0,
+        "drive": 0.0, "ring_mix": 0.7, "ring_freq": 60.0,
+        "echo_mix": 0.15, "echo_time": 60.0, "echo_fb": 0.35,
+        "rev_mix": 0.0,
+        "eq_low": 0.0, "eq_mid": 3.0, "eq_high": 2.0, "limiter": 1.0,
+    },
+)

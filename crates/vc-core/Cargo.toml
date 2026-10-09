@@ -1,0 +1,53 @@
+[package]
+name = "vc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared non-realtime glue: parameters, presets, config, AI worker"
+
+[features]
+default = []
+ai = ["dep:ort", "dep:realfft", "dep:ureq", "dep:zip", "dep:serde_json", "ort/download-binaries", "ort/copy-dylibs"]
+# AMD GPU via the system ONNX Runtime ROCm build (Fedora: `sudo dnf install onnxruntime-rocm`).
+gpu-rocm = ["ai", "ort/rocm", "ort/load-dynamic", "dep:libloading"]
+
+[dev-dependencies]
+env_logger = { workspace = true }
+
+[dependencies]
+vc-dsp = { path = "../vc-dsp" }
+nice-plug = { workspace = true }
+serde = { workspace = true }
+ron = { workspace = true }
+directories = { workspace = true }
+rtrb = { workspace = true }
+arc-swap = { workspace = true }
+atomic_float = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+ort = { workspace = true, optional = true }
+libloading = { version = "0.8", optional = true }
+ureq = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+realfft = { workspace = true, optional = true }
+
+[[example]]
+name = "ai_bench"
+required-features = ["ai"]
+
+[[example]]
+name = "ai_stream"
+required-features = ["ai"]
+
+[[example]]
+name = "inspect_onnx"
+required-features = ["ai"]
+
+[[example]]
+name = "click_hunt"
+required-features = ["ai"]
+
+[[example]]
+name = "index_probe"
+required-features = ["ai"]

@@ -1,0 +1,101 @@
+[package]
+name = "vc-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Voice Changer standalone app: PipeWire virtual microphone, tray, hotkey"
+
+[[bin]]
+name = "voice-changer"
+path = "src/main.rs"
+
+[features]
+default = ["gpu-rocm"]
+ai = ["vc-core/ai", "vc-gui/ai"]
+gpu-rocm = ["ai", "vc-core/gpu-rocm", "vc-gui/gpu-rocm"]
+
+[dependencies]
+vc-dsp = { path = "../vc-dsp" }
+vc-core = { path = "../vc-core" }
+vc-gui = { path = "../vc-gui" }
+nice-plug = { workspace = true }
+pipewire = { workspace = true }
+libspa = { workspace = true }
+iced = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+directories = { workspace = true }
+rtrb = { workspace = true }
+ksni = { workspace = true }
+ashpd = { workspace = true }
+zbus = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+clap = { workspace = true }
+ctrlc = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+ron = { workspace = true }
+
+# `cargo generate-rpm -p crates/vc-app` (run from the repo root after
+# `cargo build --release -p vc-app` and `cargo xtask bundle vc-plugin --release`).
+# Shared-library requirements are discovered from the binary (ldd), so there is
+# no hand-maintained package list here.
+[package.metadata.generate-rpm]
+name = "voice-changer"
+summary = "Realtime voice changer with local AI voices, as a PipeWire microphone"
+license = "MIT"
+url = "https://github.com/ZeroDay-Labz/voice-changer"
+assets = [
+    { source = "target/release/voice-changer", dest = "/usr/bin/voice-changer", mode = "755" },
+    { source = "target/bundled/vc-plugin.clap", dest = "/usr/lib64/clap/vc-plugin.clap", mode = "755" },
+    { source = "target/onnxruntime/libonnxruntime.so*", dest = "/usr/lib64/voice-changer/", mode = "755" },
+    { source = "packaging/io.github.zerodaylabz.VoiceChanger.desktop", dest = "/usr/share/applications/io.github.zerodaylabz.VoiceChanger.desktop", mode = "644" },
+    { source = "packaging/io.github.zerodaylabz.VoiceChanger.metainfo.xml", dest = "/usr/share/metainfo/io.github.zerodaylabz.VoiceChanger.metainfo.xml", mode = "644" },
+    { source = "packaging/io.github.zerodaylabz.VoiceChanger.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.zerodaylabz.VoiceChanger.svg", mode = "644" },
+    { source = "packaging/icons/16.png", dest = "/usr/share/icons/hicolor/16x16/apps/io.github.zerodaylabz.VoiceChanger.png", mode = "644" },
+    { source = "packaging/icons/32.png", dest = "/usr/share/icons/hicolor/32x32/apps/io.github.zerodaylabz.VoiceChanger.png", mode = "644" },
+    { source = "packaging/icons/48.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.zerodaylabz.VoiceChanger.png", mode = "644" },
+    { source = "packaging/icons/64.png", dest = "/usr/share/icons/hicolor/64x64/apps/io.github.zerodaylabz.VoiceChanger.png", mode = "644" },
+    { source = "packaging/icons/128.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.zerodaylabz.VoiceChanger.png", mode = "644" },
+    { source = "packaging/icons/256.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.zerodaylabz.VoiceChanger.png", mode = "644" },
+    { source = "packaging/icons/512.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.zerodaylabz.VoiceChanger.png", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/voice-changer/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/voice-changer/LICENSE", mode = "644" },
+]
+
+# A ROCm-enabled ONNX Runtime makes the AI run on AMD GPUs; the bundled CPU
+# runtime in /usr/lib64/voice-changer is the fallback.
+[package.metadata.generate-rpm.recommends]
+onnxruntime-rocm = "*"
+
+# `cargo deb -p vc-app --no-build` (same prerequisites). cargo-deb resolves
+# non-`target/` paths relative to this crate's directory, hence the `../../`.
+[package.metadata.deb]
+name = "voice-changer"
+copyright = "2026, ZeroDay-Labz"
+license-file = ["../../LICENSE", "0"]
+section = "sound"
+priority = "optional"
+depends = "$auto"
+suggests = "python3"
+extended-description = """Realtime voice changer that shows up as a PipeWire microphone called
+"Voice Changer Mic". Natural pitch and formant shifting, effects, presets,
+and local AI voice conversion with RVC v2 models. Includes the CLAP plugin."""
+assets = [
+    ["target/release/voice-changer", "usr/bin/", "755"],
+    ["../../target/bundled/vc-plugin.clap", "usr/lib/clap/", "755"],
+    ["../../target/onnxruntime/libonnxruntime.so*", "usr/lib/voice-changer/", "755"],
+    ["../../packaging/io.github.zerodaylabz.VoiceChanger.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/io.github.zerodaylabz.VoiceChanger.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["../../packaging/io.github.zerodaylabz.VoiceChanger.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["../../packaging/icons/16.png", "usr/share/icons/hicolor/16x16/apps/io.github.zerodaylabz.VoiceChanger.png", "644"],
+    ["../../packaging/icons/32.png", "usr/share/icons/hicolor/32x32/apps/io.github.zerodaylabz.VoiceChanger.png", "644"],
+    ["../../packaging/icons/48.png", "usr/share/icons/hicolor/48x48/apps/io.github.zerodaylabz.VoiceChanger.png", "644"],
+    ["../../packaging/icons/64.png", "usr/share/icons/hicolor/64x64/apps/io.github.zerodaylabz.VoiceChanger.png", "644"],
+    ["../../packaging/icons/128.png", "usr/share/icons/hicolor/128x128/apps/io.github.zerodaylabz.VoiceChanger.png", "644"],
+    ["../../packaging/icons/256.png", "usr/share/icons/hicolor/256x256/apps/io.github.zerodaylabz.VoiceChanger.png", "644"],
+    ["../../packaging/icons/512.png", "usr/share/icons/hicolor/512x512/apps/io.github.zerodaylabz.VoiceChanger.png", "644"],
+    ["../../README.md", "usr/share/doc/voice-changer/", "644"],
+]

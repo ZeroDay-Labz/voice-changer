@@ -1,0 +1,21 @@
+[package]
+name = "vc-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "iced user interface shared by the standalone app and the plugin editor"
+
+[features]
+default = []
+ai = ["vc-core/ai"]
+gpu-rocm = ["ai", "vc-core/gpu-rocm"]
+
+[dependencies]
+vc-core = { path = "../vc-core" }
+vc-dsp = { path = "../vc-dsp" }
+nice-plug = { workspace = true }
+iced_widget = { workspace = true }
+iced_core = { workspace = true }
+iced_renderer = { workspace = true }
+iced_runtime = { workspace = true }
+log = { workspace = true }

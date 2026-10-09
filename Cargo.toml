@@ -1,0 +1,74 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+default-members = ["crates/vc-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/echo/voice_changer"
+
+[workspace.dependencies]
+# plugin framework (maintained nih-plug fork)
+nice-plug = { version = "0.4.2", default-features = false, features = ["editor", "tracing-subscriber"] }
+nice-plug-xtask = "0.1.1"
+# ui
+iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "svg", "image", "tokio", "advanced", "canvas", "fira-sans", "linux-theme-detection", "wayland", "x11"] }
+iced_widget = { version = "0.14", features = ["svg", "image", "canvas", "advanced"] }
+iced_core = "0.14"
+iced_renderer = { version = "0.14", features = ["wgpu", "tiny-skia", "svg", "image", "wayland", "x11"] }
+iced_runtime = "0.14"
+nice-plug-iced = "0.4.1"
+# audio i/o
+pipewire = { version = "0.10.1", features = ["v0_3_77"] }
+libspa = "0.10.1"
+# dsp
+signalsmith-stretch = "0.1.3"
+realfft = "3.5"
+nnnoiseless = { version = "0.5.2", default-features = false }
+rubato = "5.0"
+# rt-safe plumbing
+rtrb = "0.4"
+arc-swap = "1"
+atomic_float = "1"
+# config / presets
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
+directories = "6"
+# desktop integration
+ksni = "0.3.6"
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "global_shortcuts"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# misc
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+# model library (downloads/conversion), feature-gated with ai
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+serde_json = "1"
+# ai (phase 2, feature-gated)
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "tls-native", "api-22"] }
+ctrlc = { version = "3", features = ["termination"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# Audio DSP in an unoptimized build can't keep up with small buffers, so
+# `cargo run` (dev profile) is optimized too; debug info is kept.
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"

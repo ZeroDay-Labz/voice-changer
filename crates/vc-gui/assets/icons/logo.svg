@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#34c796"/>
+      <stop offset="0.55" stop-color="#157a66"/>
+      <stop offset="1" stop-color="#0b3a33"/>
+    </linearGradient>
+    <linearGradient id="wave2" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7fe0c0"/>
+      <stop offset="1" stop-color="#e6fff7"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="url(#bg)"/>
+  <rect x="6" y="6" width="116" height="116" rx="24" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="2"/>
+  <!-- half theatre mask (left half of a face, smooth and modern) -->
+  <path fill="#ffffff"
+        d="M29,40 C29,30 36,24 46,24 L58,24 C64,24 68,28 68,34 L68,60 C68,78 58,92 43,98 C38,100 33,99 30,95 C28,92 28,88 28,84 L28,46 C28,44 28,42 29,40 Z"/>
+  <!-- eye -->
+  <ellipse cx="48" cy="46" rx="9" ry="3.2" fill="url(#bg)"/>
+  <!-- smile -->
+  <path d="M38,74 C44,81 54,82 61,76" fill="none" stroke="url(#bg)" stroke-width="3.5" stroke-linecap="round"/>
+  <!-- twin interleaved waves flowing right from the mouth -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path stroke="#ffffff" stroke-width="5"
+          d="M64,78 C70,78 72,56 78,56 C84,56 86,100 92,100 C98,100 100,64 106,64 C110,64 112,78 116,78"/>
+    <path stroke="url(#wave2)" stroke-width="5"
+          d="M64,78 C70,78 72,98 78,98 C84,98 86,58 92,58 C98,58 100,92 106,92 C110,92 112,78 116,78"/>
+  </g>
+  <circle cx="103" cy="33" r="5.5" fill="#e6fff7"/>
+</svg>

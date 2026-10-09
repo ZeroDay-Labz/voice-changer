@@ -1,0 +1,11 @@
+(
+    name: "Cave",
+    description: "Big reverb and a slow echo.",
+    values: {
+        "pitch": -1.0, "formant": 0.0, "pitch_engine": 4.0,
+        "drive": 0.0, "ring_mix": 0.0,
+        "echo_mix": 0.3, "echo_time": 420.0, "echo_fb": 0.45,
+        "rev_mix": 0.45, "rev_size": 0.9, "rev_damp": 0.3,
+        "eq_low": 2.0, "eq_mid": -2.0, "eq_high": -4.0, "limiter": 1.0,
+    },
+)

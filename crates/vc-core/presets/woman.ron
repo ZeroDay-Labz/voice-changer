@@ -1,0 +1,9 @@
+(
+    name: "Woman",
+    description: "Feminine voice: pitch and vocal tract up, a little brighter.",
+    values: {
+        "pitch": 6.0, "formant": 2.5, "pitch_engine": 4.0,
+        "drive": 0.0, "ring_mix": 0.0, "echo_mix": 0.0, "rev_mix": 0.0,
+        "eq_low": -2.0, "eq_mid": 0.5, "eq_high": 1.5, "limiter": 1.0,
+    },
+)

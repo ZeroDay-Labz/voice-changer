@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.zerodaylabz.VoiceChanger</id>
+  <name>Voice Changer</name>
+  <summary>Realtime voice changer that shows up as a microphone</summary>
+  <developer id="io.github.zerodaylabz">
+    <name>ZeroDay-Labz</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      Voice Changer processes your microphone in real time and publishes the result as a
+      new PipeWire microphone called "Voice Changer Mic", so Discord, SIP clients, OBS and
+      anything else can simply select it. The same engine also loads as a CLAP plugin in DAWs.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Natural pitch and formant shifting (pitch-synchronous, the technique hardware voice transformers use) plus phase-vocoder modes</li>
+      <li>Drive, robot, echo, reverb and tone effects with ready-made voices: Man, Woman, Baritone, Bass, Deep, Demon, Monster, Chipmunk, Robot, Radio, Cave, Announcer</li>
+      <li>Local AI voice conversion with RVC v2 models, including retrieval indices, on the CPU or an AMD GPU</li>
+      <li>Neural noise suppression and a voice-only gate before everything else</li>
+      <li>One big on/off switch: window, tray icon, global shortcut or the command line</li>
+      <li>Hear-myself monitoring, presets, favourites, and a voice library that imports from a pasted link</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.zerodaylabz.VoiceChanger.desktop</launchable>
+  <url type="homepage">https://github.com/ZeroDay-Labz/voice-changer</url>
+  <url type="bugtracker">https://github.com/ZeroDay-Labz/voice-changer/issues</url>
+  <url type="vcs-browser">https://github.com/ZeroDay-Labz/voice-changer</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Home: presets, quick tweaks and the AI voice card</caption>
+      <image>https://raw.githubusercontent.com/ZeroDay-Labz/voice-changer/main/docs/screenshots/home.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Voices: import and manage AI voice models</caption>
+      <image>https://raw.githubusercontent.com/ZeroDay-Labz/voice-changer/main/docs/screenshots/voices.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Effects: pitch engine and effect panels</caption>
+      <image>https://raw.githubusercontent.com/ZeroDay-Labz/voice-changer/main/docs/screenshots/effects.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Settings: microphone, window behaviour, hotkey and logs</caption>
+      <image>https://raw.githubusercontent.com/ZeroDay-Labz/voice-changer/main/docs/screenshots/settings.png</image>
+    </screenshot>
+  </screenshots>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+  </categories>
+  <keywords>
+    <keyword>voice</keyword>
+    <keyword>microphone</keyword>
+    <keyword>pitch</keyword>
+    <keyword>ai</keyword>
+    <keyword>rvc</keyword>
+  </keywords>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-10-08">
+      <description>
+        <p>First release: natural pitch engine, effects, presets, AI voices with retrieval index, GPU support, iced interface, tray, hotkey, D-Bus and CLI.</p>
+      </description>
+    </release>
+  </releases>
+</component>

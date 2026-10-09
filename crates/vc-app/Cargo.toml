@@ -10,9 +10,10 @@ name = "voice-changer"
 path = "src/main.rs"
 
 [features]
-default = ["gpu-rocm"]
+default = ["gpu"]
 ai = ["vc-core/ai", "vc-gui/ai"]
-gpu-rocm = ["ai", "vc-core/gpu-rocm", "vc-gui/gpu-rocm"]
+gpu = ["ai", "vc-core/gpu", "vc-gui/gpu"]
+gpu-rocm = ["gpu"]
 
 [dependencies]
 vc-dsp = { path = "../vc-dsp" }

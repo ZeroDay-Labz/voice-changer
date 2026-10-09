@@ -161,7 +161,7 @@ pub struct Cache {
     pub voices_dir: String,
     /// (setting key, label) for the compute picker.
     pub compute_options: Vec<(String, String)>,
-    pub gpu_note: Option<&'static str>,
+    pub gpu_note: Option<String>,
     pub runtime: Option<String>,
 }
 
@@ -227,29 +227,26 @@ impl Model {
                     "auto".to_string(),
                     match compute::resolve("auto") {
                         compute::Backend::Cpu => "Auto (CPU)".to_string(),
-                        compute::Backend::Rocm { device } => format!("Auto (GPU {device})"),
+                        compute::Backend::Rocm { device } | compute::Backend::Cuda { device } => {
+                            format!("Auto (GPU {device})")
+                        }
                     },
                 ),
                 ("cpu".to_string(), "CPU".to_string()),
             ];
             for g in &gpus {
+                let backend = if g.api == "CUDA" {
+                    compute::Backend::Cuda { device: g.index }
+                } else {
+                    compute::Backend::Rocm { device: g.index }
+                };
                 opts.push((
-                    compute::setting_string(Some(compute::Backend::Rocm { device: g.index })),
-                    format!("GPU {} · {}", g.index, g.name),
+                    compute::setting_string(Some(backend)),
+                    format!("GPU {} · {} ({})", g.index, g.name, g.api),
                 ));
             }
             self.cache.compute_options = opts;
-            self.cache.gpu_note = if gpus.is_empty() {
-                Some(if compute::gpu_runtime_available() {
-                    "No GPU detected by ROCm."
-                } else if cfg!(feature = "gpu-rocm") {
-                    "Install onnxruntime-rocm to use an AMD GPU."
-                } else {
-                    "GPU support needs the gpu-rocm build."
-                })
-            } else {
-                None
-            };
+            self.cache.gpu_note = compute::gpu_note();
         }
     }
 

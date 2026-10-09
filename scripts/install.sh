@@ -26,6 +26,10 @@ done
 cargo build --release -p vc-app "${FEATURES[@]}"
 cargo xtask bundle vc-plugin --release
 
+if [[ ${#FEATURES[@]} -eq 0 ]] && command -v nvidia-smi >/dev/null 2>&1 && ! ls "$HOME/.local/lib/voice-changer/cuda/libonnxruntime.so"* >/dev/null 2>&1; then
+    echo "NVIDIA GPU found; fetching the CUDA build of ONNX Runtime"
+    scripts/get-onnxruntime.sh --cuda
+fi
 if [[ ${#FEATURES[@]} -eq 0 ]] && ! ls /usr/lib64/rocm/lib/libonnxruntime.so* /opt/rocm/lib/libonnxruntime.so* \
         /usr/lib64/libonnxruntime.so* /usr/lib/x86_64-linux-gnu/libonnxruntime.so* \
         "$HOME/.local/lib/voice-changer/libonnxruntime.so"* >/dev/null 2>&1; then

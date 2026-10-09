@@ -60,6 +60,9 @@ pick a microphone can use it. There is nothing to configure in PulseAudio or JAC
 | **Flatpak** | Coming. A draft manifest lives in `packaging/flatpak/`. |
 | **From source** | See [Building](#building). `scripts/install.sh` builds and installs everything for your user. |
 
+AMD GPUs work out of the box with the `onnxruntime-rocm` package; NVIDIA GPUs after
+`scripts/get-onnxruntime.sh --cuda` (see [Compute](#compute-cpu-or-gpu)).
+
 The packages install the app, the CLAP plugin (`/usr/lib64/clap/` or `/usr/lib/clap/`), a
 launcher and the icon. AI voice models are downloaded separately (see [AI voices](#ai-voices)).
 
@@ -178,10 +181,17 @@ The app loads ONNX Runtime at start and uses whichever it finds first:
 | Runtime | Where it comes from | Result |
 |---|---|---|
 | ROCm build | Fedora: `sudo dnf install onnxruntime-rocm` (or `ORT_DYLIB_PATH`) | AMD GPUs appear under Compute |
+| CUDA build | `scripts/get-onnxruntime.sh --cuda` (needs NVIDIA's driver, CUDA 12 runtime and cuDNN 9) | NVIDIA GPUs appear under Compute |
 | CPU build | bundled with the packages, `scripts/get-onnxruntime.sh`, or the distribution's `onnxruntime` | CPU only |
 
-Settings → Audio shows which library is loaded. The first load of a voice on the GPU compiles
-kernels, which takes tens of seconds and is cached in `~/.cache/miopen`.
+Settings → Audio shows which library is loaded. The first load of a voice on an AMD GPU
+compiles kernels, which takes tens of seconds and is cached in `~/.cache/miopen`.
+
+NVIDIA in short: install the driver and CUDA (Fedora: RPM Fusion's `xorg-x11-drv-nvidia-cuda`
+plus `cuda-toolkit-12` and `cudnn9` from NVIDIA's repository; Ubuntu: `nvidia-driver-5xx`,
+`cuda-toolkit-12-x`, `cudnn9-cuda-12`), run `scripts/get-onnxruntime.sh --cuda`, start the app
+and pick the GPU under Compute (Auto chooses it). The same binary serves AMD, NVIDIA and
+CPU-only machines.
 
 ## Plugin
 
@@ -262,8 +272,8 @@ Rust 1.88 or newer. `cargo test --workspace` runs the DSP and index tests;
 - Mono, 48 kHz internally; multichannel plugin inputs are folded to mono and fanned out.
 - The D-Bus interface is `org.voicechanger.Control` on the session bus; the CLI is a thin
   client for it.
-- ONNX Runtime upstream dropped its ROCm build; the GPU feature loads the distribution's
-  `onnxruntime-rocm` library at runtime instead.
+- ONNX Runtime upstream dropped its ROCm build; the app loads the distribution's
+  `onnxruntime-rocm` library at runtime instead, and Microsoft's CUDA build for NVIDIA.
 - Screenshots in this README are rendered by the app itself:
   `voice-changer --screenshot docs/screenshots/home.png --page home`.
 

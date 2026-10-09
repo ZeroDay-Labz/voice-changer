@@ -8,7 +8,8 @@ description = "iced user interface shared by the standalone app and the plugin e
 [features]
 default = []
 ai = ["vc-core/ai"]
-gpu-rocm = ["ai", "vc-core/gpu-rocm"]
+gpu = ["ai", "vc-core/gpu"]
+gpu-rocm = ["gpu"]
 
 [dependencies]
 vc-core = { path = "../vc-core" }

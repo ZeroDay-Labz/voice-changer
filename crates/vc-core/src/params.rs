@@ -5,7 +5,7 @@ use vc_dsp::{EngineParams, PitchMode};
 
 /// Whether the AI runs on a GPU build (affects how much context is affordable).
 fn vc_dsp_gpu_hint() -> bool {
-    cfg!(feature = "gpu-rocm")
+    cfg!(feature = "gpu")
 }
 
 /// Host-visible mirror of [`PitchMode`] (nice-plug needs its own `Enum` derive).

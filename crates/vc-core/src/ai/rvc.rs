@@ -99,10 +99,10 @@ pub struct Rvc {
 
 /// Name of the accelerator this build defaults to, for the UI.
 pub fn backend_name() -> &'static str {
-    if super::compute::gpu_runtime_available() {
-        "ROCm GPU"
-    } else {
-        "CPU"
+    match super::compute::runtime_kind() {
+        super::compute::RuntimeKind::Cuda => "CUDA GPU",
+        super::compute::RuntimeKind::Rocm => "ROCm GPU",
+        super::compute::RuntimeKind::Cpu => "CPU",
     }
 }
 
@@ -110,13 +110,15 @@ pub fn backend_name() -> &'static str {
 /// ROCm provider by their *unversioned* names next to its own library,
 /// but Fedora only installs versioned files. Build a directory of symlinks
 /// with the expected names and load the runtime from there.
-#[cfg(feature = "gpu-rocm")]
-fn rocm_runtime_path() -> Option<std::path::PathBuf> {
-    // No ROCm runtime installed: use a CPU library (next to the executable,
-    // the package's lib dir, or the distribution's), so one binary serves
-    // machines with and without a GPU.
-    let Some(rocm_lib) = super::compute::rocm_runtime_lib() else {
-        return super::compute::cpu_runtime_lib();
+#[cfg(feature = "gpu")]
+fn runtime_path() -> Option<std::path::PathBuf> {
+    use super::compute::RuntimeKind;
+    let (lib, kind) = super::compute::runtime_lib()?;
+    // CUDA (Microsoft's tarball) and the CPU library already sit next to
+    // their provider libraries; only Fedora's ROCm layout needs the symlinks.
+    let rocm_lib = match kind {
+        RuntimeKind::Rocm => lib,
+        RuntimeKind::Cuda | RuntimeKind::Cpu => return Some(lib),
     };
     let system = rocm_lib
         .parent()
@@ -141,15 +143,15 @@ fn rocm_runtime_path() -> Option<std::path::PathBuf> {
     Some(dir.join("libonnxruntime.so"))
 }
 
-#[cfg(feature = "gpu-rocm")]
+#[cfg(feature = "gpu")]
 static RUNTIME_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Load the dynamic runtime once; `Ok` when sessions can be created.
-#[cfg(feature = "gpu-rocm")]
+#[cfg(feature = "gpu")]
 fn init_runtime() -> Result<()> {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let Some(path) = rocm_runtime_path() else {
+        let Some(path) = runtime_path() else {
             log::error!("no ONNX Runtime library found (install onnxruntime or onnxruntime-rocm, or set ORT_DYLIB_PATH)");
             return;
         };
@@ -188,10 +190,58 @@ fn init_runtime() -> Result<()> {
     }
 }
 
+/// Register the CUDA execution provider (Microsoft's GPU build of ONNX
+/// Runtime) through the classic C API, mirroring `append_rocm`.
+#[cfg(feature = "gpu")]
+fn append_cuda(builder: &ort::session::builder::SessionBuilder, device: i32) -> Result<()> {
+    use ort::AsPointer;
+    use ort::sys;
+    let api = ort::api();
+    unsafe fn check(api: &sys::OrtApi, status: sys::OrtStatusPtr) -> Result<()> {
+        let raw = status.0;
+        if raw.is_null() {
+            return Ok(());
+        }
+        // SAFETY: a non-null status is a valid OrtStatus owned by us.
+        let msg = unsafe { std::ffi::CStr::from_ptr((api.GetErrorMessage)(raw)) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { (api.ReleaseStatus)(raw) };
+        Err(anyhow!("CUDA execution provider: {msg}"))
+    }
+    // SAFETY: plain C API calls on a live session-options object; the
+    // provider options are created and released here.
+    unsafe {
+        let mut opts: *mut sys::OrtCUDAProviderOptionsV2 = std::ptr::null_mut();
+        check(api, (api.CreateCUDAProviderOptions)(&mut opts))?;
+        let device_s = std::ffi::CString::new(device.to_string()).unwrap_or_default();
+        let keys = [
+            c"device_id".as_ptr(),
+            c"cudnn_conv_algo_search".as_ptr(),
+            c"do_copy_in_default_stream".as_ptr(),
+        ];
+        let vals = [device_s.as_ptr(), c"EXHAUSTIVE".as_ptr(), c"1".as_ptr()];
+        let result = check(
+            api,
+            (api.UpdateCUDAProviderOptions)(opts, keys.as_ptr(), vals.as_ptr(), keys.len()),
+        )
+        .and_then(|_| {
+            check(
+                api,
+                (api.SessionOptionsAppendExecutionProvider_CUDA_V2)(builder.ptr().cast_mut(), opts),
+            )
+        });
+        (api.ReleaseCUDAProviderOptions)(opts);
+        result?;
+    }
+    log::info!("CUDA execution provider registered for device {device}");
+    Ok(())
+}
+
 /// Register the ROCm execution provider through the classic C API entry
 /// point. The ort crate's own registration goes through ONNX Runtime's
 /// newer plugin-device API, which the 1.22 ROCm build aborts on.
-#[cfg(feature = "gpu-rocm")]
+#[cfg(feature = "gpu")]
 fn append_rocm(builder: &ort::session::builder::SessionBuilder, device: i32) -> Result<()> {
     use ort::AsPointer;
     use ort::sys;
@@ -265,9 +315,9 @@ impl Rvc {
         threads: usize,
         backend: super::compute::Backend,
     ) -> Result<Self> {
-        #[cfg(feature = "gpu-rocm")]
+        #[cfg(feature = "gpu")]
         init_runtime()?;
-        #[cfg(not(feature = "gpu-rocm"))]
+        #[cfg(not(feature = "gpu"))]
         let _ = backend;
         let make_builder = || -> Result<ort::session::builder::SessionBuilder> {
             Session::builder()
@@ -279,15 +329,29 @@ impl Rvc {
         };
         let open = |p: &PathBuf| -> Result<Session> {
             let mut builder = make_builder()?;
-            #[cfg(feature = "gpu-rocm")]
-            if let super::compute::Backend::Rocm { device } = backend
-                && super::compute::gpu_runtime_available()
-                && let Err(e) = append_rocm(&builder, device)
+            #[cfg(feature = "gpu")]
             {
-                // A failed registration leaves the options object unusable
-                // (ONNX Runtime 1.22 aborts on it), so start over on the CPU.
-                log::warn!("{e}; this session will run on the CPU");
-                builder = make_builder()?;
+                use super::compute::{Backend, RuntimeKind};
+                let registered = match (backend, super::compute::runtime_kind()) {
+                    (Backend::Rocm { device }, RuntimeKind::Rocm) => {
+                        Some(append_rocm(&builder, device))
+                    }
+                    (Backend::Cuda { device }, RuntimeKind::Cuda) => {
+                        Some(append_cuda(&builder, device))
+                    }
+                    (Backend::Cpu, _) => None,
+                    (b, k) => Some(Err(anyhow!(
+                        "{} requested but the loaded ONNX Runtime is {:?}",
+                        b.api(),
+                        k
+                    ))),
+                };
+                if let Some(Err(e)) = registered {
+                    // A failed registration leaves the options object unusable
+                    // (ONNX Runtime 1.22 aborts on it), so start over on the CPU.
+                    log::warn!("{e}; this session will run on the CPU");
+                    builder = make_builder()?;
+                }
             }
             builder
                 .commit_from_file(p)
@@ -313,7 +377,7 @@ impl Rvc {
                         rmvpe: rmvpe.clone(),
                     });
                     // ROCm sessions must not be torn down (see `stream::discard`).
-                    if cfg!(feature = "gpu-rocm") {
+                    if cfg!(feature = "gpu") {
                         std::mem::forget(old);
                     }
                     log::info!(

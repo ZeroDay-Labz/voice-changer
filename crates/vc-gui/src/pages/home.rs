@@ -366,8 +366,8 @@ fn ai_card<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> 
     ]
     .spacing(8)
     .width(Length::Fixed(400.0));
-    if let Some(n) = model.cache.gpu_note {
-        right = right.push(dim(n, 11, mode));
+    if let Some(n) = &model.cache.gpu_note {
+        right = right.push(dim(n.clone(), 11, mode));
     }
 
     // Status line.

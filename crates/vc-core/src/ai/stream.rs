@@ -222,11 +222,7 @@ fn ms_to_samples(ms: f32, sr: usize) -> usize {
 }
 
 /// Audio before the new block that the pitch model and synthesizer also see.
-const SYNTH_CONTEXT_MS: f32 = if cfg!(feature = "gpu-rocm") {
-    500.0
-} else {
-    200.0
-};
+const SYNTH_CONTEXT_MS: f32 = if cfg!(feature = "gpu") { 500.0 } else { 200.0 };
 /// Blocks after a (re)configuration during which timing is not judged:
 /// GPU kernels compile for the new shapes and the first blocks are slow.
 const SETTLE_BLOCKS: u32 = 4;
@@ -559,9 +555,9 @@ fn worker_loop(
 /// corrupts the heap inside ONNX Runtime 1.22, so GPU builds leak them
 /// instead (a voice switch costs its model size in GPU memory).
 fn release(loaded: Option<Loaded>) {
-    #[cfg(feature = "gpu-rocm")]
+    #[cfg(feature = "gpu")]
     std::mem::forget(loaded);
-    #[cfg(not(feature = "gpu-rocm"))]
+    #[cfg(not(feature = "gpu"))]
     drop(loaded);
 }
 

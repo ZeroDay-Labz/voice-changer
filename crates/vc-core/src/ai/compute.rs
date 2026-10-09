@@ -7,7 +7,7 @@ use std::path::PathBuf;
 pub struct GpuInfo {
     pub index: i32,
     pub name: String,
-    /// "ROCm" for now; CUDA/DirectML can slot in later.
+    /// "ROCm" or "CUDA".
     pub api: &'static str,
 }
 
@@ -15,30 +15,59 @@ pub struct GpuInfo {
 pub enum Backend {
     Cpu,
     Rocm { device: i32 },
+    Cuda { device: i32 },
 }
 
 impl Backend {
     pub fn label(self, gpus: &[GpuInfo]) -> String {
         match self {
             Backend::Cpu => "CPU".into(),
-            Backend::Rocm { device } => gpus
+            Backend::Rocm { device } | Backend::Cuda { device } => gpus
                 .iter()
                 .find(|g| g.index == device)
                 .map(|g| format!("GPU {} ({})", g.index, g.name))
-                .unwrap_or_else(|| format!("GPU {device} (ROCm)")),
+                .unwrap_or_else(|| format!("GPU {device} ({})", self.api())),
+        }
+    }
+
+    pub fn api(self) -> &'static str {
+        match self {
+            Backend::Cpu => "CPU",
+            Backend::Rocm { .. } => "ROCm",
+            Backend::Cuda { .. } => "CUDA",
+        }
+    }
+
+    pub fn device(self) -> Option<i32> {
+        match self {
+            Backend::Cpu => None,
+            Backend::Rocm { device } | Backend::Cuda { device } => Some(device),
         }
     }
 }
 
-/// The setting string stored in the parameters: "auto", "cpu", "rocm:N".
+/// Which ONNX Runtime library a dynamic build loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeKind {
+    Cpu,
+    Rocm,
+    Cuda,
+}
+
+/// The setting string stored in the parameters: "auto", "cpu", "rocm:N", "cuda:N".
 pub fn parse_setting(s: &str) -> Option<Backend> {
     match s.trim() {
         "" | "auto" => None,
         "cpu" => Some(Backend::Cpu),
-        other => other
-            .strip_prefix("rocm:")
-            .and_then(|n| n.parse().ok())
-            .map(|device| Backend::Rocm { device }),
+        other => {
+            if let Some(n) = other.strip_prefix("rocm:") {
+                n.parse().ok().map(|device| Backend::Rocm { device })
+            } else if let Some(n) = other.strip_prefix("cuda:") {
+                n.parse().ok().map(|device| Backend::Cuda { device })
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -47,7 +76,59 @@ pub fn setting_string(b: Option<Backend>) -> String {
         None => "auto".into(),
         Some(Backend::Cpu) => "cpu".into(),
         Some(Backend::Rocm { device }) => format!("rocm:{device}"),
+        Some(Backend::Cuda { device }) => format!("cuda:{device}"),
     }
+}
+
+/// NVIDIA GPUs as reported by `nvidia-smi` (present whenever the driver is). Cached.
+pub fn nvidia_gpus() -> Vec<GpuInfo> {
+    static CACHE: std::sync::OnceLock<Vec<GpuInfo>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let Ok(out) = std::process::Command::new("nvidia-smi")
+                .args(["--query-gpu=name", "--format=csv,noheader"])
+                .output()
+            else {
+                return Vec::new();
+            };
+            if !out.status.success() {
+                return Vec::new();
+            }
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .enumerate()
+                .map(|(i, name)| GpuInfo {
+                    index: i as i32,
+                    name: name.to_string(),
+                    api: "CUDA",
+                })
+                .collect()
+        })
+        .clone()
+}
+
+/// Microsoft's CUDA build of ONNX Runtime, installed by
+/// `scripts/get-onnxruntime.sh --cuda` (override with ORT_CUDA_DYLIB_PATH).
+pub fn cuda_runtime_lib() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ORT_CUDA_DYLIB_PATH") {
+        let p = PathBuf::from(p);
+        return p.is_file().then_some(p);
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        dirs.push(exe_dir.join("cuda"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".local/lib/voice-changer/cuda"));
+    }
+    dirs.push("/usr/lib64/voice-changer/cuda".into());
+    dirs.push("/usr/lib/voice-changer/cuda".into());
+    dirs.iter().find_map(|d| newest_lib(d))
 }
 
 /// Fedora's `onnxruntime-rocm` install location (override with ORT_DYLIB_PATH).
@@ -77,10 +158,9 @@ pub fn rocm_runtime_lib() -> Option<PathBuf> {
     None
 }
 
-/// Whether this build can use a GPU at all (ROCm-capable runtime present). Cached.
+/// Whether this build can use a GPU at all (a ROCm or CUDA runtime is loaded).
 pub fn gpu_runtime_available() -> bool {
-    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| cfg!(feature = "gpu-rocm") && rocm_runtime_lib().is_some())
+    cfg!(feature = "gpu") && runtime_kind() != RuntimeKind::Cpu
 }
 
 fn newest_lib(dir: &std::path::Path) -> Option<PathBuf> {
@@ -120,33 +200,69 @@ pub fn cpu_runtime_lib() -> Option<PathBuf> {
     dirs.iter().find_map(|d| newest_lib(d))
 }
 
-/// The runtime library a dynamic build will load and whether it is the ROCm one.
-pub fn runtime_lib() -> Option<(PathBuf, bool)> {
-    if let Some(p) = rocm_runtime_lib() {
-        return Some((p, true));
-    }
-    cpu_runtime_lib().map(|p| (p, false))
+/// The runtime library a dynamic build will load: CUDA when an NVIDIA card
+/// and the CUDA runtime are both present, else ROCm, else CPU. Cached.
+pub fn runtime_lib() -> Option<(PathBuf, RuntimeKind)> {
+    static CACHE: std::sync::OnceLock<Option<(PathBuf, RuntimeKind)>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            if !nvidia_gpus().is_empty()
+                && let Some(p) = cuda_runtime_lib()
+            {
+                return Some((p, RuntimeKind::Cuda));
+            }
+            if let Some(p) = rocm_runtime_lib() {
+                return Some((p, RuntimeKind::Rocm));
+            }
+            cpu_runtime_lib().map(|p| (p, RuntimeKind::Cpu))
+        })
+        .clone()
+}
+
+pub fn runtime_kind() -> RuntimeKind {
+    runtime_lib().map(|(_, k)| k).unwrap_or(RuntimeKind::Cpu)
 }
 
 /// One line for the Settings page: which ONNX Runtime is in use.
 pub fn runtime_description() -> String {
-    if !cfg!(feature = "gpu-rocm") {
+    if !cfg!(feature = "gpu") {
         return "ONNX Runtime built in (CPU)".to_string();
     }
     match runtime_lib() {
-        Some((p, true)) => format!("ONNX Runtime with ROCm: {}", p.display()),
-        Some((p, false)) => format!("ONNX Runtime (CPU): {}", p.display()),
+        Some((p, RuntimeKind::Cuda)) => format!("ONNX Runtime with CUDA: {}", p.display()),
+        Some((p, RuntimeKind::Rocm)) => format!("ONNX Runtime with ROCm: {}", p.display()),
+        Some((p, RuntimeKind::Cpu)) => format!("ONNX Runtime (CPU): {}", p.display()),
         None => "ONNX Runtime not found: install onnxruntime or onnxruntime-rocm".to_string(),
     }
 }
 
-/// GPUs visible to ROCm, via `rocminfo` (no HIP linkage needed). Cached.
+/// Why no GPU is offered, for the Compute picker. `None` when GPUs are listed.
+pub fn gpu_note() -> Option<String> {
+    if !gpus().is_empty() {
+        return None;
+    }
+    if !cfg!(feature = "gpu") {
+        return Some("GPU support needs the gpu build.".into());
+    }
+    if !nvidia_gpus().is_empty() {
+        return Some("NVIDIA GPU found. Run scripts/get-onnxruntime.sh --cuda (needs the CUDA 12 runtime and cuDNN 9), then restart.".into());
+    }
+    if rocm_runtime_lib().is_some() {
+        return Some("No GPU detected by ROCm.".into());
+    }
+    Some("AMD: install onnxruntime-rocm. NVIDIA: run scripts/get-onnxruntime.sh --cuda.".into())
+}
+
+/// GPUs the loaded runtime can use: NVIDIA via `nvidia-smi` with the CUDA
+/// runtime, AMD via `rocminfo` with the ROCm runtime. Cached.
 pub fn gpus() -> Vec<GpuInfo> {
     static CACHE: std::sync::OnceLock<Vec<GpuInfo>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
-            if !gpu_runtime_available() {
-                return Vec::new();
+            match runtime_kind() {
+                RuntimeKind::Cuda => return nvidia_gpus(),
+                RuntimeKind::Cpu => return Vec::new(),
+                RuntimeKind::Rocm => {}
             }
             let Ok(out) = std::process::Command::new("rocminfo").output() else {
                 return Vec::new();
@@ -214,14 +330,10 @@ pub fn gpus() -> Vec<GpuInfo> {
 pub fn resolve(setting: &str) -> Backend {
     match parse_setting(setting) {
         Some(b) => b,
-        None => {
-            if gpu_runtime_available() && !gpus().is_empty() {
-                Backend::Rocm {
-                    device: gpus()[0].index,
-                }
-            } else {
-                Backend::Cpu
-            }
-        }
+        None => match (runtime_kind(), gpus().first()) {
+            (RuntimeKind::Cuda, Some(g)) => Backend::Cuda { device: g.index },
+            (RuntimeKind::Rocm, Some(g)) => Backend::Rocm { device: g.index },
+            _ => Backend::Cpu,
+        },
     }
 }

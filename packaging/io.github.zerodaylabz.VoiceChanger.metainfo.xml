@@ -63,6 +63,11 @@
   </supports>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.2.0" date="2026-10-09">
+      <description>
+        <p>NVIDIA GPU support through ONNX Runtime's CUDA provider; the gpu feature now covers ROCm and CUDA.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-08">
       <description>
         <p>First release: natural pitch engine, effects, presets, AI voices with retrieval index, GPU support, iced interface, tray, hotkey, D-Bus and CLI.</p>

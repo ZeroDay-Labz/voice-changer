@@ -3,6 +3,17 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] - 2026-10-09
+
+### Added
+- NVIDIA GPU support. The same binary now registers ONNX Runtime's CUDA provider when
+  an NVIDIA card and Microsoft's CUDA runtime (`scripts/get-onnxruntime.sh --cuda`) are
+  present; the Compute picker lists the card as `GPU n · name (CUDA)` and Auto picks it.
+  Built and reviewed on an AMD machine; please report how it behaves on yours.
+
+### Changed
+- The Cargo feature is now `gpu` (covering ROCm and CUDA); `gpu-rocm` remains as an alias.
+
 ## [0.1.0] - 2026-10-08
 
 First public release.

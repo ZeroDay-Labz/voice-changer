@@ -521,9 +521,9 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                 if data.to_source.push(s).is_err() {
                     data.stats.trimmed_frames.fetch_add(1, Ordering::Relaxed);
                 }
-                if monitor {
-                    let _ = data.to_monitor.push(s);
-                }
+                // Feed the always-on monitor stream the processed voice when
+                // "Hear myself" is on, otherwise silence.
+                let _ = data.to_monitor.push(if monitor { s } else { 0.0 });
             }
         })
         .register()
@@ -607,14 +607,15 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
         )
         .context("connect output stream")?;
     let mut mon_params = [Pod::from_bytes(&format).ok_or_else(|| anyhow!("bad format pod"))?];
+    // The monitor plays to the default output and is always streaming; the
+    // `monitor_on` flag decides whether it carries the processed voice or
+    // silence. (Activating a parked AUTOCONNECT stream at runtime leaves its
+    // link stuck in `init`, so "Hear myself" never actually started.)
     monitor
         .connect(
             spa::utils::Direction::Output,
             None,
-            StreamFlags::AUTOCONNECT
-                | StreamFlags::MAP_BUFFERS
-                | StreamFlags::RT_PROCESS
-                | StreamFlags::INACTIVE,
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
             &mut mon_params,
         )
         .context("connect monitor stream")?;
@@ -740,6 +741,7 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
         let monitor = monitor.clone();
         let routing = routing.clone();
         let source_name = source_name.clone();
+        let capture_target = capture_target.clone();
         move |cmd| match cmd {
             Command::Quit => {
                 // Give the previous default microphone back before leaving.
@@ -783,7 +785,31 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                 }
             }
             Command::SetDefaultSource(on) => {
-                set_default_source(metadata.borrow().as_ref(), &routing, &source_name, on)
+                // Our own capture follows the system default source. If we
+                // become the default while it still follows, WirePlumber
+                // routes our capture onto our own output -- a feedback loop
+                // that silences the real microphone (and therefore Discord,
+                // routed apps and hear-myself). Pin the capture to a real
+                // microphone first; on the way out, restore the user's choice.
+                if on {
+                    let real = real_default_source(&routing, &devices, &source_name);
+                    retarget_capture(
+                        &capture,
+                        metadata.borrow().as_ref(),
+                        &devices,
+                        real.as_deref(),
+                    );
+                    set_default_source(metadata.borrow().as_ref(), &routing, &source_name, true);
+                } else {
+                    set_default_source(metadata.borrow().as_ref(), &routing, &source_name, false);
+                    let want = capture_target.lock().ok().and_then(|t| t.clone());
+                    retarget_capture(
+                        &capture,
+                        metadata.borrow().as_ref(),
+                        &devices,
+                        want.as_deref(),
+                    );
+                }
             }
             Command::SetCaptureTarget(target) => {
                 retarget_capture(
@@ -794,11 +820,11 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                 );
             }
             Command::SetMonitor(on) => {
-                if let Err(e) = monitor.set_active(on) {
-                    log::warn!("monitor set_active({on}) failed: {e}");
-                } else {
-                    log::info!("monitor {}", if on { "on" } else { "off" });
-                }
+                // The audio is gated by the `monitor_on` flag in the capture
+                // callback (already set by the caller); the stream itself
+                // stays connected so the link is reliably active.
+                let _ = &monitor;
+                log::info!("monitor {}", if on { "on" } else { "off" });
             }
         }
     });
@@ -956,6 +982,40 @@ fn app_stream_from_global(global: &GlobalObject<&spa::utils::dict::DictRef>) -> 
         media: props.get("media.name").unwrap_or("").to_string(),
         routed: false,
     })
+}
+
+/// Extract the `name` field from a `{"name":"..."}` metadata value.
+fn json_name(json: &str) -> Option<String> {
+    let after = &json[json.find("\"name\"")? + 6..];
+    let start = after.find('"')? + 1;
+    let rest = &after[start..];
+    Some(rest[..rest.find('"')?].to_string())
+}
+
+/// The real default microphone (what apps follow), never our own source.
+/// Used to pin our capture so making ourselves the default cannot loop.
+fn real_default_source(
+    routing: &Mutex<Routing>,
+    devices: &Mutex<Vec<DeviceInfo>>,
+    source_name: &str,
+) -> Option<String> {
+    if let Ok(r) = routing.lock() {
+        for json in [r.default_current.as_deref(), r.default_prev.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(name) = json_name(json)
+                && name != source_name
+                && !name.starts_with("voice_changer")
+            {
+                return Some(name);
+            }
+        }
+    }
+    devices
+        .lock()
+        .ok()
+        .and_then(|d| d.first().map(|x| x.name.clone()))
 }
 
 /// Make (or stop making) our source the session default microphone through

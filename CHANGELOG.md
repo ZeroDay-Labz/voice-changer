@@ -3,6 +3,19 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.3] - 2026-10-09
+
+### Fixed
+- **"Use as the microphone for everything" cut audio to every app** (Discord, routed
+  streams, hear-myself all went silent). Our own capture stream follows the system default
+  source, so making ourselves the default made WirePlumber route our capture onto our own
+  output -- a feedback loop that dropped the real microphone. The capture is now pinned to a
+  real microphone whenever we become the default, and restored when we stop.
+- **"Hear myself" produced no sound.** The monitor stream was parked (connected inactive and
+  auto-linked); activating it at runtime left the link stuck, so it never played. The monitor
+  now stays connected and streaming, and the toggle gates the processed voice against silence,
+  so it starts instantly.
+
 ## [0.2.2] - 2026-10-09
 
 ### Fixed

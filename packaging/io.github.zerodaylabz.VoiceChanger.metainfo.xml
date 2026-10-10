@@ -63,6 +63,11 @@
   </supports>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.2.5" date="2026-10-10">
+      <description>
+        <p>Fixes the AI voice muting your microphone while it warms up or drops a block, keeps the voice effects working during warm-up, and makes "Replace my microphone everywhere" move every recording app.</p>
+      </description>
+    </release>
     <release version="0.2.4" date="2026-10-10">
       <description>
         <p>The virtual microphone now works with PulseAudio apps (Discord, browsers, OBS); it is a proper driver node instead of a pw_stream source.</p>

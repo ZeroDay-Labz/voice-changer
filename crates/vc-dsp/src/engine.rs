@@ -190,14 +190,14 @@ impl Engine {
 
     /// Process one mono block in place. Realtime-safe: no allocation, no locks.
     pub fn process(&mut self, buf: &mut [f32]) {
-        self.process_with(buf, |_| {});
+        self.process_with(buf, |_| false);
     }
 
     /// Like [`Self::process`], but runs `between` on the cleaned-up input
     /// (after gain, noise suppression, leveling and gating) and before the
     /// voice/effects chain. Hosts insert AI conversion there so the model
     /// gets clean speech and its output still passes through the effects.
-    pub fn process_with(&mut self, buf: &mut [f32], mut between: impl FnMut(&mut [f32])) {
+    pub fn process_with(&mut self, buf: &mut [f32], mut between: impl FnMut(&mut [f32]) -> bool) {
         self.in_peak = buf.iter().fold(0.0f32, |m, x| m.max(x.abs()));
         // Larger blocks than promised are processed in slices rather than
         // allocating; this keeps the realtime guarantee intact.
@@ -211,7 +211,7 @@ impl Engine {
         self.out_peak = buf.iter().fold(0.0f32, |m, x| m.max(x.abs()));
     }
 
-    fn process_chunk(&mut self, buf: &mut [f32], between: &mut impl FnMut(&mut [f32])) {
+    fn process_chunk(&mut self, buf: &mut [f32], between: &mut impl FnMut(&mut [f32]) -> bool) {
         let n = buf.len();
         let dry = &mut self.scratch[..n];
 
@@ -235,8 +235,10 @@ impl Engine {
         if self.params.gate_enabled {
             self.gate.process(buf);
         }
-        between(buf);
-        if !self.params.skip_voice_fx {
+        // Only hand the voice entirely to the AI when it really produced this
+        // block; while it warms up the normal voice effects still apply.
+        let converted = between(buf);
+        if !(self.params.skip_voice_fx && converted) {
             self.pitch.process(buf);
             self.drive.process(buf);
             self.ring.process(buf);

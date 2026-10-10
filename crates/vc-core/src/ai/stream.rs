@@ -53,6 +53,9 @@ pub struct AiStatus {
     state: AtomicU8,
     /// Whether the loaded voice has a retrieval index.
     pub has_index: AtomicBool,
+    /// The model is loaded but not yet producing; the live voice is passing
+    /// through in the meantime.
+    pub warming: AtomicBool,
     pub message: Mutex<String>,
     pub infer_ms: AtomicF32,
     pub block_ms: AtomicF32,
@@ -95,7 +98,13 @@ pub struct AiStage {
     seen_latency: usize,
     primed: bool,
     was_active: bool,
+    /// 0 = live voice, 1 = fully converted. Ramped so handing over to and
+    /// from the model does not click.
+    fade: f32,
 }
+
+/// ~20 ms at 48 kHz for the AI/live-voice handover.
+const AI_FADE_SAMPLES: f32 = 960.0;
 
 impl AiStage {
     pub fn status(&self) -> Arc<AiStatus> {
@@ -124,11 +133,15 @@ impl AiStage {
         changed
     }
 
-    /// Replace `buf` with converted audio. Returns false (buffer untouched)
-    /// when AI is not active.
+    /// Mix converted audio into `buf`. Returns true only when the model
+    /// actually replaced the audio. While it is warming up, or when it has
+    /// dropped a block, the live voice already in `buf` is left alone -- the
+    /// microphone must never go silent just because the AI is not ready.
     pub fn process(&mut self, buf: &mut [f32]) -> bool {
         if !self.is_active() {
             self.primed = false;
+            self.fade = 0.0;
+            self.status.warming.store(false, Ordering::Relaxed);
             while self.output.pop().is_ok() {}
             return false;
         }
@@ -139,19 +152,33 @@ impl AiStage {
             if self.output.slots() >= self.latency_samples() {
                 self.primed = true;
             } else {
-                buf.fill(0.0);
-                return true;
+                // Still filling the model's first window.
+                self.status.warming.store(true, Ordering::Relaxed);
+                self.ease_out(buf.len());
+                return false;
             }
         }
-        if self.output.slots() >= buf.len() {
-            for x in buf.iter_mut() {
-                *x = self.output.pop().unwrap_or(0.0);
-            }
-        } else {
-            buf.fill(0.0);
+        if self.output.slots() < buf.len() {
+            // The worker fell behind; keep this block of the live voice.
             self.status.dropouts.fetch_add(1, Ordering::Relaxed);
+            self.status.warming.store(true, Ordering::Relaxed);
+            self.ease_out(buf.len());
+            return false;
+        }
+        self.status.warming.store(false, Ordering::Relaxed);
+        let step = 1.0 / AI_FADE_SAMPLES;
+        for x in buf.iter_mut() {
+            let converted = self.output.pop().unwrap_or(0.0);
+            self.fade = (self.fade + step).min(1.0);
+            let (w_ai, w_live) = (self.fade * core::f32::consts::FRAC_PI_2).sin_cos();
+            *x = converted * w_ai + *x * w_live;
         }
         true
+    }
+
+    /// Let the converted voice recede so the next handover fades back in.
+    fn ease_out(&mut self, frames: usize) {
+        self.fade = (self.fade - frames as f32 / AI_FADE_SAMPLES).max(0.0);
     }
 }
 
@@ -197,6 +224,7 @@ impl AiWorker {
             seen_latency: 0,
             primed: false,
             was_active: false,
+            fade: 0.0,
         };
         let thread = std::thread::Builder::new()
             .name("ai-worker".into())

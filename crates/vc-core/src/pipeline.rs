@@ -84,9 +84,7 @@ impl Pipeline {
         #[cfg(feature = "ai")]
         {
             let ai = &mut self.ai;
-            self.engine.process_with(buf, |b| {
-                ai.process(b);
-            });
+            self.engine.process_with(buf, |b| ai.process(b));
         }
         #[cfg(not(feature = "ai"))]
         self.engine.process(buf);

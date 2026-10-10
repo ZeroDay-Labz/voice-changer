@@ -308,6 +308,21 @@ impl VcParams {
         }
     }
 
+    /// True when nothing in the voice chain would audibly change the sound
+    /// (so the UI can explain why turning it on seems to do nothing).
+    pub fn voice_is_neutral(&self) -> bool {
+        const EPS: f32 = 1e-3;
+        self.pitch.value().abs() < EPS
+            && self.formant.value().abs() < EPS
+            && self.drive.value().abs() < EPS
+            && self.ring_mix.value().abs() < EPS
+            && self.echo_mix.value().abs() < EPS
+            && self.reverb_mix.value().abs() < EPS
+            && self.eq_low.value().abs() < EPS
+            && self.eq_mid.value().abs() < EPS
+            && self.eq_high.value().abs() < EPS
+    }
+
     /// Build the block-constant snapshot the engine consumes. Realtime-safe
     /// (atomic loads only).
     pub fn snapshot(&self) -> EngineParams {

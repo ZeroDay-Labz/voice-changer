@@ -19,9 +19,44 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
     let lower = row![quick_tweaks(host, mode)].spacing(16);
     #[cfg(feature = "ai")]
     let lower = lower.push(container(ai_card(model, host, mode)).width(Length::Fill));
-    column![presets(model, mode), lower.wrap()]
-        .spacing(14)
-        .into()
+    let mut col = column![].spacing(14);
+    if let Some(note) = nothing_changing(host) {
+        col = col.push(notice(note, mode));
+    }
+    col = col.push(presets(model, mode));
+    col = col.push(lower.wrap());
+    col.into()
+}
+
+/// Why the voice would sound unchanged right now, if that is the case.
+fn nothing_changing(host: &dyn Host) -> Option<&'static str> {
+    let p = host.params();
+    if p.bypass.value() {
+        return None;
+    }
+    #[cfg(feature = "ai")]
+    if p.ai_enabled.value() && !p.ai_voice().is_empty() {
+        return None;
+    }
+    p.voice_is_neutral().then_some(
+        "Nothing is changing your voice yet — pick a preset below, or turn a Quick tweak knob.",
+    )
+}
+
+/// A one-line amber banner.
+fn notice<'a>(text_: &'a str, _mode: Mode) -> Element<'a> {
+    container(
+        row![
+            icons::star(14.0, theme::AMBER),
+            text(text_).size(13).color(theme::AMBER)
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .padding([8, 12])
+    .width(Length::Fill)
+    .style(theme::panel_accent(theme::AMBER))
+    .into()
 }
 
 fn presets<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
@@ -396,7 +431,13 @@ fn ai_card<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> 
                 let load = st.load_factor();
                 let drops = st.dropouts.load(std::sync::atomic::Ordering::Relaxed);
                 let f0 = st.f0_hz.load(std::sync::atomic::Ordering::Relaxed);
-                let mut s = if p.ai_enabled.value() {
+                let warming = st.warming.load(std::sync::atomic::Ordering::Relaxed);
+                let mut s = if p.ai_enabled.value() && warming {
+                    format!(
+                        "Warming up on {} — your live voice is passing through until the model catches up",
+                        vc_core::ai::rvc::backend_name()
+                    )
+                } else if p.ai_enabled.value() {
                     format!(
                         "Ready on {} · {infer:.0} ms per block ({:.0}% of realtime)",
                         vc_core::ai::rvc::backend_name(),
@@ -414,7 +455,14 @@ fn ai_card<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> 
                 if drops > 0 {
                     s.push_str(&format!(" · {drops} dropouts"));
                 }
-                (s, if load > 0.9 { theme::WARN } else { t.text_dim })
+                let colour = if warming && p.ai_enabled.value() {
+                    theme::AMBER
+                } else if load > 0.9 {
+                    theme::WARN
+                } else {
+                    t.text_dim
+                };
+                (s, colour)
             }
         },
     };

@@ -81,6 +81,20 @@ impl Preset {
         }
     }
 
+    /// Whether `params` still hold this preset's values, ignoring the
+    /// settings presets never touch. Lets the UI avoid naming a preset that
+    /// is not actually in effect any more.
+    pub fn matches(&self, params: &VcParams) -> bool {
+        let current = Preset::capture(params, &self.name);
+        self.values.iter().all(|(id, want)| {
+            EXCLUDED_IDS.contains(&id.as_str())
+                || current
+                    .values
+                    .get(id)
+                    .is_some_and(|got| (got - want).abs() < 1e-3)
+        })
+    }
+
     /// Apply through a GUI `ParamSetter` (plugin editor or app window).
     pub fn apply_with_setter(&self, params: &VcParams, setter: &ParamSetter) {
         self.apply(params, |ptr, normalized| {

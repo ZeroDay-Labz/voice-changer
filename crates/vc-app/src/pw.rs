@@ -101,6 +101,11 @@ pub struct Routing {
     pub default_is_us: bool,
     /// `target.object` per stream node id.
     pub targets: std::collections::HashMap<u32, String>,
+    /// Whether we are taking over as the microphone for every application.
+    pub take_over: bool,
+    /// Each app's `target.object` before we routed it to us (None = it was
+    /// following the default), so we can put it back when we stop.
+    pub original_targets: std::collections::HashMap<u32, Option<String>>,
 }
 
 /// A selectable microphone (any `Audio/Source` node that isn't ours).
@@ -697,11 +702,27 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                         feed_link.borrow_mut().src_node = Some(global.id);
                     }
                     try_feed_link(&core, &feed_link);
-                    if let Some(app) = app_stream_from_global(global)
-                        && let Ok(mut list) = app_streams.lock()
-                    {
-                        list.retain(|a| a.id != app.id);
-                        list.push(app);
+                    if let Some(app) = app_stream_from_global(global) {
+                        let id = app.id;
+                        if let Ok(mut list) = app_streams.lock() {
+                            list.retain(|a| a.id != id);
+                            list.push(app);
+                        }
+                        // An app that opens while we are the microphone for
+                        // everything is routed to us too.
+                        if routing
+                            .lock()
+                            .map(|r| r.take_over && !r.original_targets.contains_key(&id))
+                            .unwrap_or(false)
+                        {
+                            route_stream(
+                                metadata.borrow().as_ref(),
+                                &routing,
+                                &source_name,
+                                id,
+                                true,
+                            );
+                        }
                     }
                 }
                 ObjectType::Port => {
@@ -790,47 +811,25 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
         let routing = routing.clone();
         let source_name = source_name.clone();
         let capture_target = capture_target.clone();
+        let app_streams = app_streams.clone();
         move |cmd| match cmd {
             Command::Quit => {
-                // Give the previous default microphone back before leaving.
+                // Put every application back on its own microphone, then
+                // restore the default, before leaving.
+                if routing.lock().map(|r| r.take_over).unwrap_or(false) {
+                    restore_all_apps(metadata.borrow().as_ref(), &routing);
+                }
                 set_default_source(metadata.borrow().as_ref(), &routing, &source_name, false);
                 mainloop.quit()
             }
             Command::RouteApp { stream_id, on } => {
-                let guard = metadata.borrow();
-                let Some(metadata) = guard.as_ref() else {
-                    log::warn!("no default metadata object; cannot route applications");
-                    return;
-                };
-                let serial = routing.lock().ok().and_then(|r| r.source_serial.clone());
-                if on {
-                    match serial {
-                        Some(serial) => {
-                            metadata.set_property(
-                                stream_id,
-                                "target.object",
-                                Some("Spa:Id"),
-                                Some(&serial),
-                            );
-                            if let Ok(mut r) = routing.lock() {
-                                r.targets.insert(stream_id, serial);
-                            }
-                        }
-                        None => metadata.set_property(
-                            stream_id,
-                            "target.object",
-                            Some("Spa:String"),
-                            Some(&source_name),
-                        ),
-                    }
-                    log::info!("routing stream {stream_id} to {source_name}");
-                } else {
-                    metadata.set_property(stream_id, "target.object", None, None);
-                    if let Ok(mut r) = routing.lock() {
-                        r.targets.remove(&stream_id);
-                    }
-                    log::info!("released stream {stream_id}");
-                }
+                route_stream(
+                    metadata.borrow().as_ref(),
+                    &routing,
+                    &source_name,
+                    stream_id,
+                    on,
+                );
             }
             Command::SetDefaultSource(on) => {
                 // Our own capture follows the system default source. If we
@@ -848,7 +847,24 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                         real.as_deref(),
                     );
                     set_default_source(metadata.borrow().as_ref(), &routing, &source_name, true);
+                    if let Ok(mut r) = routing.lock() {
+                        r.take_over = true;
+                    }
+                    // Move every application that is recording right now onto
+                    // the voice changer (default-following apps AND apps pinned
+                    // to a specific device), and remember where each one was.
+                    let ids: Vec<u32> = app_streams
+                        .lock()
+                        .map(|l| l.iter().map(|a| a.id).collect())
+                        .unwrap_or_default();
+                    for id in ids {
+                        route_stream(metadata.borrow().as_ref(), &routing, &source_name, id, true);
+                    }
                 } else {
+                    if let Ok(mut r) = routing.lock() {
+                        r.take_over = false;
+                    }
+                    restore_all_apps(metadata.borrow().as_ref(), &routing);
                     set_default_source(metadata.borrow().as_ref(), &routing, &source_name, false);
                     let want = capture_target.lock().ok().and_then(|t| t.clone());
                     retarget_capture(
@@ -1103,6 +1119,76 @@ fn real_default_source(
         .lock()
         .ok()
         .and_then(|d| d.first().map(|x| x.name.clone()))
+}
+
+/// Point an application's recording stream at our virtual microphone (or
+/// release it), remembering where it was so take-over can be undone.
+fn route_stream(
+    metadata: Option<&pw::metadata::Metadata>,
+    routing: &Mutex<Routing>,
+    source_name: &str,
+    stream_id: u32,
+    on: bool,
+) {
+    let Some(metadata) = metadata else {
+        log::warn!("no default metadata object; cannot route applications");
+        return;
+    };
+    if on {
+        let serial = {
+            let Ok(mut r) = routing.lock() else { return };
+            // Remember the app's current target once, before we move it.
+            if !r.original_targets.contains_key(&stream_id) {
+                let current = r.targets.get(&stream_id).cloned();
+                r.original_targets.insert(stream_id, current);
+            }
+            r.source_serial.clone()
+        };
+        match serial {
+            Some(serial) => {
+                metadata.set_property(stream_id, "target.object", Some("Spa:Id"), Some(&serial));
+                if let Ok(mut r) = routing.lock() {
+                    r.targets.insert(stream_id, serial);
+                }
+            }
+            None => metadata.set_property(
+                stream_id,
+                "target.object",
+                Some("Spa:String"),
+                Some(source_name),
+            ),
+        }
+        log::info!("routing stream {stream_id} to {source_name}");
+    } else {
+        // Restore the app's original target (or release it to follow default).
+        let original = routing.lock().ok().and_then(|mut r| {
+            r.targets.remove(&stream_id);
+            r.original_targets.remove(&stream_id)
+        });
+        match original.flatten() {
+            Some(orig) => {
+                metadata.set_property(stream_id, "target.object", Some("Spa:Id"), Some(&orig))
+            }
+            None => metadata.set_property(stream_id, "target.object", None, None),
+        }
+        log::info!("released stream {stream_id}");
+    }
+}
+
+/// Put every application we moved back on its own microphone.
+fn restore_all_apps(metadata: Option<&pw::metadata::Metadata>, routing: &Mutex<Routing>) {
+    let Some(metadata) = metadata else { return };
+    let apps: Vec<(u32, Option<String>)> = {
+        let Ok(mut r) = routing.lock() else { return };
+        r.targets.clear();
+        r.original_targets.drain().collect()
+    };
+    for (id, orig) in apps {
+        match orig {
+            Some(orig) => metadata.set_property(id, "target.object", Some("Spa:Id"), Some(&orig)),
+            None => metadata.set_property(id, "target.object", None, None),
+        }
+    }
 }
 
 /// Make (or stop making) our source the session default microphone through

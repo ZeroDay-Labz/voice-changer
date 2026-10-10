@@ -3,6 +3,39 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.5] - 2026-10-10
+
+### Fixed
+- **The AI voice could mute your microphone completely** (it "killed Discord"). While the
+  model was warming up -- which happens on every start, voice switch, compute switch and
+  error retry -- and on every dropout, the AI stage filled the output with digital silence;
+  with "AI only" on, the normal voice effects were switched off at the same time, so nothing
+  came out at all. Measured on the virtual microphone, 5 of 20 seconds after start were
+  completely silent. Now the live voice keeps flowing whenever the model is not producing,
+  with a short crossfade on the handover: 0 silent seconds in the same test.
+- **Voice effects now keep working while the AI warms up.** Previously "AI only" disabled
+  pitch, drive, robot, echo, reverb and tone even when the AI was not yet converting, so
+  those seconds were unprocessed. The effects are only handed over once the model is
+  actually producing audio.
+- **The window no longer names a preset that is not in effect.** Your saved parameters were
+  restored, but the last preset's *name* was displayed regardless, so the UI could claim
+  "Natural" while quite different settings were loaded. It now shows the preset only while
+  the parameters still match it, and "Custom" otherwise.
+
+### Added
+- The AI card says "Warming up -- your live voice is passing through" while the model is
+  catching up, instead of looking idle.
+- The Home page points it out when the changer is on but nothing is actually altering the
+  voice ("pick a preset, or turn a Quick tweak knob").
+
+### Changed
+- **"Replace my microphone everywhere"** (was "Use as the microphone for everything") now
+  takes over completely. Every app recording right now is switched to the voice changer,
+  including apps pinned to a specific device (Discord, OBS), not only apps set to "Default";
+  apps that open while it is on are switched too; and every app plus your default microphone
+  returns to its own device when you turn it off or quit. It stays an opt-in toggle and is
+  remembered between runs.
+
 ## [0.2.4] - 2026-10-10
 
 ### Fixed

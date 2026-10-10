@@ -70,8 +70,8 @@ pub fn send_to<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
             row![
                 toggler(is_default).on_toggle(Message::SetDefaultSource).style(theme::toggler_style),
                 column![
-                    text("Use as the microphone for everything").size(14),
-                    dim("Sets Voice Changer Mic as the system default while running; the previous default comes back when you turn this off or quit.", 12, mode)
+                    text("Replace my microphone everywhere").size(14),
+                    dim("Switches every app that reads your microphone over to the voice changer, including apps pinned to a specific device. Everything returns to normal when you turn this off or quit.", 12, mode)
                 ]
                 .spacing(2)
             ]

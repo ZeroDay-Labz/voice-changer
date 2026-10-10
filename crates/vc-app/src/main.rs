@@ -182,14 +182,28 @@ fn main() -> Result<()> {
     )
     .context("start PipeWire audio")?;
     let shared = Shared::new(params, cli.rate as f32, cli.quantum, audio, cfg.clone());
-    if let Some(name) = cli.preset.as_deref().or(cfg.last_preset.as_deref())
-        && cli.preset.is_some()
-        && !shared.apply_preset_named(name)
-    {
-        log::warn!("unknown preset {name:?}");
+    // A preset named on the command line is applied. Otherwise the restored
+    // state is authoritative (it keeps the user's own tweaks), so we only
+    // *name* the last preset when the parameters still match it -- the UI must
+    // never claim a preset that is not actually in effect.
+    let mut shown_preset: Option<String> = None;
+    if let Some(name) = cli.preset.as_deref() {
+        if shared.apply_preset_named(name) {
+            shown_preset = Some(name.to_string());
+        } else {
+            log::warn!("unknown preset {name:?}");
+        }
+    } else if let Some(name) = cfg.last_preset.as_deref() {
+        let still_matches = vc_core::presets::list_presets()
+            .into_iter()
+            .find(|e| e.preset.name.eq_ignore_ascii_case(name))
+            .is_some_and(|e| e.preset.matches(&shared.params));
+        if still_matches {
+            shown_preset = Some(name.to_string());
+        }
     }
     if let Ok(mut cur) = shared.current_preset.lock() {
-        *cur = cfg.last_preset.clone();
+        *cur = shown_preset;
     }
     shared.set_enabled(cli.on || !(cli.bypass || cfg.start_bypassed));
     if cli.monitor {

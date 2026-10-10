@@ -25,6 +25,8 @@ use vc_core::{Meters, Pipeline, VcParams};
 
 pub const SOURCE_NODE_NAME: &str = "voice_changer.source";
 pub const SOURCE_DESCRIPTION: &str = "Voice Changer Mic";
+/// Internal stream that feeds the virtual microphone node.
+const OUTPUT_NODE_NAME: &str = "voice_changer.output";
 pub const CAPTURE_NODE_NAME: &str = "voice_changer.capture";
 
 const SAMPLE_BYTES: usize = std::mem::size_of::<f32>();
@@ -414,6 +416,26 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
     };
 
     let latency = format!("{}/{}", config.quantum, config.rate);
+
+    // The virtual microphone apps capture from is a `support.null-audio-sink`
+    // node published as a virtual source. Unlike a plain pw_stream source it
+    // is a real driver, so PulseAudio clients (Discord, Chromium, OBS) can
+    // negotiate with it -- a pw_stream source leaves them stuck in
+    // "negotiating" and silent. We feed it from our output stream below.
+    let vsource_props = properties! {
+        "factory.name" => "support.null-audio-sink",
+        *pw::keys::NODE_NAME => config.source_name.as_str(),
+        *pw::keys::NODE_DESCRIPTION => SOURCE_DESCRIPTION,
+        *pw::keys::MEDIA_CLASS => "Audio/Source/Virtual",
+        *pw::keys::NODE_VIRTUAL => "true",
+        *pw::keys::AUDIO_CHANNELS => "1",
+        "audio.position" => "[MONO]",
+        "object.linger" => "false",
+    };
+    let _vsource: pw::node::Node = core
+        .create_object("adapter", &vsource_props)
+        .context("create virtual microphone node")?;
+
     // One second of headroom each; the sink callbacks trim their queues so
     // real latency stays around one quantum.
     let (to_source, from_capture) = rtrb::RingBuffer::<f32>::new(config.rate as usize);
@@ -534,15 +556,13 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Playback",
         *pw::keys::MEDIA_ROLE => "Communication",
-        *pw::keys::MEDIA_CLASS => "Audio/Source",
-        *pw::keys::NODE_NAME => config.source_name.as_str(),
-        *pw::keys::NODE_DESCRIPTION => SOURCE_DESCRIPTION,
-        *pw::keys::NODE_VIRTUAL => "true",
+        *pw::keys::NODE_NAME => OUTPUT_NODE_NAME,
+        *pw::keys::NODE_DESCRIPTION => "Voice Changer (processed voice)",
         *pw::keys::NODE_LATENCY => latency.as_str(),
         *pw::keys::AUDIO_CHANNELS => "1",
         "audio.position" => "[MONO]",
     };
-    let output = pw::stream::StreamRc::new(core.clone(), SOURCE_DESCRIPTION, out_props)
+    let output = pw::stream::StreamRc::new(core.clone(), "Voice Changer output", out_props)
         .context("create output stream")?;
     let _output_listener = output
         .add_local_listener_with_user_data(SinkData {
@@ -626,6 +646,8 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
     let metadata_listener: Rc<RefCell<Option<pw::metadata::MetadataListener>>> =
         Rc::new(RefCell::new(None));
     let source_node: Rc<RefCell<Option<pw::node::Node>>> = Rc::new(RefCell::new(None));
+    // Tracks the node/port ids needed to link our output into the virtual mic.
+    let feed_link: Rc<RefCell<FeedLink>> = Rc::new(RefCell::new(FeedLink::default()));
     let source_name = config.source_name.clone();
     let _registry_listener = registry
         .add_listener_local()
@@ -636,6 +658,8 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
             let metadata = metadata.clone();
             let metadata_listener = metadata_listener.clone();
             let source_node = source_node.clone();
+            let feed_link = feed_link.clone();
+            let core = core.clone();
             let registry = registry.downgrade();
             let source_name = source_name.clone();
             move |global| match global.type_ {
@@ -648,7 +672,8 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                         list.sort_by(|a, b| a.description.cmp(&b.description));
                     }
                     let props = global.props.as_ref();
-                    if props.and_then(|p| p.get("node.name")) == Some(source_name.as_str()) {
+                    let node_name = props.and_then(|p| p.get("node.name"));
+                    if node_name == Some(source_name.as_str()) {
                         if let Some(serial) = props.and_then(|p| p.get("object.serial"))
                             && let Ok(mut r) = routing.lock()
                         {
@@ -664,12 +689,35 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                             }
                         }
                     }
+                    // Record the node ids so we can link our output's port into
+                    // the virtual mic's input port once the ports appear.
+                    if node_name == Some(OUTPUT_NODE_NAME) {
+                        feed_link.borrow_mut().out_node = Some(global.id);
+                    } else if node_name == Some(source_name.as_str()) {
+                        feed_link.borrow_mut().src_node = Some(global.id);
+                    }
+                    try_feed_link(&core, &feed_link);
                     if let Some(app) = app_stream_from_global(global)
                         && let Ok(mut list) = app_streams.lock()
                     {
                         list.retain(|a| a.id != app.id);
                         list.push(app);
                     }
+                }
+                ObjectType::Port => {
+                    let props = global.props.as_ref();
+                    let pnode: Option<u32> = props
+                        .and_then(|p| p.get("node.id"))
+                        .and_then(|s| s.parse().ok());
+                    let dir = props.and_then(|p| p.get("port.direction"));
+                    let mut fl = feed_link.borrow_mut();
+                    if pnode == fl.out_node && dir == Some("out") {
+                        fl.out_port = Some(global.id);
+                    } else if pnode == fl.src_node && dir == Some("in") {
+                        fl.in_port = Some(global.id);
+                    }
+                    drop(fl);
+                    try_feed_link(&core, &feed_link);
                 }
                 ObjectType::Metadata => {
                     let is_default = global
@@ -887,6 +935,45 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
     mainloop.run();
     log::info!("PipeWire loop stopped");
     Ok(())
+}
+
+/// Node/port ids used to wire our processed-audio output into the virtual
+/// microphone node. Linking by explicit ports is reliable where node-only
+/// linking is not.
+#[derive(Default)]
+struct FeedLink {
+    out_node: Option<u32>,
+    src_node: Option<u32>,
+    out_port: Option<u32>,
+    in_port: Option<u32>,
+    link: Option<pw::link::Link>,
+}
+
+/// Create the output -> virtual-mic link once both ports are known.
+fn try_feed_link(core: &pw::core::CoreRc, feed_link: &Rc<RefCell<FeedLink>>) {
+    let mut fl = feed_link.borrow_mut();
+    if fl.link.is_some() {
+        return;
+    }
+    let (Some(on), Some(sn), Some(op), Some(ip)) =
+        (fl.out_node, fl.src_node, fl.out_port, fl.in_port)
+    else {
+        return;
+    };
+    let props = properties! {
+        "link.output.node" => on.to_string().as_str(),
+        "link.output.port" => op.to_string().as_str(),
+        "link.input.node" => sn.to_string().as_str(),
+        "link.input.port" => ip.to_string().as_str(),
+        "object.linger" => "false",
+    };
+    match core.create_object::<pw::link::Link>("link-factory", &props) {
+        Ok(link) => {
+            log::info!("virtual microphone connected to the processed voice");
+            fl.link = Some(link);
+        }
+        Err(e) => log::warn!("could not link output to virtual mic: {e}"),
+    }
 }
 
 /// Set a node's volume to 100% (channel volumes, master volume, unmuted).

@@ -3,6 +3,16 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.4] - 2026-10-10
+
+### Fixed
+- **Apps that use the PulseAudio interface (Discord, most browsers, OBS) got silence from the
+  virtual microphone.** It was a `pw_stream` source, which PulseAudio clients cannot negotiate
+  with -- their capture stalls forever in "negotiating". The virtual microphone is now a proper
+  driver node (PipeWire's `support.null-audio-sink` published as a virtual source), fed by the
+  processed voice, so every app -- native PipeWire or PulseAudio -- captures it. Pick
+  "Voice Changer Mic" in the app, or route it from the Mixer page.
+
 ## [0.2.3] - 2026-10-09
 
 ### Fixed

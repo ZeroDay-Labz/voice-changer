@@ -63,6 +63,11 @@
   </supports>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.2.4" date="2026-10-10">
+      <description>
+        <p>The virtual microphone now works with PulseAudio apps (Discord, browsers, OBS); it is a proper driver node instead of a pw_stream source.</p>
+      </description>
+    </release>
     <release version="0.2.3" date="2026-10-09">
       <description>
         <p>Fixes "use as the microphone for everything" silencing apps (a capture feedback loop) and "hear myself" producing no sound.</p>

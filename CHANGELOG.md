@@ -3,6 +3,15 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.1] - 2026-10-11
+
+### Fixed
+- **Crash at start with `onnxruntime-rocm` installed but no AMD GPU.** The ROCm build of
+  ONNX Runtime aborts (a C++ assertion on an empty device list) as soon as a model is loaded
+  on a machine where `rocminfo` finds no GPU. The app now only loads the ROCm runtime when
+  a ROCm GPU is present and uses the bundled CPU runtime otherwise; Settings and
+  `voice-changer doctor` say so. `ORT_DYLIB_PATH` still forces a specific library.
+
 ## [0.3.0] - 2026-10-11
 
 The "runs everywhere, runs smoothly" release.

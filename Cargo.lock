@@ -6340,7 +6340,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vc-app"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -6368,7 +6368,7 @@ dependencies = [
 
 [[package]]
 name = "vc-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6392,7 +6392,7 @@ dependencies = [
 
 [[package]]
 name = "vc-dsp"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "nnnoiseless",
  "realfft",
@@ -6401,7 +6401,7 @@ dependencies = [
 
 [[package]]
 name = "vc-gui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "iced_core",
  "iced_renderer",
@@ -6415,7 +6415,7 @@ dependencies = [
 
 [[package]]
 name = "vc-plugin"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "nice-plug",
  "nice-plug-iced",
@@ -7412,7 +7412,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "nice-plug-xtask",
 ]

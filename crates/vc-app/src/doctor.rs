@@ -332,10 +332,15 @@ pub fn run_checks() -> Vec<Finding> {
     {
         use vc_core::ai::{compute, hardware, library};
         match compute::runtime_lib() {
-            Some((p, kind)) => out.push(Finding::ok(
-                "ONNX Runtime",
-                format!("{} ({:?} build)", p.display(), kind),
-            )),
+            Some((p, kind)) => {
+                out.push(Finding::ok(
+                    "ONNX Runtime",
+                    format!("{} ({:?} build)", p.display(), kind),
+                ));
+                if let Some(note) = compute::rocm_note() {
+                    out.push(Finding::warn("ROCm runtime", note, "Nothing to do unless this machine has an AMD GPU that ROCm should see; then check that the amdgpu driver and rocminfo work."));
+                }
+            }
             None => {
                 if cfg!(feature = "gpu") {
                     out.push(Finding::warn(

@@ -5,7 +5,7 @@
 # otherwise the bundled CPU runtime is used.
 
 pkgname=voice-changer
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=1
 pkgdesc="Realtime voice changer with local AI voices, as a PipeWire microphone (and a CLAP plugin)"
 arch=('x86_64' 'aarch64')

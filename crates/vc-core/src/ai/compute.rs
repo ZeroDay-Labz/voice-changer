@@ -241,12 +241,38 @@ pub fn runtime_lib() -> Option<(PathBuf, RuntimeKind)> {
             {
                 return Some((p, RuntimeKind::Cuda));
             }
-            if let Some(p) = rocm_runtime_lib() {
+            // The ROCm build of ONNX Runtime aborts (a C++ assertion on an
+            // empty device list) when it is loaded on a machine without a
+            // ROCm GPU, so it is only used when `rocminfo` reports one. An
+            // explicit ORT_DYLIB_PATH is honoured regardless.
+            let rocm = rocm_runtime_lib();
+            let forced = std::env::var_os("ORT_DYLIB_PATH").is_some();
+            if let Some(p) = rocm.clone()
+                && (forced || !rocm_gpus().is_empty())
+            {
                 return Some((p, RuntimeKind::Rocm));
             }
-            cpu_runtime_lib().map(|p| (p, RuntimeKind::Cpu))
+            if let Some(p) = cpu_runtime_lib() {
+                return Some((p, RuntimeKind::Cpu));
+            }
+            // No CPU library anywhere: the ROCm one is the only option left.
+            rocm.map(|p| (p, RuntimeKind::Rocm))
         })
         .clone()
+}
+
+/// Why the installed ROCm runtime is not in use, for the Settings page and
+/// the doctor. `None` when there is nothing to explain.
+pub fn rocm_note() -> Option<String> {
+    if cfg!(feature = "gpu")
+        && rocm_runtime_lib().is_some()
+        && runtime_kind() != RuntimeKind::Rocm
+        && std::env::var_os("ORT_DYLIB_PATH").is_none()
+    {
+        Some("onnxruntime-rocm is installed but rocminfo reports no AMD GPU, so the CPU runtime is used (the ROCm one would crash without a GPU).".into())
+    } else {
+        None
+    }
 }
 
 pub fn runtime_kind() -> RuntimeKind {
@@ -266,6 +292,14 @@ pub fn runtime_description() -> String {
     }
 }
 
+/// `runtime_description` plus, when relevant, why the ROCm runtime is idle.
+pub fn runtime_description_full() -> String {
+    match rocm_note() {
+        Some(note) => format!("{} · {note}", runtime_description()),
+        None => runtime_description(),
+    }
+}
+
 /// Why no GPU is offered, for the Compute picker. `None` when GPUs are listed.
 pub fn gpu_note() -> Option<String> {
     if !gpus().is_empty() {
@@ -278,7 +312,7 @@ pub fn gpu_note() -> Option<String> {
         return Some("NVIDIA GPU found. Run scripts/get-onnxruntime.sh --cuda (needs the CUDA 12 runtime and cuDNN 9), then restart.".into());
     }
     if rocm_runtime_lib().is_some() {
-        return Some("No GPU detected by ROCm.".into());
+        return Some("No AMD GPU detected by ROCm; the AI runs on the CPU runtime.".into());
     }
     Some("AMD: install onnxruntime-rocm. NVIDIA: run scripts/get-onnxruntime.sh --cuda.".into())
 }
@@ -286,72 +320,79 @@ pub fn gpu_note() -> Option<String> {
 /// GPUs the loaded runtime can use: NVIDIA via `nvidia-smi` with the CUDA
 /// runtime, AMD via `rocminfo` with the ROCm runtime. Cached.
 pub fn gpus() -> Vec<GpuInfo> {
-    GPUS.get_or_init(|| {
-        match runtime_kind() {
-            RuntimeKind::Cuda => return nvidia_gpus(),
-            RuntimeKind::Cpu => return Vec::new(),
-            RuntimeKind::Rocm => {}
-        }
-        let Ok(out) = std::process::Command::new("rocminfo").output() else {
-            return Vec::new();
-        };
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut gpus = Vec::new();
-        let mut name: Option<String> = None;
-        let mut marketing: Option<String> = None;
-        let mut is_gpu = false;
-        let mut index = 0;
-        let flush = |gpus: &mut Vec<GpuInfo>,
-                     name: &mut Option<String>,
-                     marketing: &mut Option<String>,
-                     is_gpu: &mut bool,
-                     index: &mut i32| {
-            if *is_gpu {
-                let label = marketing
-                    .take()
-                    .or_else(|| name.take())
-                    .unwrap_or_else(|| "GPU".into());
-                gpus.push(GpuInfo {
-                    index: *index,
-                    name: label,
-                    api: "ROCm",
-                });
-                *index += 1;
-            }
-            *name = None;
-            *marketing = None;
-            *is_gpu = false;
-        };
-        for line in text.lines() {
-            let t = line.trim();
-            if t.starts_with("Agent ") && t.ends_with(':') || t.starts_with("*******") {
-                flush(
-                    &mut gpus,
-                    &mut name,
-                    &mut marketing,
-                    &mut is_gpu,
-                    &mut index,
-                );
-            } else if let Some(v) = t.strip_prefix("Marketing Name:") {
-                marketing = Some(v.trim().to_string());
-            } else if let Some(v) = t.strip_prefix("Name:") {
-                if name.is_none() {
-                    name = Some(v.trim().to_string());
-                }
-            } else if let Some(v) = t.strip_prefix("Device Type:") {
-                is_gpu = v.trim() == "GPU";
-            }
-        }
-        flush(
-            &mut gpus,
-            &mut name,
-            &mut marketing,
-            &mut is_gpu,
-            &mut index,
-        );
-        gpus
+    GPUS.get_or_init(|| match runtime_kind() {
+        RuntimeKind::Cuda => nvidia_gpus(),
+        RuntimeKind::Cpu => Vec::new(),
+        RuntimeKind::Rocm => rocm_gpus(),
     })
     .clone()
+}
+
+/// AMD GPUs as reported by `rocminfo` (independent of which runtime is loaded). Cached.
+pub fn rocm_gpus() -> Vec<GpuInfo> {
+    static CACHE: OnceLock<Vec<GpuInfo>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let Ok(out) = std::process::Command::new("rocminfo").output() else {
+                return Vec::new();
+            };
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut gpus = Vec::new();
+            let mut name: Option<String> = None;
+            let mut marketing: Option<String> = None;
+            let mut is_gpu = false;
+            let mut index = 0;
+            let flush = |gpus: &mut Vec<GpuInfo>,
+                         name: &mut Option<String>,
+                         marketing: &mut Option<String>,
+                         is_gpu: &mut bool,
+                         index: &mut i32| {
+                if *is_gpu {
+                    let label = marketing
+                        .take()
+                        .or_else(|| name.take())
+                        .unwrap_or_else(|| "GPU".into());
+                    gpus.push(GpuInfo {
+                        index: *index,
+                        name: label,
+                        api: "ROCm",
+                    });
+                    *index += 1;
+                }
+                *name = None;
+                *marketing = None;
+                *is_gpu = false;
+            };
+            for line in text.lines() {
+                let t = line.trim();
+                if t.starts_with("Agent ") && t.ends_with(':') || t.starts_with("*******") {
+                    flush(
+                        &mut gpus,
+                        &mut name,
+                        &mut marketing,
+                        &mut is_gpu,
+                        &mut index,
+                    );
+                } else if let Some(v) = t.strip_prefix("Marketing Name:") {
+                    marketing = Some(v.trim().to_string());
+                } else if let Some(v) = t.strip_prefix("Name:") {
+                    if name.is_none() {
+                        name = Some(v.trim().to_string());
+                    }
+                } else if let Some(v) = t.strip_prefix("Device Type:") {
+                    is_gpu = v.trim() == "GPU";
+                }
+            }
+            flush(
+                &mut gpus,
+                &mut name,
+                &mut marketing,
+                &mut is_gpu,
+                &mut index,
+            );
+            gpus
+        })
+        .clone()
 }
 
 /// Resolve "auto" to the best available backend.

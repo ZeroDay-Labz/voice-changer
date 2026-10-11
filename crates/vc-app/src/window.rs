@@ -162,7 +162,7 @@ impl Host for AppHost {
     }
     #[cfg(feature = "ai")]
     fn runtime_description(&self) -> Option<String> {
-        Some(vc_core::ai::compute::runtime_description())
+        Some(vc_core::ai::compute::runtime_description_full())
     }
     fn hotkey(&self) -> Option<Option<String>> {
         Some(

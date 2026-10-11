@@ -1,6 +1,6 @@
 pkgbase = voice-changer
 	pkgdesc = Realtime voice changer with local AI voices, as a PipeWire microphone (and a CLAP plugin)
-	pkgver = 0.3.0
+	pkgver = 0.3.1
 	pkgrel = 1
 	url = https://github.com/ZeroDay-Labz/voice-changer
 	arch = x86_64
@@ -22,7 +22,7 @@ pkgbase = voice-changer
 	optdepends = python: converts .pth voice models to ONNX
 	optdepends = xdg-desktop-portal: global on/off shortcut
 	options = !lto
-	source = voice-changer-0.3.0.tar.gz::https://github.com/ZeroDay-Labz/voice-changer/archive/refs/tags/v0.3.0.tar.gz
+	source = voice-changer-0.3.1.tar.gz::https://github.com/ZeroDay-Labz/voice-changer/archive/refs/tags/v0.3.1.tar.gz
 	sha256sums = SKIP
 
 pkgname = voice-changer

@@ -141,8 +141,10 @@ fn icon_pixmaps(enabled: bool) -> Vec<ksni::Icon> {
 }
 
 /// Run the tray until quit is requested. Keeps the checkmark/icon in sync
-/// with toggles made elsewhere (hotkey, D-Bus, window).
-pub async fn run(shared: Arc<Shared>) {
+/// with toggles made elsewhere (hotkey, D-Bus, window). When the desktop
+/// has no tray and the window was meant to start hidden, open it instead:
+/// an app with no window and no tray icon is impossible to reach.
+pub async fn run(shared: Arc<Shared>, started_hidden: bool) {
     let tray = VcTray {
         enabled: shared.is_enabled(),
         shared: shared.clone(),
@@ -151,6 +153,10 @@ pub async fn run(shared: Arc<Shared>) {
         Ok(h) => h,
         Err(e) => {
             log::warn!("tray icon unavailable: {e}");
+            if started_hidden {
+                log::warn!("no tray to reopen the window from; opening it now");
+                shared.request_show();
+            }
             return;
         }
     };

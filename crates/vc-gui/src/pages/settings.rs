@@ -17,6 +17,10 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
         col = col.push(audio(model, host, mode));
         col = col.push(window(host, mode));
     }
+    #[cfg(feature = "ai")]
+    {
+        col = col.push(ai(model, mode));
+    }
     col = col.push(appearance(host, mode));
     if caps.standalone {
         col = col.push(logs(host, mode));
@@ -55,6 +59,46 @@ fn audio<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> {
         ));
         col = col.push(dim("Plays the processed voice to your default output so you can hear what others hear. Use headphones.", 12, mode));
     }
+    if let Some(a) = &model.cache.audio {
+        let (line, color) = match a.state {
+            crate::AudioState::Running => (
+                if a.virtual_mic {
+                    "Running. “Voice Changer Mic” is available to every app.".to_string()
+                } else {
+                    "Running, but the virtual microphone is not connected yet.".to_string()
+                },
+                theme::ACCENT,
+            ),
+            crate::AudioState::Starting => ("Starting…".to_string(), theme::tokens(mode).text_dim),
+            crate::AudioState::Reconnecting => {
+                ("Reconnecting to the audio system…".to_string(), theme::WARN)
+            }
+            crate::AudioState::Failed => (a.message.clone(), theme::DANGER),
+        };
+        col = col.push(
+            text(line)
+                .size(13)
+                .color(color)
+                .wrapping(iced_core::text::Wrapping::WordOrGlyph),
+        );
+        if a.state == crate::AudioState::Running && !a.message.is_empty() {
+            col = col.push(
+                text(a.message.clone())
+                    .size(12)
+                    .color(theme::WARN)
+                    .wrapping(iced_core::text::Wrapping::WordOrGlyph),
+            );
+        }
+        if let (Some(active), Some(chosen)) = (&a.active_mic, &a.chosen_mic)
+            && active != chosen
+        {
+            col = col.push(
+                text(format!("Using {active} while {chosen} is unplugged."))
+                    .size(12)
+                    .color(theme::WARN),
+            );
+        }
+    }
     if let Some(stats) = host.stats() {
         col = col.push(kv(
             "Block",
@@ -84,6 +128,61 @@ fn audio<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> {
         out = out.push(super::mixer::send_to(model, mode));
     }
     out.into()
+}
+
+/// AI engine: which library runs it, how many threads it gets, and what
+/// the machine has.
+#[cfg(feature = "ai")]
+fn ai<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
+    let mut col = column![].spacing(10);
+    if let Some(hw) = &model.cache.hardware {
+        col = col.push(kv("This computer", hw.line.clone(), mode));
+        let max = hw.max_threads.max(1);
+        let auto_label = format!("Auto ({})", hw.auto_threads);
+        let mut options: Vec<String> = vec![auto_label.clone()];
+        options.extend((1..=max).map(|n| n.to_string()));
+        let current = model.cache.settings.ai_threads.min(max);
+        let selected = if current == 0 {
+            auto_label.clone()
+        } else {
+            current.to_string()
+        };
+        let picker = pick_list(options, Some(selected), move |label: String| {
+            let n = if label.starts_with("Auto") {
+                0
+            } else {
+                label.parse::<u32>().unwrap_or(0)
+            };
+            Message::Setting(HostSetting::AiThreads(n))
+        })
+        .style(theme::pick_list_style)
+        .text_size(13)
+        .width(Length::Fixed(160.0));
+        let mut line = row![tip(picker, help::AI_THREADS)]
+            .spacing(10)
+            .align_y(Alignment::Center);
+        if hw.in_use > 0 {
+            line = line.push(dim(
+                format!(
+                    "the loaded voice runs with {} thread{}",
+                    hw.in_use,
+                    if hw.in_use == 1 { "" } else { "s" }
+                ),
+                12,
+                mode,
+            ));
+        }
+        col = col.push(labelled("AI threads", mode, line));
+        col = col.push(dim(
+            "Auto keeps one core free for audio and the window. Pick a number only if other programs stutter while the AI runs, or if the AI cannot keep up.",
+            12,
+            mode,
+        ));
+    }
+    if let Some(rt) = &model.cache.runtime {
+        col = col.push(tip(kv("AI engine", rt.clone(), mode), help::RUNTIME));
+    }
+    section_accent("AI", theme::INDIGO, mode, col)
 }
 
 fn window<'a>(host: &'a dyn Host, mode: Mode) -> Element<'a> {

@@ -1,29 +1,33 @@
-# Flatpak manifest for Voice Changer (ZeroDay-Labz). DRAFT: builds, but the
-# AI converter (Python venv) does not run inside the sandbox, so .pth imports
-# fall back to "convert outside, drop the .onnx in the voices folder".
+# Flatpak manifest for Voice Changer (ZeroDay-Labz). Built by the release
+# workflow into VoiceChanger.flatpak; install with
+#   flatpak install --user VoiceChanger.flatpak
 #
-# Build (needs flatpak-builder, the freedesktop 25.08 SDK and its rust-stable
-# and llvm20 extensions; see packaging/flatpak/README.md):
+# Inside the sandbox the AI runs on the CPU (the bundled ONNX Runtime): the
+# host's ROCm/CUDA runtimes are not visible. The .pth converter (a Python
+# environment) does not run in the sandbox either; convert on the host with
+# scripts/convert-voice.sh and drop the .onnx into the voices folder.
+#
+# Local build (needs flatpak-builder and the freedesktop 24.08 SDK plus its
+# rust-stable and llvm18 extensions):
+#   python3 flatpak-cargo-generator.py Cargo.lock -o packaging/flatpak/cargo-sources.json
 #   flatpak-builder --user --install --force-clean build-dir \
 #     packaging/flatpak/io.github.zerodaylabz.VoiceChanger.yml
-#
-# cargo-sources.json must be generated from Cargo.lock first (offline build,
-# as Flathub requires) — see README.md next to this file.
 
 app-id: io.github.zerodaylabz.VoiceChanger
 runtime: org.freedesktop.Platform
-runtime-version: '25.08'
+runtime-version: '24.08'
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-  - org.freedesktop.Sdk.Extension.llvm20
+  - org.freedesktop.Sdk.Extension.llvm18
 command: voice-changer
 
 finish-args:
   - --socket=wayland
   - --socket=fallback-x11
   - --device=dri
-  # The virtual microphone is a native PipeWire node.
+  # The virtual microphone is a native PipeWire node: the app needs the
+  # PipeWire socket itself, the PulseAudio socket alone is not enough.
   - --filesystem=xdg-run/pipewire-0
   - --socket=pulseaudio
   # Voice library downloads (Hugging Face) and the base-model download.
@@ -34,26 +38,81 @@ finish-args:
   # Global shortcut and autostart go through portals (no extra permission).
 
 build-options:
-  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
-  prepend-ld-library-path: /usr/lib/sdk/llvm20/lib
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm18/bin
+  prepend-ld-library-path: /usr/lib/sdk/llvm18/lib
   env:
     CARGO_HOME: /run/build/voice-changer/cargo
-    LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
+    LIBCLANG_PATH: /usr/lib/sdk/llvm18/lib
 
 modules:
-  - name: voice-changer
+  - name: pipewire-headers
+    # Only the client library and headers are needed to build; the sandbox
+    # talks to the host's PipeWire at run time.
+    buildsystem: meson
+    config-opts:
+      - -Dsession-managers=[]
+      - -Dexamples=disabled
+      - -Dtests=disabled
+      - -Dgstreamer=disabled
+      - -Dsystemd=disabled
+      - -Dpipewire-alsa=disabled
+      - -Dpipewire-jack=disabled
+      - -Dpipewire-v4l2=disabled
+      - -Dspa-plugins=disabled
+      - -Dudev=disabled
+      - -Ddbus=disabled
+      - -Dlibcamera=disabled
+      - -Dbluez5=disabled
+      - -Davahi=disabled
+      - -Dx11=disabled
+      - -Dlibpulse=disabled
+      - -Dlibusb=disabled
+      - -Draop=disabled
+      - -Dsndfile=disabled
+      - -Dreadline=disabled
+      - -Dman=disabled
+      - -Ddocs=disabled
+    sources:
+      - type: archive
+        url: https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.2.7/pipewire-1.2.7.tar.gz
+        sha256: e75568ed18bcbe75e9779af57cb9cc256fd7ebfaadc12bb347a0717055d1d3a9
+    cleanup:
+      - /bin
+      - /share
+
+  - name: onnxruntime
     buildsystem: simple
     build-commands:
+      - install -d /app/lib/voice-changer
+      - cp -P lib/libonnxruntime.so* /app/lib/voice-changer/
+    sources:
+      - type: archive
+        only-arches: [x86_64]
+        url: https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz
+        sha256: 8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3
+      - type: archive
+        only-arches: [aarch64]
+        url: https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-aarch64-1.22.0.tgz
+        sha256: bb76395092d150b52c7092dc6b8f2fe4d80f0f3bf0416d2f269193e347e24702
+
+  - name: voice-changer
+    buildsystem: simple
+    build-options:
+      env:
+        ORT_DYLIB_PATH: /app/lib/voice-changer/libonnxruntime.so
+    build-commands:
       - cargo --offline build --release --locked -p vc-app
+      - cargo --offline run --release --locked -p xtask -- bundle vc-plugin --release
       - install -Dm755 target/release/voice-changer /app/bin/voice-changer
+      - install -Dm755 target/bundled/vc-plugin.clap /app/lib/clap/vc-plugin.clap
       - install -Dm644 packaging/io.github.zerodaylabz.VoiceChanger.desktop
         /app/share/applications/io.github.zerodaylabz.VoiceChanger.desktop
       - install -Dm644 packaging/io.github.zerodaylabz.VoiceChanger.metainfo.xml
         /app/share/metainfo/io.github.zerodaylabz.VoiceChanger.metainfo.xml
       - install -Dm644 packaging/io.github.zerodaylabz.VoiceChanger.svg
         /app/share/icons/hicolor/scalable/apps/io.github.zerodaylabz.VoiceChanger.svg
-      - install -Dm644 packaging/icons/256.png
-        /app/share/icons/hicolor/256x256/apps/io.github.zerodaylabz.VoiceChanger.png
+      - for s in 16 32 48 64 128 256 512; do install -Dm644 packaging/icons/$s.png
+        /app/share/icons/hicolor/${s}x${s}/apps/io.github.zerodaylabz.VoiceChanger.png; done
     sources:
       - type: dir
         path: ../..

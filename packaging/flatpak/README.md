@@ -1,8 +1,15 @@
-# Flatpak (draft)
+# Flatpak
 
-The manifest builds the app against the freedesktop 25.08 runtime. It is not
-on Flathub yet; the RPM, .deb and tarball from the GitHub release are the
-supported installs for now.
+The release workflow builds `VoiceChanger.flatpak` from this manifest (freedesktop
+24.08 runtime) and attaches it to every GitHub release:
+
+```sh
+flatpak install --user ./VoiceChanger.flatpak
+```
+
+It is not on Flathub yet. Inside the sandbox the AI runs on the CPU (the host's
+ROCm/CUDA runtime is not visible), so on an AMD or NVIDIA machine the native
+package is the better choice.
 
 Generate the offline cargo sources after every `Cargo.lock` change:
 
@@ -14,7 +21,7 @@ python3 flatpak-cargo-generator.py Cargo.lock -o packaging/flatpak/cargo-sources
 Then build and install for your user:
 
 ```sh
-flatpak install flathub org.freedesktop.Sdk//25.08 org.freedesktop.Sdk.Extension.rust-stable//25.08 org.freedesktop.Sdk.Extension.llvm20//25.08
+flatpak install flathub org.freedesktop.Sdk//24.08 org.freedesktop.Sdk.Extension.rust-stable//24.08 org.freedesktop.Sdk.Extension.llvm18//24.08
 flatpak-builder --user --install --force-clean build-dir packaging/flatpak/io.github.zerodaylabz.VoiceChanger.yml
 ```
 

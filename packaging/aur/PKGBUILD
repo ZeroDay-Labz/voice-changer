@@ -1,0 +1,60 @@
+# Maintainer: ZeroDay-Labz <https://github.com/ZeroDay-Labz/voice-changer>
+# Voice Changer: realtime voice changer that shows up as a PipeWire microphone.
+#   makepkg -si
+# AMD GPUs: install a ROCm build of ONNX Runtime and the app picks it up;
+# otherwise the bundled CPU runtime is used.
+
+pkgname=voice-changer
+pkgver=0.3.0
+pkgrel=1
+pkgdesc="Realtime voice changer with local AI voices, as a PipeWire microphone (and a CLAP plugin)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/ZeroDay-Labz/voice-changer"
+license=('MIT')
+depends=('pipewire' 'wireplumber' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'rust' 'clang' 'pkgconf' 'libxkbcommon' 'wayland' 'alsa-lib' 'curl')
+optdepends=('pipewire-pulse: lets PulseAudio apps (Discord, browsers, OBS) see the virtual microphone'
+            'python: converts .pth voice models to ONNX'
+            'xdg-desktop-portal: global on/off shortcut')
+options=('!lto')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export CARGO_TARGET_DIR=target
+  cargo build --release --frozen -p vc-app
+  cargo xtask bundle vc-plugin --release
+  # The CPU ONNX Runtime the app falls back to (Microsoft's build).
+  scripts/get-onnxruntime.sh "$srcdir/onnxruntime"
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  target/release/voice-changer --self-test
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/voice-changer "$pkgdir/usr/bin/voice-changer"
+  install -Dm755 target/bundled/vc-plugin.clap "$pkgdir/usr/lib/clap/vc-plugin.clap"
+  install -d "$pkgdir/usr/lib/voice-changer"
+  cp -P "$srcdir"/onnxruntime/libonnxruntime.so* "$pkgdir/usr/lib/voice-changer/"
+  install -Dm644 packaging/io.github.zerodaylabz.VoiceChanger.desktop \
+    "$pkgdir/usr/share/applications/io.github.zerodaylabz.VoiceChanger.desktop"
+  install -Dm644 packaging/io.github.zerodaylabz.VoiceChanger.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/io.github.zerodaylabz.VoiceChanger.metainfo.xml"
+  install -Dm644 packaging/io.github.zerodaylabz.VoiceChanger.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.zerodaylabz.VoiceChanger.svg"
+  for s in 16 32 48 64 128 256 512; do
+    install -Dm644 "packaging/icons/$s.png" \
+      "$pkgdir/usr/share/icons/hicolor/${s}x${s}/apps/io.github.zerodaylabz.VoiceChanger.png"
+  done
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

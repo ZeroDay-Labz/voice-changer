@@ -14,6 +14,20 @@ use std::sync::{Arc, Mutex};
 /// The RVC exporter script, shipped inside the binary.
 const EXPORTER_PY: &str = include_str!("../../../../scripts/rvc_export.py");
 const HF_BASE_REPO: &str = "TigreGotico/voiceclonnx-rvc";
+/// The base models with their sizes and SHA-256 (as published by the
+/// repository; a download that does not match is deleted, never installed).
+const BASE_MODELS: &[(&str, u64, &str)] = &[
+    (
+        "contentvec_768l12.onnx",
+        377_755_911,
+        "cbddd8fa9352b3128df6359e2e3da6be0f9072e768e51e3efc3004e5030ea97f",
+    ),
+    (
+        "rmvpe.onnx",
+        361_688_443,
+        "5370e71ac80af8b4b7c793d27efd51fd8bf962de3a7ede0766dac0befa3660fd",
+    ),
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stage {
@@ -259,13 +273,13 @@ pub fn start_base_models_download() -> Arc<ImportStatus> {
             let run = || -> Result<()> {
                 let dir = super::models_dir().ok_or_else(|| anyhow!("no data directory"))?;
                 std::fs::create_dir_all(&dir)?;
-                for f in ["contentvec_768l12.onnx", "rmvpe.onnx"] {
+                for (f, size, sha) in BASE_MODELS {
                     let dest = dir.join(f);
                     if dest.is_file() {
                         continue;
                     }
                     let url = format!("https://huggingface.co/{HF_BASE_REPO}/resolve/main/{f}");
-                    download(&url, &dest, &st)?;
+                    download_verified(&url, &dest, &st, Some(*size), Some(sha))?;
                 }
                 Ok(())
             };
@@ -418,6 +432,21 @@ fn pick_hf_file(repo: &str, status: &ImportStatus) -> Result<(String, String, Op
 }
 
 fn download(url: &str, dest: &Path, status: &ImportStatus) -> Result<()> {
+    download_verified(url, dest, status, None, None)
+}
+
+/// Download to `dest` through a `.part` file. The result is checked
+/// against the server's Content-Length (and `expected_size` / `sha256`
+/// when known): a cut-off or corrupted download is removed and reported
+/// instead of being installed as a model that then fails to load.
+fn download_verified(
+    url: &str,
+    dest: &Path,
+    status: &ImportStatus,
+    expected_size: Option<u64>,
+    sha256: Option<&str>,
+) -> Result<()> {
+    use sha2::Digest as _;
     let file_name = dest
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
@@ -435,6 +464,7 @@ fn download(url: &str, dest: &Path, status: &ImportStatus) -> Result<()> {
     let mut out = std::fs::File::create(&tmp)?;
     let mut buf = vec![0u8; 1 << 16];
     let mut done = 0u64;
+    let mut hasher = sha2::Sha256::new();
     loop {
         status.check_cancel().inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
@@ -444,6 +474,9 @@ fn download(url: &str, dest: &Path, status: &ImportStatus) -> Result<()> {
             break;
         }
         out.write_all(&buf[..n])?;
+        if sha256.is_some() {
+            hasher.update(&buf[..n]);
+        }
         done += n as u64;
         status.set(Stage::Downloading {
             file: file_name.clone(),
@@ -456,6 +489,26 @@ fn download(url: &str, dest: &Path, status: &ImportStatus) -> Result<()> {
     if done < 1000 {
         let _ = std::fs::remove_file(&tmp);
         bail!("download was only {done} bytes; the link probably isn't a model file");
+    }
+    let want = expected_size.or(total);
+    if let Some(want) = want
+        && want != done
+    {
+        let _ = std::fs::remove_file(&tmp);
+        bail!(
+            "download of {file_name} stopped at {:.1} of {:.1} MB; check the connection and try again",
+            done as f32 / 1e6,
+            want as f32 / 1e6
+        );
+    }
+    if let Some(expected) = sha256 {
+        let got = format!("{:x}", hasher.finalize());
+        if got != expected {
+            let _ = std::fs::remove_file(&tmp);
+            bail!(
+                "{file_name} is corrupted (checksum mismatch); it was removed, try the download again"
+            );
+        }
     }
     std::fs::rename(&tmp, dest)?;
     status.note(format!("got {} ({:.1} MB)", file_name, done as f32 / 1e6));

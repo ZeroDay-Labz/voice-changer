@@ -2,6 +2,32 @@
 //! or a specific GPU and the worker reloads the models accordingly.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static NVIDIA: OnceLock<Vec<GpuInfo>> = OnceLock::new();
+static RUNTIME: OnceLock<Option<(PathBuf, RuntimeKind)>> = OnceLock::new();
+static GPUS: OnceLock<Vec<GpuInfo>> = OnceLock::new();
+
+/// Run the slow probes (`nvidia-smi`, `rocminfo`, library search) on a
+/// background thread so the window never waits for them. Call once at
+/// startup; everything else reads the cached results.
+pub fn probe_in_background() {
+    if GPUS.get().is_some() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("gpu-probe".into())
+        .spawn(|| {
+            let _ = runtime_lib();
+            let _ = gpus();
+            let _ = super::hardware::info();
+        });
+}
+
+/// The GPU list if the probe has finished, without blocking on it.
+pub fn gpus_if_probed() -> Option<Vec<GpuInfo>> {
+    GPUS.get().cloned()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuInfo {
@@ -82,8 +108,7 @@ pub fn setting_string(b: Option<Backend>) -> String {
 
 /// NVIDIA GPUs as reported by `nvidia-smi` (present whenever the driver is). Cached.
 pub fn nvidia_gpus() -> Vec<GpuInfo> {
-    static CACHE: std::sync::OnceLock<Vec<GpuInfo>> = std::sync::OnceLock::new();
-    CACHE
+    NVIDIA
         .get_or_init(|| {
             let Ok(out) = std::process::Command::new("nvidia-smi")
                 .args(["--query-gpu=name", "--format=csv,noheader"])
@@ -138,24 +163,9 @@ pub fn rocm_runtime_lib() -> Option<PathBuf> {
         return p.is_file().then_some(p);
     }
     let candidates = ["/usr/lib64/rocm/lib", "/usr/lib/rocm/lib", "/opt/rocm/lib"];
-    for dir in candidates {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            let mut libs: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .map(|f| f.to_string_lossy().starts_with("libonnxruntime.so"))
-                        .unwrap_or(false)
-                })
-                .collect();
-            libs.sort();
-            if let Some(lib) = libs.pop() {
-                return Some(lib);
-            }
-        }
-    }
-    None
+    candidates
+        .iter()
+        .find_map(|dir| newest_lib(std::path::Path::new(dir)))
 }
 
 /// Whether this build can use a GPU at all (a ROCm or CUDA runtime is loaded).
@@ -163,8 +173,11 @@ pub fn gpu_runtime_available() -> bool {
     cfg!(feature = "gpu") && runtime_kind() != RuntimeKind::Cpu
 }
 
+/// The highest-versioned `libonnxruntime.so*` in `dir`, comparing version
+/// numbers numerically (a plain string sort puts `so.1.9` after `so.1.22`).
+/// Libraries older than the API this build was compiled against are skipped.
 fn newest_lib(dir: &std::path::Path) -> Option<PathBuf> {
-    let mut libs: Vec<PathBuf> = std::fs::read_dir(dir)
+    let mut libs: Vec<(Vec<u32>, PathBuf)> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
@@ -173,9 +186,27 @@ fn newest_lib(dir: &std::path::Path) -> Option<PathBuf> {
                 .map(|f| f.to_string_lossy().starts_with("libonnxruntime.so"))
                 .unwrap_or(false)
         })
+        .map(|p| (lib_version(&p), p))
+        .filter(|(v, _)| v.is_empty() || v >= &MIN_RUNTIME_VERSION.to_vec())
         .collect();
-    libs.sort();
-    libs.pop()
+    // A bare `libonnxruntime.so` symlink says nothing about its version:
+    // prefer any explicitly versioned file, then the highest version.
+    libs.sort_by(|a, b| a.0.cmp(&b.0));
+    libs.pop().map(|(_, p)| p)
+}
+
+/// Oldest ONNX Runtime this build can load (the C API version it targets).
+pub const MIN_RUNTIME_VERSION: [u32; 2] = [1, 22];
+
+/// `libonnxruntime.so.1.22.0` → `[1, 22, 0]`; a bare `.so` → `[]`.
+pub fn lib_version(path: &std::path::Path) -> Vec<u32> {
+    let name = path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+    name.strip_prefix("libonnxruntime.so.")
+        .map(|v| v.split('.').filter_map(|n| n.parse().ok()).collect())
+        .unwrap_or_default()
 }
 
 /// A CPU-only ONNX Runtime library for builds that load it dynamically:
@@ -203,8 +234,7 @@ pub fn cpu_runtime_lib() -> Option<PathBuf> {
 /// The runtime library a dynamic build will load: CUDA when an NVIDIA card
 /// and the CUDA runtime are both present, else ROCm, else CPU. Cached.
 pub fn runtime_lib() -> Option<(PathBuf, RuntimeKind)> {
-    static CACHE: std::sync::OnceLock<Option<(PathBuf, RuntimeKind)>> = std::sync::OnceLock::new();
-    CACHE
+    RUNTIME
         .get_or_init(|| {
             if !nvidia_gpus().is_empty()
                 && let Some(p) = cuda_runtime_lib()
@@ -256,74 +286,72 @@ pub fn gpu_note() -> Option<String> {
 /// GPUs the loaded runtime can use: NVIDIA via `nvidia-smi` with the CUDA
 /// runtime, AMD via `rocminfo` with the ROCm runtime. Cached.
 pub fn gpus() -> Vec<GpuInfo> {
-    static CACHE: std::sync::OnceLock<Vec<GpuInfo>> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            match runtime_kind() {
-                RuntimeKind::Cuda => return nvidia_gpus(),
-                RuntimeKind::Cpu => return Vec::new(),
-                RuntimeKind::Rocm => {}
+    GPUS.get_or_init(|| {
+        match runtime_kind() {
+            RuntimeKind::Cuda => return nvidia_gpus(),
+            RuntimeKind::Cpu => return Vec::new(),
+            RuntimeKind::Rocm => {}
+        }
+        let Ok(out) = std::process::Command::new("rocminfo").output() else {
+            return Vec::new();
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut gpus = Vec::new();
+        let mut name: Option<String> = None;
+        let mut marketing: Option<String> = None;
+        let mut is_gpu = false;
+        let mut index = 0;
+        let flush = |gpus: &mut Vec<GpuInfo>,
+                     name: &mut Option<String>,
+                     marketing: &mut Option<String>,
+                     is_gpu: &mut bool,
+                     index: &mut i32| {
+            if *is_gpu {
+                let label = marketing
+                    .take()
+                    .or_else(|| name.take())
+                    .unwrap_or_else(|| "GPU".into());
+                gpus.push(GpuInfo {
+                    index: *index,
+                    name: label,
+                    api: "ROCm",
+                });
+                *index += 1;
             }
-            let Ok(out) = std::process::Command::new("rocminfo").output() else {
-                return Vec::new();
-            };
-            let text = String::from_utf8_lossy(&out.stdout);
-            let mut gpus = Vec::new();
-            let mut name: Option<String> = None;
-            let mut marketing: Option<String> = None;
-            let mut is_gpu = false;
-            let mut index = 0;
-            let flush = |gpus: &mut Vec<GpuInfo>,
-                         name: &mut Option<String>,
-                         marketing: &mut Option<String>,
-                         is_gpu: &mut bool,
-                         index: &mut i32| {
-                if *is_gpu {
-                    let label = marketing
-                        .take()
-                        .or_else(|| name.take())
-                        .unwrap_or_else(|| "GPU".into());
-                    gpus.push(GpuInfo {
-                        index: *index,
-                        name: label,
-                        api: "ROCm",
-                    });
-                    *index += 1;
+            *name = None;
+            *marketing = None;
+            *is_gpu = false;
+        };
+        for line in text.lines() {
+            let t = line.trim();
+            if t.starts_with("Agent ") && t.ends_with(':') || t.starts_with("*******") {
+                flush(
+                    &mut gpus,
+                    &mut name,
+                    &mut marketing,
+                    &mut is_gpu,
+                    &mut index,
+                );
+            } else if let Some(v) = t.strip_prefix("Marketing Name:") {
+                marketing = Some(v.trim().to_string());
+            } else if let Some(v) = t.strip_prefix("Name:") {
+                if name.is_none() {
+                    name = Some(v.trim().to_string());
                 }
-                *name = None;
-                *marketing = None;
-                *is_gpu = false;
-            };
-            for line in text.lines() {
-                let t = line.trim();
-                if t.starts_with("Agent ") && t.ends_with(':') || t.starts_with("*******") {
-                    flush(
-                        &mut gpus,
-                        &mut name,
-                        &mut marketing,
-                        &mut is_gpu,
-                        &mut index,
-                    );
-                } else if let Some(v) = t.strip_prefix("Marketing Name:") {
-                    marketing = Some(v.trim().to_string());
-                } else if let Some(v) = t.strip_prefix("Name:") {
-                    if name.is_none() {
-                        name = Some(v.trim().to_string());
-                    }
-                } else if let Some(v) = t.strip_prefix("Device Type:") {
-                    is_gpu = v.trim() == "GPU";
-                }
+            } else if let Some(v) = t.strip_prefix("Device Type:") {
+                is_gpu = v.trim() == "GPU";
             }
-            flush(
-                &mut gpus,
-                &mut name,
-                &mut marketing,
-                &mut is_gpu,
-                &mut index,
-            );
-            gpus
-        })
-        .clone()
+        }
+        flush(
+            &mut gpus,
+            &mut name,
+            &mut marketing,
+            &mut is_gpu,
+            &mut index,
+        );
+        gpus
+    })
+    .clone()
 }
 
 /// Resolve "auto" to the best available backend.

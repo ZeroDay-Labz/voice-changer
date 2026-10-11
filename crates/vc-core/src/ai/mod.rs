@@ -7,6 +7,7 @@
 
 pub mod compute;
 pub mod f0;
+pub mod hardware;
 pub mod index;
 pub mod library;
 pub mod mel;
@@ -18,6 +19,7 @@ pub mod stream;
 use std::path::{Path, PathBuf};
 
 pub use compute::{Backend, GpuInfo};
+pub use hardware::HardwareInfo;
 pub use index::RetrievalIndex;
 pub use library::{ImportStatus, Stage, VoiceInfo};
 pub use rvc::{ModelPaths, Rvc};

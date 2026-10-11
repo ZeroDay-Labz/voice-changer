@@ -25,6 +25,10 @@ pub enum HostSetting {
     StartMinimized(bool),
     Autostart(bool),
     Theme(crate::theme::Mode),
+    /// AI inference threads: 0 = Auto.
+    AiThreads(u32),
+    /// The welcome card was read.
+    DismissWelcome,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -32,6 +36,49 @@ pub struct HostSettings {
     pub close_to_tray: bool,
     pub start_minimized: bool,
     pub autostart: Option<bool>,
+    /// AI inference threads: 0 = Auto.
+    pub ai_threads: u32,
+    /// Show the welcome card.
+    pub first_run: bool,
+}
+
+/// Where the audio side stands (standalone only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioState {
+    Starting,
+    #[default]
+    Running,
+    Reconnecting,
+    Failed,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AudioStatus {
+    pub state: AudioState,
+    /// One plain sentence about the problem, empty when fine.
+    pub message: String,
+    pub virtual_mic: bool,
+    /// Audio has arrived from the microphone recently.
+    pub mic_alive: bool,
+    /// Applications currently hearing the virtual microphone.
+    pub listeners: usize,
+    /// The microphone the user chose and the one in use (differ while the
+    /// chosen one is unplugged); descriptions, not node names.
+    pub chosen_mic: Option<String>,
+    pub active_mic: Option<String>,
+}
+
+/// What this machine offers the AI, for the Settings page.
+#[derive(Debug, Clone, Default)]
+pub struct HardwareSummary {
+    /// "AMD Ryzen 9 5950X · 16 cores, 32 threads · 94 GB memory"
+    pub line: String,
+    /// Hardware threads: the most the user may pick.
+    pub max_threads: u32,
+    /// What Auto resolves to right now.
+    pub auto_threads: u32,
+    /// Threads the loaded voice actually runs with (0 = none loaded).
+    pub in_use: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,4 +149,14 @@ pub trait Host {
     }
     fn open_data_folder(&self) {}
     fn quit(&self) {}
+    /// Audio health (standalone only).
+    fn audio_status(&self) -> Option<AudioStatus> {
+        None
+    }
+    /// Try to start audio again after a failed start.
+    fn retry_audio(&self) {}
+    /// Cores, threads and the Auto thread count (AI builds only).
+    fn hardware(&self) -> Option<HardwareSummary> {
+        None
+    }
 }

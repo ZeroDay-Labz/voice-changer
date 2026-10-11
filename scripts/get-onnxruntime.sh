@@ -6,16 +6,25 @@
 #
 #   scripts/get-onnxruntime.sh [dir]           CPU, default dir ~/.local/lib/voice-changer
 #   scripts/get-onnxruntime.sh --cuda [dir]    CUDA, into <dir>/cuda
+#   scripts/get-onnxruntime.sh --arch aarch64 [dir]   another architecture (packaging)
 set -euo pipefail
 VERSION="${ORT_VERSION:-1.22.0}"
 CUDA=0
-if [[ "${1:-}" == "--cuda" ]]; then CUDA=1; shift; fi
+MACHINE="$(uname -m)"
+while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+        --cuda) CUDA=1; shift ;;
+        --arch) MACHINE="$2"; shift 2 ;;
+        *) echo "unknown option $1" >&2; exit 2 ;;
+    esac
+done
 DIR="${1:-${XDG_DATA_HOME:-$HOME/.local}/lib/voice-changer}"
 if [[ $CUDA == 1 ]]; then DIR="$DIR/cuda"; fi
-case "$(uname -m)" in
+case "$MACHINE" in
     x86_64) ARCH=x64 ;;
     aarch64) ARCH=aarch64 ;;
-    *) echo "unsupported architecture $(uname -m)" >&2; exit 1 ;;
+    arm64) ARCH=aarch64 ;;
+    *) echo "unsupported architecture $MACHINE" >&2; exit 1 ;;
 esac
 if [[ $CUDA == 1 ]]; then NAME="onnxruntime-linux-$ARCH-gpu-$VERSION"; else NAME="onnxruntime-linux-$ARCH-$VERSION"; fi
 URL="https://github.com/microsoft/onnxruntime/releases/download/v$VERSION/$NAME.tgz"

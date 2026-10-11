@@ -7,7 +7,7 @@ description = "Shared non-realtime glue: parameters, presets, config, AI worker"
 
 [features]
 default = []
-ai = ["dep:ort", "dep:realfft", "dep:ureq", "dep:zip", "dep:serde_json", "ort/download-binaries", "ort/copy-dylibs"]
+ai = ["dep:ort", "dep:realfft", "dep:ureq", "dep:zip", "dep:serde_json", "dep:sha2", "ort/download-binaries", "ort/copy-dylibs"]
 # AMD GPU via the system ONNX Runtime ROCm build (Fedora: `sudo dnf install onnxruntime-rocm`).
 # AMD (ROCm) and NVIDIA (CUDA) through a dynamically loaded ONNX Runtime.
 gpu = ["ai", "ort/rocm", "ort/load-dynamic", "dep:libloading"]
@@ -33,6 +33,7 @@ libloading = { version = "0.8", optional = true }
 ureq = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 realfft = { workspace = true, optional = true }
 
 [[example]]

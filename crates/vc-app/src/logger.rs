@@ -6,6 +6,8 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 const KEEP: usize = 300;
+/// Longest line kept for the in-app viewer.
+const MAX_LINE: usize = 400;
 
 static LINES: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -28,11 +30,20 @@ impl log::Log for Capture {
             .get()
             .map(|s| s.elapsed().as_secs_f32())
             .unwrap_or(0.0);
+        // One line per record, bounded in length: a multi-line debug dump
+        // (iced logs its whole window settings, icon pixels included) would
+        // otherwise become a 60 000-line text widget on the Settings page
+        // and freeze the window.
+        let body = record.args().to_string();
+        let first = body.lines().next().unwrap_or("");
+        let mut shown: String = first.chars().take(MAX_LINE).collect();
+        if shown.len() < first.len() || body.contains('\n') {
+            shown.push('…');
+        }
         let line = format!(
-            "{t:8.2}s {:<5} {}: {}",
+            "{t:8.2}s {:<5} {}: {shown}",
             record.level(),
             record.target(),
-            record.args()
         );
         if let Ok(mut l) = LINES.lock() {
             if l.len() >= KEEP {

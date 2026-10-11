@@ -87,6 +87,23 @@ pub fn send_to<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
         .align_y(Alignment::Center),
     ]
     .spacing(10);
+    if let Some(a) = &model.cache.audio {
+        let (line, color) = match a.listeners {
+            0 => (
+                "No app is hearing the voice yet. Pick “Voice Changer Mic” in the app's own input settings, tick the app below, or turn on the switch above.".to_string(),
+                theme::AMBER,
+            ),
+            1 => ("1 app is hearing the voice.".to_string(), theme::SKY),
+            n => (format!("{n} apps are hearing the voice."), theme::SKY),
+        };
+        col = col.push(tip(
+            text(line)
+                .size(13)
+                .color(color)
+                .wrapping(iced_core::text::Wrapping::WordOrGlyph),
+            help::LISTENERS,
+        ));
+    }
     if model.cache.app_streams.is_empty() {
         col = col.push(dim("No application is recording right now. Apps appear here once they open their microphone (Discord: join a call; OBS: add a mic source).", 12, mode));
     }
@@ -122,7 +139,7 @@ pub fn send_to<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
         ));
     }
     col = col.push(dim(
-        "Any app can also just pick “Voice Changer Mic” in its own input settings.",
+        "Any app can also just pick “Voice Changer Mic” in its own input settings. Discord and browsers keep their own device choice, so pick it there once if the switch above is off.",
         12,
         mode,
     ));

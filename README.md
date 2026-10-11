@@ -54,11 +54,14 @@ pick a microphone can use it. There is nothing to configure in PulseAudio or JAC
 
 | | |
 |---|---|
-| **Fedora** | Download the `.rpm` from the [latest release](https://github.com/ZeroDay-Labz/voice-changer/releases/latest), then `sudo dnf install ./voice-changer-*.rpm` |
-| **Debian / Ubuntu** | Download the `.deb`, then `sudo apt install ./voice-changer_*.deb` |
-| **Any Linux** | Download the `.tar.gz`, unpack it, run `./voice-changer`. The CLAP plugin is in the same folder. |
-| **Flatpak** | Coming. A draft manifest lives in `packaging/flatpak/`. |
+| **Fedora, openSUSE, RHEL family** | Download the `.rpm` from the [latest release](https://github.com/ZeroDay-Labz/voice-changer/releases/latest), then `sudo dnf install ./voice-changer-*.rpm` |
+| **Debian, Ubuntu, Mint, Zorin, Pop!_OS** | Download the `.deb`, then `sudo apt install ./voice-changer_*.deb` |
+| **Arch, Manjaro, EndeavourOS** | `git clone` this repository, `cd packaging/aur`, `makepkg -si` |
+| **Any Linux (also Steam Deck desktop mode)** | Download `VoiceChanger.flatpak`, then `flatpak install --user ./VoiceChanger.flatpak`; or unpack the `.tar.gz` and run `./voice-changer` (the CLAP plugin is in the same folder) |
 | **From source** | See [Building](#building). `scripts/install.sh` builds and installs everything for your user. |
+
+Every asset comes for **x86_64** and **aarch64** (Raspberry Pi 5, Asahi Linux, ARM
+laptops), with a `SHA256SUMS` file next to them.
 
 AMD GPUs work out of the box with the `onnxruntime-rocm` package; NVIDIA GPUs after
 `scripts/get-onnxruntime.sh --cuda` (see [Compute](#compute-cpu-or-gpu)).
@@ -66,8 +69,19 @@ AMD GPUs work out of the box with the `onnxruntime-rocm` package; NVIDIA GPUs af
 The packages install the app, the CLAP plugin (`/usr/lib64/clap/` or `/usr/lib/clap/`), a
 launcher and the icon. AI voice models are downloaded separately (see [AI voices](#ai-voices)).
 
-Requirements: PipeWire (any distribution from the last few years), a Wayland or X11
-desktop. The GPU build additionally needs Fedora's `onnxruntime-rocm` package.
+### Requirements
+
+| | |
+|---|---|
+| Sound server | **PipeWire** with WirePlumber, as the *audio* server (not only for screen sharing). Tested with PipeWire 1.0 and 1.6. |
+| System | glibc 2.35 or newer: Ubuntu 22.04+, Debian 12+, Fedora 36+, Linux Mint 21+, Zorin 17+, openSUSE Leap 15.6+ / Tumbleweed, Arch, NixOS |
+| Desktop | Wayland or X11. Any GPU; virtual machines fall back to software rendering |
+| Optional | A tray (KDE, GNOME with the AppIndicator extension), the GlobalShortcuts portal, `pipewire-pulse` so PulseAudio apps (Discord, browsers, OBS) see the microphone |
+
+Ubuntu 22.04 and Debian 12 ship PulseAudio as the default sound server; install
+`pipewire-audio` (Debian: `pipewire-audio` or `pipewire-pulse` + `wireplumber`), log out
+and in, and you are set. **`voice-changer doctor`** tells you exactly what is missing
+and what to install.
 
 ## Using it
 
@@ -82,7 +96,7 @@ desktop. The GPU build additionally needs Fedora's `onnxruntime-rocm` package.
 | **Voices** | Import AI voices from a link, list and delete installed ones, download the base models |
 | **Effects** | Pitch engine, Voice, Drive, Robot, Echo, Reverb, Tone |
 | **Mixer** | Input and output gain, auto level, limiter, noise suppression, voice-only gate, noise gate |
-| **Settings** | Microphone, hear-myself, close to tray, start minimized, autostart, hotkey, theme, log |
+| **Settings** | Microphone, hear-myself, audio status, close to tray, start minimized, autostart, hotkey, AI threads and engine, theme, log |
 
 Knobs: drag up or down, roll the mouse wheel, double-click or right-click to go back to the
 default. Sliders: drag or click anywhere on the rail, wheel, and the same double-click or
@@ -129,7 +143,10 @@ voice-changer voices               # installed voice models
 voice-changer voices add https://huggingface.co/user/voice-model "Nice Voice"
 voice-changer voices remove "Nice Voice"
 voice-changer show | quit
+voice-changer doctor               # check this computer: PipeWire, session manager, mics, GPU, models, tray
+voice-changer --self-test          # run the engine through every preset (no audio devices needed)
 voice-changer --quantum 512        # bigger audio block if you hear dropouts
+voice-changer --ai-threads 4       # AI inference threads (default: auto, from your CPU)
 voice-changer --help
 ```
 
@@ -186,8 +203,14 @@ The app loads ONNX Runtime at start and uses whichever it finds first:
 | CUDA build | `scripts/get-onnxruntime.sh --cuda` (needs NVIDIA's driver, CUDA 12 runtime and cuDNN 9) | NVIDIA GPUs appear under Compute |
 | CPU build | bundled with the packages, `scripts/get-onnxruntime.sh`, or the distribution's `onnxruntime` | CPU only |
 
-Settings → Audio shows which library is loaded. The first load of a voice on an AMD GPU
+Settings → AI shows which library is loaded. The first load of a voice on an AMD GPU
 compiles kernels, which takes tens of seconds and is cached in `~/.cache/miopen`.
+
+**Threads.** The AI picks its thread count from your processor: physical cores minus one
+(so audio and the window always have a core), only the performance cores on hybrid
+chips, at most 12, and just a few when the models run on a GPU. Settings → AI shows what
+was detected and lets you choose a number up to the threads you have; `--ai-threads N`
+does the same from the terminal. Lower it if other programs stutter while the AI runs.
 
 NVIDIA in short: install the driver and CUDA (Fedora: RPM Fusion's `xorg-x11-drv-nvidia-cuda`
 plus `cuda-toolkit-12` and `cudnn9` from NVIDIA's repository; Ubuntu: `nvidia-driver-5xx`,
@@ -216,6 +239,22 @@ interface copes; USB headsets usually do not.
 
 ## Troubleshooting
 
+Start with **`voice-changer doctor`**: it checks the sound server, the session manager,
+virtual-device support, microphones, GPU and AI runtime, models, tray and shortcut
+portal, and prints the fix for anything missing.
+
+- **"Audio is not running" in the window.** PipeWire is not the sound server on this
+  machine, or is not running. Ubuntu 22.04 / Debian 12: `sudo apt install pipewire-audio`
+  (or `pipewire-pulse wireplumber`), log out and in. Elsewhere:
+  `systemctl --user start pipewire wireplumber pipewire-pulse`. Press **Try again**.
+- **The app looks right but there is no "Voice Changer Mic" in Discord or the browser.**
+  Those apps talk PulseAudio; make sure `pipewire-pulse` is installed and
+  `pactl info` says `Server Name: PulseAudio (on PipeWire …)`.
+- **Blank or very slow window in a VM.** Run with `ICED_BACKEND=tiny-skia voice-changer`
+  (software rendering) or `WGPU_BACKEND=gl` (OpenGL instead of Vulkan).
+- **No window and no tray icon.** GNOME needs the AppIndicator extension for a tray; the
+  app opens its window instead when "Start minimized" finds no tray. `voice-changer show`
+  always brings it up.
 - **Pops or crackle.** Check the sidebar for "dropouts". Start with a bigger block
   (`voice-changer --quantum 512`), then run `pw-top` while speaking: an `ERR` count rising
   on your microphone or on `voice_changer.*` nodes confirms PipeWire xruns.

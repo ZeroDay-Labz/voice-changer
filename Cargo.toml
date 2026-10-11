@@ -4,7 +4,7 @@ members = ["crates/*", "xtask"]
 default-members = ["crates/vc-app"]
 
 [workspace.package]
-version = "0.2.5"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -52,6 +52,7 @@ clap = { version = "4", features = ["derive"] }
 ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 serde_json = "1"
+sha2 = "0.10"
 # ai (phase 2, feature-gated)
 ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "tls-native", "api-22"] }
 ctrlc = { version = "3", features = ["termination"] }

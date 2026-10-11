@@ -7,13 +7,18 @@ use std::sync::{Arc, Mutex};
 use vc_core::{Meters, Preset, VcParams};
 
 use crate::config::AppConfig;
-use crate::pw::{AppStream, AudioThread, DeviceInfo, Stats};
+use crate::pw::{AppStream, AudioConfig, AudioHealth, AudioState, AudioThread, DeviceInfo, Stats};
 
 pub struct Shared {
     pub params: Arc<VcParams>,
     pub sample_rate: f32,
     pub quantum: u32,
+    /// `None` while the audio side could not be started (see `audio_error`).
     pub audio: Mutex<Option<AudioThread>>,
+    /// What to spawn again when the user presses Retry.
+    pub audio_config: AudioConfig,
+    /// Why audio is not running, in one sentence for the window.
+    pub audio_error: Mutex<Option<String>>,
     pub stats: Arc<Stats>,
     pub meters: Arc<Meters>,
     /// Persistent settings; the Settings page edits and saves them.
@@ -29,20 +34,28 @@ pub struct Shared {
 }
 
 impl Shared {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         params: Arc<VcParams>,
         sample_rate: f32,
         quantum: u32,
-        audio: AudioThread,
+        audio: Result<AudioThread, String>,
+        audio_config: AudioConfig,
+        stats: Arc<Stats>,
+        meters: Arc<Meters>,
         config: AppConfig,
     ) -> Arc<Self> {
-        let stats = audio.stats.clone();
-        let meters = audio.meters.clone();
+        let (audio, error) = match audio {
+            Ok(a) => (Some(a), None),
+            Err(e) => (None, Some(e)),
+        };
         Arc::new(Self {
             params,
             sample_rate,
             quantum,
-            audio: Mutex::new(Some(audio)),
+            audio: Mutex::new(audio),
+            audio_config,
+            audio_error: Mutex::new(error),
             stats,
             meters,
             config: Mutex::new(config),
@@ -56,6 +69,97 @@ impl Shared {
 
     pub fn is_enabled(&self) -> bool {
         !self.params.bypass.value()
+    }
+
+    /// Try to start the audio side again (after a failed start).
+    pub fn retry_audio(&self) -> bool {
+        if self.audio.lock().map(|a| a.is_some()).unwrap_or(true) {
+            return true;
+        }
+        match AudioThread::spawn(
+            self.audio_config.clone(),
+            self.params.clone(),
+            self.stats.clone(),
+            self.meters.clone(),
+        ) {
+            Ok(a) => {
+                // `stats`/`meters` are per-thread Arcs; the window reads
+                // through `audio` for those from now on.
+                if let Ok(mut slot) = self.audio.lock() {
+                    *slot = Some(a);
+                }
+                if let Ok(mut e) = self.audio_error.lock() {
+                    *e = None;
+                }
+                let want_default = self
+                    .config
+                    .lock()
+                    .map(|c| c.set_as_default)
+                    .unwrap_or(false);
+                if want_default {
+                    self.set_default_source(true);
+                }
+                let mic = self.config.lock().ok().and_then(|c| c.mic.clone());
+                if mic.is_some() {
+                    self.set_capture_target(mic);
+                }
+                log::info!("audio started");
+                true
+            }
+            Err(e) => {
+                if let Ok(mut err) = self.audio_error.lock() {
+                    *err = Some(format!("{e:#}"));
+                }
+                false
+            }
+        }
+    }
+
+    /// The audio side's state, with the start-up failure folded in.
+    pub fn audio_health(&self) -> AudioHealth {
+        let running = self
+            .audio
+            .lock()
+            .ok()
+            .and_then(|a| a.as_ref().map(|a| a.health()));
+        match running {
+            Some(h) => h,
+            None => AudioHealth {
+                state: AudioState::Failed,
+                message: self
+                    .audio_error
+                    .lock()
+                    .ok()
+                    .and_then(|e| e.clone())
+                    .unwrap_or_else(|| "Audio is not running.".into()),
+                ..AudioHealth::default()
+            },
+        }
+    }
+
+    /// Applications currently linked to the virtual microphone.
+    pub fn listeners(&self) -> usize {
+        self.audio
+            .lock()
+            .ok()
+            .and_then(|a| a.as_ref().map(|a| a.listeners()))
+            .unwrap_or(0)
+    }
+
+    /// The microphone in use right now (None = system default).
+    pub fn active_target(&self) -> Option<String> {
+        self.audio
+            .lock()
+            .ok()
+            .and_then(|a| a.as_ref().and_then(|a| a.active_target()))
+    }
+
+    /// AI inference threads: 0 = Auto. Saved and applied immediately.
+    pub fn set_ai_threads(&self, threads: u32) {
+        self.params.set_ai_threads(threads);
+        if let Ok(mut c) = self.config.lock() {
+            c.ai_threads = threads;
+        }
     }
 
     pub fn set_enabled(&self, enabled: bool) {

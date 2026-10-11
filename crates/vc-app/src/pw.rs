@@ -4,10 +4,17 @@
 //! Both streams live on a dedicated thread that runs the PipeWire main loop.
 //! Their realtime `process` callbacks run on PipeWire's data thread and talk
 //! to each other through a lock-free SPSC ring buffer. The engine runs inside
-//! the *output* callback so the published mic always has fresh data.
+//! the *capture* callback so processing never stops while nobody listens.
+//!
+//! The thread runs *sessions*: one connection to the daemon with all its
+//! streams and listeners. When the daemon goes away (restart, crash, a
+//! WirePlumber update) the session ends, the thread waits a moment and
+//! starts a new one, re-applying the microphone choice and the take-over.
+//! The engine and the loaded AI models survive the gap.
 
 use anyhow::{Context as _, Result, anyhow};
 use pipewire as pw;
+use pw::proxy::ProxyT;
 use pw::registry::GlobalObject;
 use pw::spa;
 use pw::spa::pod::Pod;
@@ -15,12 +22,14 @@ use pw::types::ObjectType;
 use pw::{properties::properties, stream::StreamFlags};
 use spa::param::format::{MediaSubtype, MediaType};
 use spa::param::format_utils;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use vc_core::{Meters, Pipeline, VcParams};
 
 pub const SOURCE_NODE_NAME: &str = "voice_changer.source";
@@ -28,10 +37,14 @@ pub const SOURCE_DESCRIPTION: &str = "Voice Changer Mic";
 /// Internal stream that feeds the virtual microphone node.
 const OUTPUT_NODE_NAME: &str = "voice_changer.output";
 pub const CAPTURE_NODE_NAME: &str = "voice_changer.capture";
+pub const MONITOR_NODE_NAME: &str = "voice_changer.monitor";
 
 const SAMPLE_BYTES: usize = std::mem::size_of::<f32>();
 /// Largest block we'll ever be asked for in one callback.
 const MAX_BLOCK: usize = 8192;
+/// Wait between reconnection attempts, doubling up to the maximum.
+const RECONNECT_MIN: Duration = Duration::from_millis(500);
+const RECONNECT_MAX: Duration = Duration::from_secs(5);
 
 static PW_INIT: Once = Once::new();
 
@@ -58,8 +71,6 @@ pub struct AudioConfig {
     pub input_wav: Option<Arc<Vec<f32>>>,
 }
 
-pub const MONITOR_NODE_NAME: &str = "voice_changer.monitor";
-
 enum Command {
     Quit,
     /// Move the capture stream to another microphone (`node.name`), or back
@@ -74,6 +85,44 @@ enum Command {
     },
     /// Make the virtual mic the session's default source (or restore the previous one).
     SetDefaultSource(bool),
+}
+
+/// Where the audio side stands, for the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioState {
+    Starting,
+    Running,
+    /// The daemon went away; a new session is being attempted.
+    Reconnecting,
+    /// Could not start at all (no PipeWire, refused connection).
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct AudioHealth {
+    pub state: AudioState,
+    /// One plain sentence about the current problem, empty when fine.
+    pub message: String,
+    /// The virtual microphone node exists and is fed.
+    pub virtual_mic: bool,
+    /// The capture stream has delivered audio recently.
+    pub mic_alive: bool,
+    /// How many sessions have been (re)started.
+    pub sessions: u32,
+}
+
+impl Default for AudioHealth {
+    fn default() -> Self {
+        Self {
+            state: AudioState::Starting,
+            message: String::new(),
+            virtual_mic: false,
+            // Optimistic until the one-second check has seen two quiet
+            // seconds; otherwise every start would flash "no sound".
+            mic_alive: true,
+            sessions: 0,
+        }
+    }
 }
 
 /// An application that is currently recording (a `Stream/Input/Audio` node).
@@ -108,6 +157,18 @@ pub struct Routing {
     pub original_targets: std::collections::HashMap<u32, Option<String>>,
 }
 
+impl Routing {
+    /// Forget everything tied to a daemon instance (ids, serials, metadata
+    /// values); keep what the user asked for.
+    fn reset_for_new_session(&mut self) {
+        self.source_serial = None;
+        self.default_current = None;
+        self.default_is_us = false;
+        self.targets.clear();
+        self.original_targets.clear();
+    }
+}
+
 /// A selectable microphone (any `Audio/Source` node that isn't ours).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -138,28 +199,42 @@ pub struct AudioThread {
     sender: pw::channel::Sender<Command>,
     thread: Option<JoinHandle<Result<()>>>,
     pub stats: Arc<Stats>,
-    pub meters: Arc<Meters>,
     #[cfg(feature = "ai")]
     pub ai_status: Arc<vc_core::ai::AiStatus>,
     devices: Arc<Mutex<Vec<DeviceInfo>>>,
+    /// The microphone the user asked for (`None` = system default).
     capture_target: Arc<Mutex<Option<String>>>,
+    /// The microphone actually in use right now: differs from the preferred
+    /// one while that is unplugged.
+    active_target: Arc<Mutex<Option<String>>>,
     monitor_on: Arc<AtomicBool>,
     app_streams: Arc<Mutex<Vec<AppStream>>>,
     routing: Arc<Mutex<Routing>>,
+    health: Arc<Mutex<AudioHealth>>,
+    /// Links from the virtual mic to applications (apps hearing the voice).
+    listeners: Arc<AtomicUsize>,
+    quit: Arc<AtomicBool>,
     source_name: String,
 }
 
 impl AudioThread {
-    pub fn spawn(config: AudioConfig, params: Arc<VcParams>) -> Result<Self> {
+    pub fn spawn(
+        config: AudioConfig,
+        params: Arc<VcParams>,
+        stats: Arc<Stats>,
+        meters: Arc<Meters>,
+    ) -> Result<Self> {
         ensure_init();
         let (sender, receiver) = pw::channel::channel::<Command>();
-        let stats = Arc::new(Stats::default());
-        let meters = Arc::new(Meters::default());
         let devices = Arc::new(Mutex::new(Vec::new()));
         let capture_target = Arc::new(Mutex::new(config.capture_target.clone()));
+        let active_target = Arc::new(Mutex::new(config.capture_target.clone()));
         let monitor_on = Arc::new(AtomicBool::new(false));
         let app_streams = Arc::new(Mutex::new(Vec::new()));
         let routing = Arc::new(Mutex::new(Routing::default()));
+        let health = Arc::new(Mutex::new(AudioHealth::default()));
+        let listeners = Arc::new(AtomicUsize::new(0));
+        let quit = Arc::new(AtomicBool::new(false));
         let source_name = config.source_name.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
 
@@ -168,20 +243,22 @@ impl AudioThread {
         let ai_status = pipeline.ai_status();
         let ctx = LoopContext {
             config,
-            pipeline,
-            receiver,
+            pipeline: Arc::new(Mutex::new(pipeline)),
             stats: stats.clone(),
             meters: meters.clone(),
             devices: devices.clone(),
             capture_target: capture_target.clone(),
+            active_target: active_target.clone(),
             monitor_on: monitor_on.clone(),
             app_streams: app_streams.clone(),
             routing: routing.clone(),
-            ready: ready_tx,
+            health: health.clone(),
+            listeners: listeners.clone(),
+            quit: quit.clone(),
         };
         let thread = std::thread::Builder::new()
             .name("pipewire-main".into())
-            .spawn(move || run_loop(ctx))?;
+            .spawn(move || run_thread(ctx, receiver, ready_tx))?;
 
         // Surface startup errors (no daemon, bad target...) to the caller.
         ready_rx
@@ -192,14 +269,17 @@ impl AudioThread {
             sender,
             thread: Some(thread),
             stats,
-            meters,
             #[cfg(feature = "ai")]
             ai_status,
             devices,
             capture_target,
+            active_target,
             monitor_on,
             app_streams,
             routing,
+            health,
+            listeners,
+            quit,
             source_name,
         })
     }
@@ -237,6 +317,11 @@ impl AudioThread {
             .unwrap_or(false)
     }
 
+    /// Whether take-over is wanted (it may still be waiting for the session manager).
+    pub fn take_over(&self) -> bool {
+        self.routing.lock().map(|r| r.take_over).unwrap_or(false)
+    }
+
     pub fn set_default_source(&self, on: bool) {
         let _ = self.sender.send(Command::SetDefaultSource(on));
     }
@@ -256,9 +341,15 @@ impl AudioThread {
         self.devices.lock().map(|d| d.clone()).unwrap_or_default()
     }
 
-    /// `node.name` of the microphone we capture from; `None` = system default.
+    /// `node.name` of the microphone the user chose; `None` = system default.
     pub fn capture_target(&self) -> Option<String> {
         self.capture_target.lock().ok().and_then(|t| t.clone())
+    }
+
+    /// The microphone in use right now (differs from the choice while that
+    /// one is unplugged).
+    pub fn active_target(&self) -> Option<String> {
+        self.active_target.lock().ok().and_then(|t| t.clone())
     }
 
     pub fn set_capture_target(&self, target: Option<String>) {
@@ -268,7 +359,17 @@ impl AudioThread {
         let _ = self.sender.send(Command::SetCaptureTarget(target));
     }
 
+    pub fn health(&self) -> AudioHealth {
+        self.health.lock().map(|h| h.clone()).unwrap_or_default()
+    }
+
+    /// Applications currently linked to the virtual microphone.
+    pub fn listeners(&self) -> usize {
+        self.listeners.load(Ordering::Relaxed)
+    }
+
     pub fn shutdown(mut self) -> Result<()> {
+        self.quit.store(true, Ordering::SeqCst);
         let _ = self.sender.send(Command::Quit);
         if let Some(t) = self.thread.take() {
             t.join()
@@ -286,7 +387,10 @@ struct CaptureData {
     to_monitor: rtrb::Producer<f32>,
     monitor_on: Arc<AtomicBool>,
     format: spa::param::audio::AudioInfoRaw,
-    pipeline: Pipeline,
+    /// Shared with the thread so it survives a reconnect. Only this callback
+    /// ever locks it while a session runs; `try_lock` keeps the RT path free
+    /// of blocking.
+    pipeline: Arc<Mutex<Pipeline>>,
     scratch: Vec<f32>,
     input_wav: Option<Arc<Vec<f32>>>,
     wav_pos: usize,
@@ -350,16 +454,9 @@ fn drain_into(stream: &pw::stream::Stream, data: &mut SinkData) {
             data.target_slack += data.quantum;
         }
         if data.count_callbacks {
-            let n = data.stats.underruns.fetch_add(1, Ordering::Relaxed) + 1;
-            if n == 1 || n.is_power_of_two() {
-                // Logging from the RT thread is not ideal, but this only
-                // happens when audio is already breaking up.
-                log::warn!(
-                    "output underrun #{n}; buffering grows to {} frames (try --quantum {} if this keeps happening)",
-                    data.target_slack,
-                    data.quantum * 2
-                );
-            }
+            // Counted only: the window shows dropouts, and logging (which
+            // allocates and takes a lock) does not belong on the RT thread.
+            data.stats.underruns.fetch_add(1, Ordering::Relaxed);
         }
     }
     for dst in bytes.as_chunks_mut::<SAMPLE_BYTES>().0.iter_mut().take(n) {
@@ -376,48 +473,248 @@ fn drain_into(stream: &pw::stream::Stream, data: &mut SinkData) {
     *chunk.size_mut() = (n * SAMPLE_BYTES) as u32;
 }
 
+/// Everything a session needs, owned by the thread for its whole life.
 struct LoopContext {
     config: AudioConfig,
-    pipeline: Pipeline,
-    receiver: pw::channel::Receiver<Command>,
+    pipeline: Arc<Mutex<Pipeline>>,
     stats: Arc<Stats>,
     meters: Arc<Meters>,
     devices: Arc<Mutex<Vec<DeviceInfo>>>,
     capture_target: Arc<Mutex<Option<String>>>,
+    active_target: Arc<Mutex<Option<String>>>,
     monitor_on: Arc<AtomicBool>,
     app_streams: Arc<Mutex<Vec<AppStream>>>,
     routing: Arc<Mutex<Routing>>,
-    ready: std::sync::mpsc::Sender<Result<()>>,
+    health: Arc<Mutex<AudioHealth>>,
+    listeners: Arc<AtomicUsize>,
+    quit: Arc<AtomicBool>,
 }
 
-fn run_loop(ctx: LoopContext) -> Result<()> {
-    let LoopContext {
-        config,
-        pipeline,
-        receiver,
-        stats,
-        meters,
-        devices,
-        capture_target,
-        monitor_on,
-        app_streams,
-        routing,
-        ready,
-    } = ctx;
-    let setup = (|| -> Result<_> {
-        let mainloop = pw::main_loop::MainLoopRc::new(None).context("create main loop")?;
-        let context = pw::context::ContextRc::new(&mainloop, None).context("create context")?;
-        let core = context
-            .connect_rc(None)
-            .context("connect to PipeWire daemon")?;
-        Ok((mainloop, context, core))
-    })();
-    let (mainloop, _context, core) = match setup {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = ready.send(Err(anyhow!("{e:#}")));
-            return Err(e);
+fn set_health(health: &Mutex<AudioHealth>, f: impl FnOnce(&mut AudioHealth)) {
+    if let Ok(mut h) = health.lock() {
+        f(&mut h);
+    }
+}
+
+/// Why a session ended.
+enum SessionEnd {
+    Quit,
+    /// The connection to the daemon was lost; try again.
+    Lost(String),
+}
+
+/// The thread body: run sessions until quit, reconnecting after a loss.
+fn run_thread(
+    ctx: LoopContext,
+    receiver: pw::channel::Receiver<Command>,
+    ready: std::sync::mpsc::Sender<Result<()>>,
+) -> Result<()> {
+    let mut receiver = Some(receiver);
+    let mut ready = Some(ready);
+    let mut backoff = RECONNECT_MIN;
+    loop {
+        let first = ready.is_some();
+        let rx = receiver
+            .take()
+            .expect("receiver is handed back after every session");
+        match run_session(&ctx, rx, ready.take()) {
+            Ok((SessionEnd::Quit, _)) => return Ok(()),
+            Ok((SessionEnd::Lost(why), rx)) => {
+                receiver = Some(rx);
+                if ctx.quit.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                log::warn!("audio session lost ({why}); reconnecting");
+                set_health(&ctx.health, |h| {
+                    h.state = AudioState::Reconnecting;
+                    h.message = "Reconnecting to the audio system…".into();
+                    h.virtual_mic = false;
+                    h.mic_alive = false;
+                });
+                ctx.listeners.store(0, Ordering::Relaxed);
+                backoff = RECONNECT_MIN;
+            }
+            Err((e, rx)) => {
+                if first {
+                    // The very first attempt failed: the caller shows it.
+                    return Err(e);
+                }
+                receiver = Some(rx);
+                if ctx.quit.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                log::warn!("could not reconnect to PipeWire ({e:#}); retrying in {backoff:?}");
+                set_health(&ctx.health, |h| {
+                    h.state = AudioState::Reconnecting;
+                    h.message = format!("Waiting for the audio system to come back ({e:#})");
+                });
+            }
         }
+        // Sleep in slices so Quit is honoured quickly.
+        let until = Instant::now() + backoff;
+        while Instant::now() < until {
+            if ctx.quit.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        backoff = (backoff * 2).min(RECONNECT_MAX);
+    }
+}
+
+/// Node/port ids used to wire our processed-audio output into the virtual
+/// microphone node. Linking by explicit ports is reliable where node-only
+/// linking is not.
+#[derive(Default)]
+struct FeedLink {
+    out_node: Option<u32>,
+    src_node: Option<u32>,
+    out_port: Option<u32>,
+    in_port: Option<u32>,
+    link: Option<pw::link::Link>,
+}
+
+/// One connection to the daemon. Returns how it ended plus the command
+/// receiver (so the next session can reuse it), or the setup error.
+#[allow(clippy::type_complexity)]
+fn run_session(
+    ctx: &LoopContext,
+    receiver: pw::channel::Receiver<Command>,
+    ready: Option<std::sync::mpsc::Sender<Result<()>>>,
+) -> std::result::Result<
+    (SessionEnd, pw::channel::Receiver<Command>),
+    (anyhow::Error, pw::channel::Receiver<Command>),
+> {
+    if let Ok(mut r) = ctx.routing.lock() {
+        r.reset_for_new_session();
+    }
+    if let Ok(mut d) = ctx.devices.lock() {
+        d.clear();
+    }
+    if let Ok(mut a) = ctx.app_streams.lock() {
+        a.clear();
+    }
+    set_health(&ctx.health, |h| h.sessions += 1);
+
+    // Build everything inside a closure so that *every* failure, not only
+    // the connection, is reported to whoever is waiting.
+    let built = build_session(ctx);
+    let session = match built {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(ready) = ready {
+                set_health(&ctx.health, |h| {
+                    h.state = AudioState::Failed;
+                    h.message = format!("{e:#}");
+                });
+                let _ = ready.send(Err(anyhow!("{e:#}")));
+            }
+            return Err((e, receiver));
+        }
+    };
+    let Session {
+        mainloop,
+        _context,
+        _core,
+        _core_listener,
+        _vsource,
+        _capture,
+        _output,
+        _monitor,
+        _capture_listener,
+        _output_listener,
+        _monitor_listener,
+        _registry,
+        _registry_listener,
+        _metadata,
+        _metadata_listener,
+        _source_node,
+        _feed_link,
+        end,
+        receiver_slot,
+    } = session;
+
+    // Commands arrive through the channel attached to this loop.
+    let attached = receiver.attach(mainloop.loop_(), {
+        let slot = receiver_slot.clone();
+        move |cmd| {
+            if let Some(handler) = slot.borrow().as_ref() {
+                handler(cmd);
+            }
+        }
+    });
+
+    set_health(&ctx.health, |h| {
+        h.state = AudioState::Running;
+        h.message.clear();
+    });
+    if let Some(ready) = ready {
+        let _ = ready.send(Ok(()));
+    }
+    log::info!("audio session running");
+    mainloop.run();
+    log::info!("PipeWire loop stopped");
+    let receiver = attached.deattach();
+    let outcome = end
+        .take()
+        .unwrap_or(SessionEnd::Lost("loop stopped".into()));
+    Ok((outcome, receiver))
+}
+
+type CommandHandler = Rc<RefCell<Option<Box<dyn Fn(Command)>>>>;
+
+/// Everything that has to stay alive while the loop runs.
+struct Session {
+    mainloop: pw::main_loop::MainLoopRc,
+    _context: pw::context::ContextRc,
+    _core: pw::core::CoreRc,
+    _core_listener: pw::core::Listener,
+    _vsource: pw::node::Node,
+    _capture: pw::stream::StreamRc,
+    _output: pw::stream::StreamRc,
+    _monitor: pw::stream::StreamRc,
+    _capture_listener: pw::stream::StreamListener<CaptureData>,
+    _output_listener: pw::stream::StreamListener<SinkData>,
+    _monitor_listener: pw::stream::StreamListener<SinkData>,
+    _registry: pw::registry::RegistryRc,
+    _registry_listener: pw::registry::Listener,
+    _metadata: Rc<RefCell<Option<pw::metadata::Metadata>>>,
+    _metadata_listener: Rc<RefCell<Option<pw::metadata::MetadataListener>>>,
+    _source_node: Rc<RefCell<Option<pw::node::Node>>>,
+    _feed_link: Rc<RefCell<FeedLink>>,
+    end: Rc<RefCell<Option<SessionEnd>>>,
+    receiver_slot: CommandHandler,
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_session(ctx: &LoopContext) -> Result<Session> {
+    let config = &ctx.config;
+    let stats = ctx.stats.clone();
+    let devices = ctx.devices.clone();
+    let capture_target = ctx.capture_target.clone();
+    let active_target = ctx.active_target.clone();
+    let app_streams = ctx.app_streams.clone();
+    let routing = ctx.routing.clone();
+    let health = ctx.health.clone();
+
+    let mainloop = pw::main_loop::MainLoopRc::new(None).context("create main loop")?;
+    let context = pw::context::ContextRc::new(&mainloop, None).context("create context")?;
+    let core = context
+        .connect_rc(None)
+        .context("connect to the PipeWire audio system")?;
+
+    let end: Rc<RefCell<Option<SessionEnd>>> = Rc::new(RefCell::new(None));
+    // Ends the session (once) from any callback.
+    let lose = {
+        let end = end.clone();
+        let mainloop = mainloop.clone();
+        Rc::new(move |why: String| {
+            let mut e = end.borrow_mut();
+            if e.is_none() {
+                *e = Some(SessionEnd::Lost(why));
+                mainloop.quit();
+            }
+        })
     };
 
     let latency = format!("{}/{}", config.quantum, config.rate);
@@ -437,9 +734,36 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
         "audio.position" => "[MONO]",
         "object.linger" => "false",
     };
-    let _vsource: pw::node::Node = core
+    let vsource: pw::node::Node = core
         .create_object("adapter", &vsource_props)
-        .context("create virtual microphone node")?;
+        .context("create the virtual microphone")?;
+    let vsource_id = vsource.upcast_ref().id();
+
+    // Errors from the daemon arrive here: a failed object creation names
+    // the proxy, a dead connection names the core (id 0).
+    let core_listener = core
+        .add_listener_local()
+        .error({
+            let lose = lose.clone();
+            let health = health.clone();
+            move |id, _seq, res, message| {
+                if id == 0 || res == -libc_epipe() {
+                    log::error!("PipeWire connection error: {message} ({res})");
+                    lose(message.to_string());
+                } else if id == vsource_id {
+                    log::error!("the virtual microphone could not be created: {message} ({res})");
+                    set_health(&health, |h| {
+                        h.virtual_mic = false;
+                        h.message = format!(
+                            "The audio system refused to create the virtual microphone ({message}). Apps cannot pick “Voice Changer Mic”; Hear myself still works."
+                        );
+                    });
+                } else {
+                    log::warn!("PipeWire error on object {id}: {message} ({res})");
+                }
+            }
+        })
+        .register();
 
     // One second of headroom each; the sink callbacks trim their queues so
     // real latency stays around one quantum.
@@ -457,25 +781,34 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
         *pw::keys::AUDIO_CHANNELS => "1",
         "audio.position" => "[MONO]",
     };
-    if let Some(target) = &config.capture_target {
+    let initial_target = active_target.lock().ok().and_then(|t| t.clone());
+    if let Some(target) = &initial_target {
         cap_props.insert(*pw::keys::TARGET_OBJECT, target.as_str());
     }
     let capture = pw::stream::StreamRc::new(core.clone(), "Voice Changer capture", cap_props)
         .context("create capture stream")?;
-    let _capture_listener = capture
+    let capture_listener = capture
         .add_local_listener_with_user_data(CaptureData {
             to_source,
             to_monitor,
-            monitor_on: monitor_on.clone(),
+            monitor_on: ctx.monitor_on.clone(),
             format: Default::default(),
-            pipeline,
+            pipeline: ctx.pipeline.clone(),
             scratch: vec![0.0; MAX_BLOCK],
             input_wav: config.input_wav.clone(),
             wav_pos: 0,
             stats: stats.clone(),
-            meters,
+            meters: ctx.meters.clone(),
         })
-        .state_changed(|_, _, old, new| log::info!("capture stream: {old:?} -> {new:?}"))
+        .state_changed({
+            let lose = lose.clone();
+            move |_, _, old, new| {
+                log::info!("capture stream: {old:?} -> {new:?}");
+                if let pw::stream::StreamState::Error(e) = new {
+                    lose(format!("capture stream error: {e}"));
+                }
+            }
+        })
         .param_changed(|_, data, id, param| {
             let Some(param) = param else { return };
             if id != spa::param::ParamType::Format.as_raw() {
@@ -507,6 +840,8 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
             let offset = d.chunk().offset() as usize;
             let channels = data.format.channels().max(1) as usize;
             let Some(bytes) = d.data() else { return };
+            // A chunk that points past its buffer must not panic the RT thread.
+            let offset = offset.min(bytes.len());
             let end = (offset + size).min(bytes.len());
             let frame_bytes = SAMPLE_BYTES * channels;
             let frames = ((end - offset) / frame_bytes).min(data.scratch.len());
@@ -531,17 +866,22 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                 }
             }
 
+            // Uncontended except for the instant a session is torn down.
+            let Ok(mut pipeline) = data.pipeline.try_lock() else {
+                return;
+            };
             let started = std::time::Instant::now();
-            data.pipeline.process(scratch);
+            pipeline.process(scratch);
             let us = started.elapsed().as_micros() as u64;
             data.stats.process_max_us.fetch_max(us, Ordering::Relaxed);
             let avg = data.stats.process_avg_us.load(Ordering::Relaxed);
             data.stats
                 .process_avg_us
                 .store((avg * 15 + us) / 16, Ordering::Relaxed);
-            let (i, o) = data.pipeline.peaks();
-            data.meters.publish(i, o, data.pipeline.engine.vad() > 0.5);
-            data.meters.publish_auto_gain(data.pipeline.auto_gain_db());
+            let (i, o) = pipeline.peaks();
+            data.meters.publish(i, o, pipeline.engine.vad() > 0.5);
+            data.meters.publish_auto_gain(pipeline.auto_gain_db());
+            drop(pipeline);
 
             let monitor = data.monitor_on.load(Ordering::Relaxed);
             for &s in scratch.iter() {
@@ -556,7 +896,7 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
         .register()
         .context("register capture listener")?;
 
-    // ---- output: published as a virtual microphone --------------------------------------
+    // ---- output: feeds the virtual microphone ----------------------------------------
     let out_props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Playback",
@@ -569,7 +909,7 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
     };
     let output = pw::stream::StreamRc::new(core.clone(), "Voice Changer output", out_props)
         .context("create output stream")?;
-    let _output_listener = output
+    let output_listener = output
         .add_local_listener_with_user_data(SinkData {
             consumer: from_capture,
             target_slack: (config.quantum as usize).max(64),
@@ -579,12 +919,23 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
             stats: stats.clone(),
             count_callbacks: true,
         })
-        .state_changed(|_, _, old, new| log::info!("source stream: {old:?} -> {new:?}"))
+        .state_changed({
+            let lose = lose.clone();
+            move |_, _, old, new| {
+                log::info!("source stream: {old:?} -> {new:?}");
+                if let pw::stream::StreamState::Error(e) = new {
+                    lose(format!("output stream error: {e}"));
+                }
+            }
+        })
         .process(drain_into)
         .register()
         .context("register output listener")?;
 
     // ---- monitor: hear yourself through the default output -------------------------------
+    // Role "Music" rather than "Communication": a communication stream
+    // makes WirePlumber switch Bluetooth headsets into the low-quality
+    // headset profile even while this stream only carries silence.
     let mon_props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Playback",
@@ -597,7 +948,7 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
     };
     let monitor = pw::stream::StreamRc::new(core.clone(), "Voice Changer monitor", mon_props)
         .context("create monitor stream")?;
-    let _monitor_listener = monitor
+    let monitor_listener = monitor
         .add_local_listener_with_user_data(SinkData {
             consumer: from_capture_mon,
             target_slack: (config.quantum as usize).max(64),
@@ -612,7 +963,7 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
         .register()
         .context("register monitor listener")?;
 
-    let format = mono_f32_format(config.rate);
+    let format = mono_f32_format(config.rate)?;
     let mut cap_params = [Pod::from_bytes(&format).ok_or_else(|| anyhow!("bad format pod"))?];
     capture
         .connect(
@@ -653,8 +1004,14 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
     let source_node: Rc<RefCell<Option<pw::node::Node>>> = Rc::new(RefCell::new(None));
     // Tracks the node/port ids needed to link our output into the virtual mic.
     let feed_link: Rc<RefCell<FeedLink>> = Rc::new(RefCell::new(FeedLink::default()));
+    // Links from the virtual mic's output to other nodes (= apps listening).
+    let listener_links: Rc<RefCell<HashSet<u32>>> = Rc::new(RefCell::new(HashSet::new()));
+    // The take-over waits here until the session manager's metadata and a
+    // real microphone are known (see `take_over_timer`).
+    let take_over_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let source_name = config.source_name.clone();
-    let _registry_listener = registry
+
+    let registry_listener = registry
         .add_listener_local()
         .global({
             let devices = devices.clone();
@@ -664,17 +1021,40 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
             let metadata_listener = metadata_listener.clone();
             let source_node = source_node.clone();
             let feed_link = feed_link.clone();
+            let listener_links = listener_links.clone();
+            let listeners = ctx.listeners.clone();
+            let health = health.clone();
             let core = core.clone();
             let registry = registry.downgrade();
             let source_name = source_name.clone();
+            let capture = capture.clone();
+            let capture_target = capture_target.clone();
+            let active_target = active_target.clone();
+            let take_over_pending = take_over_pending.clone();
             move |global| match global.type_ {
                 ObjectType::Node => {
-                    if let Some(dev) = device_from_global(global)
-                        && let Ok(mut list) = devices.lock()
-                    {
-                        list.retain(|d| d.id != dev.id);
-                        list.push(dev);
-                        list.sort_by(|a, b| a.description.cmp(&b.description));
+                    if let Some(dev) = device_from_global(global) {
+                        let name = dev.name.clone();
+                        if let Ok(mut list) = devices.lock() {
+                            list.retain(|d| d.id != dev.id);
+                            list.push(dev);
+                            list.sort_by(|a, b| a.description.cmp(&b.description));
+                        }
+                        // The microphone the user chose came back: use it again.
+                        let preferred = capture_target.lock().ok().and_then(|t| t.clone());
+                        let active = active_target.lock().ok().and_then(|t| t.clone());
+                        if preferred.as_deref() == Some(name.as_str()) && active != preferred {
+                            log::info!("microphone {name:?} is back; switching to it");
+                            if let Ok(mut a) = active_target.lock() {
+                                *a = preferred.clone();
+                            }
+                            retarget_capture(
+                                &capture,
+                                metadata.borrow().as_ref(),
+                                &devices,
+                                Some(&name),
+                            );
+                        }
                     }
                     let props = global.props.as_ref();
                     let node_name = props.and_then(|p| p.get("node.name"));
@@ -701,7 +1081,7 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                     } else if node_name == Some(source_name.as_str()) {
                         feed_link.borrow_mut().src_node = Some(global.id);
                     }
-                    try_feed_link(&core, &feed_link);
+                    try_feed_link(&core, &feed_link, &health);
                     if let Some(app) = app_stream_from_global(global) {
                         let id = app.id;
                         if let Ok(mut list) = app_streams.lock() {
@@ -712,7 +1092,11 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                         // everything is routed to us too.
                         if routing
                             .lock()
-                            .map(|r| r.take_over && !r.original_targets.contains_key(&id))
+                            .map(|r| {
+                                r.take_over
+                                    && r.default_is_us
+                                    && !r.original_targets.contains_key(&id)
+                            })
                             .unwrap_or(false)
                         {
                             route_stream(
@@ -738,7 +1122,19 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                         fl.in_port = Some(global.id);
                     }
                     drop(fl);
-                    try_feed_link(&core, &feed_link);
+                    try_feed_link(&core, &feed_link, &health);
+                }
+                ObjectType::Link => {
+                    // A link *from* the virtual mic is an application hearing us.
+                    let props = global.props.as_ref();
+                    let out_node: Option<u32> = props
+                        .and_then(|p| p.get("link.output.node"))
+                        .and_then(|s| s.parse().ok());
+                    let src = feed_link.borrow().src_node;
+                    if out_node.is_some() && out_node == src {
+                        listener_links.borrow_mut().insert(global.id);
+                        listeners.store(listener_links.borrow().len(), Ordering::Relaxed);
+                    }
                 }
                 ObjectType::Metadata => {
                     let is_default = global
@@ -749,11 +1145,11 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                     if is_default && let Some(registry) = registry.upgrade() {
                         match registry.bind::<pw::metadata::Metadata, _>(global) {
                             Ok(m) => {
-                                let routing = routing.clone();
+                                let routing_for_props = routing.clone();
                                 let listener = m
                                     .add_listener_local()
                                     .property(move |subject, key, _type, value| {
-                                        if let Ok(mut r) = routing.lock() {
+                                        if let Ok(mut r) = routing_for_props.lock() {
                                             match key {
                                                 Some("default.configured.audio.source")
                                                     if subject == 0 =>
@@ -776,6 +1172,11 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                                     .register();
                                 *metadata_listener.borrow_mut() = Some(listener);
                                 *metadata.borrow_mut() = Some(m);
+                                // A remembered take-over can now be applied
+                                // (the timer waits for a real microphone too).
+                                if routing.lock().map(|r| r.take_over).unwrap_or(false) {
+                                    take_over_pending.set(true);
+                                }
                             }
                             Err(e) => log::warn!("could not bind default metadata: {e}"),
                         }
@@ -788,21 +1189,50 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
             let devices = devices.clone();
             let app_streams = app_streams.clone();
             let routing = routing.clone();
+            let listener_links = listener_links.clone();
+            let listeners = ctx.listeners.clone();
+            let active_target = active_target.clone();
+            let capture = capture.clone();
+            let metadata = metadata.clone();
             move |id| {
-                if let Ok(mut list) = devices.lock() {
-                    list.retain(|d| d.id != id);
+                let mut unplugged: Option<DeviceInfo> = None;
+                if let Ok(mut list) = devices.lock()
+                    && let Some(pos) = list.iter().position(|d| d.id == id)
+                {
+                    unplugged = Some(list.remove(pos));
                 }
                 if let Ok(mut list) = app_streams.lock() {
                     list.retain(|a| a.id != id);
                 }
                 if let Ok(mut r) = routing.lock() {
                     r.targets.remove(&id);
+                    r.original_targets.remove(&id);
+                }
+                if listener_links.borrow_mut().remove(&id) {
+                    listeners.store(listener_links.borrow().len(), Ordering::Relaxed);
+                }
+                // The microphone in use vanished: fall back to the default
+                // for now; the registry handler switches back when it returns.
+                if let Some(dev) = unplugged {
+                    let active = active_target.lock().ok().and_then(|t| t.clone());
+                    if active.as_deref() == Some(dev.name.as_str()) {
+                        log::warn!(
+                            "microphone {:?} was unplugged; using the system default until it is back",
+                            dev.description
+                        );
+                        if let Ok(mut a) = active_target.lock() {
+                            *a = None;
+                        }
+                        retarget_capture(&capture, metadata.borrow().as_ref(), &devices, None);
+                    }
                 }
             }
         })
         .register();
 
-    let _receiver = receiver.attach(mainloop.loop_(), {
+    // ---- commands from the rest of the app ------------------------------------------------
+    let receiver_slot: CommandHandler = Rc::new(RefCell::new(None));
+    {
         let mainloop = mainloop.clone();
         let devices = devices.clone();
         let metadata = metadata.clone();
@@ -811,8 +1241,11 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
         let routing = routing.clone();
         let source_name = source_name.clone();
         let capture_target = capture_target.clone();
+        let active_target = active_target.clone();
         let app_streams = app_streams.clone();
-        move |cmd| match cmd {
+        let end = end.clone();
+        let take_over_pending = take_over_pending.clone();
+        let handler: Box<dyn Fn(Command)> = Box::new(move |cmd| match cmd {
             Command::Quit => {
                 // Put every application back on its own microphone, then
                 // restore the default, before leaving.
@@ -820,6 +1253,7 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                     restore_all_apps(metadata.borrow().as_ref(), &routing);
                 }
                 set_default_source(metadata.borrow().as_ref(), &routing, &source_name, false);
+                *end.borrow_mut() = Some(SessionEnd::Quit);
                 mainloop.quit()
             }
             Command::RouteApp { stream_id, on } => {
@@ -832,41 +1266,33 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                 );
             }
             Command::SetDefaultSource(on) => {
-                // Our own capture follows the system default source. If we
-                // become the default while it still follows, WirePlumber
-                // routes our capture onto our own output -- a feedback loop
-                // that silences the real microphone (and therefore Discord,
-                // routed apps and hear-myself). Pin the capture to a real
-                // microphone first; on the way out, restore the user's choice.
                 if on {
-                    let real = real_default_source(&routing, &devices, &source_name);
-                    retarget_capture(
-                        &capture,
-                        metadata.borrow().as_ref(),
-                        &devices,
-                        real.as_deref(),
-                    );
-                    set_default_source(metadata.borrow().as_ref(), &routing, &source_name, true);
                     if let Ok(mut r) = routing.lock() {
                         r.take_over = true;
                     }
-                    // Move every application that is recording right now onto
-                    // the voice changer (default-following apps AND apps pinned
-                    // to a specific device), and remember where each one was.
-                    let ids: Vec<u32> = app_streams
-                        .lock()
-                        .map(|l| l.iter().map(|a| a.id).collect())
-                        .unwrap_or_default();
-                    for id in ids {
-                        route_stream(metadata.borrow().as_ref(), &routing, &source_name, id, true);
-                    }
+                    let applied = apply_take_over(
+                        &capture,
+                        metadata.borrow().as_ref(),
+                        &devices,
+                        &routing,
+                        &source_name,
+                        &app_streams,
+                        &capture_target,
+                    );
+                    // Not possible yet (no session manager / no microphone
+                    // known): the timer below keeps trying.
+                    take_over_pending.set(!applied);
                 } else {
+                    take_over_pending.set(false);
                     if let Ok(mut r) = routing.lock() {
                         r.take_over = false;
                     }
                     restore_all_apps(metadata.borrow().as_ref(), &routing);
                     set_default_source(metadata.borrow().as_ref(), &routing, &source_name, false);
                     let want = capture_target.lock().ok().and_then(|t| t.clone());
+                    if let Ok(mut a) = active_target.lock() {
+                        *a = want.clone();
+                    }
                     retarget_capture(
                         &capture,
                         metadata.borrow().as_ref(),
@@ -876,6 +1302,9 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                 }
             }
             Command::SetCaptureTarget(target) => {
+                if let Ok(mut a) = active_target.lock() {
+                    *a = target.clone();
+                }
                 retarget_capture(
                     &capture,
                     metadata.borrow().as_ref(),
@@ -890,23 +1319,22 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                 let _ = &monitor;
                 log::info!("monitor {}", if on { "on" } else { "off" });
             }
-        }
-    });
+        });
+        *receiver_slot.borrow_mut() = Some(handler);
+    }
     log::info!(
         "capture target: {}",
-        capture_target
-            .lock()
-            .ok()
-            .and_then(|t| t.clone())
+        initial_target
+            .clone()
             .unwrap_or_else(|| "system default".into())
     );
 
     // A saved microphone that no longer exists (unplugged, renamed) must not
-    // leave the capture stream pointing at nothing: fall back to the default.
-    if let Some(wanted) = capture_target.lock().ok().and_then(|t| t.clone()) {
-        let check_at = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    // leave the capture stream pointing at nothing: fall back to the default
+    // (and come back to it when it reappears, see the registry handler).
+    if let Some(wanted) = initial_target.clone() {
         let devices = devices.clone();
-        let capture_target = capture_target.clone();
+        let active_target = active_target.clone();
         let capture = capture.clone();
         let metadata = metadata.clone();
         let timer = mainloop.loop_().add_timer(move |_| {
@@ -916,16 +1344,15 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
                 .unwrap_or(true);
             if !known {
                 log::warn!("saved microphone {wanted:?} is not present; using the system default");
-                if let Ok(mut t) = capture_target.lock() {
+                if let Ok(mut t) = active_target.lock() {
                     *t = None;
                 }
                 retarget_capture(&capture, metadata.borrow().as_ref(), &devices, None);
             }
         });
-        let _ = timer.update_timer(
-            Some(check_at.duration_since(std::time::Instant::now())),
-            None,
-        );
+        let _ = timer.update_timer(Some(Duration::from_millis(1500)), None);
+        // SAFETY of lifetime: the timer borrows the loop, which lives in the
+        // same `Session`; leaking it is simpler than carrying the borrow.
         std::mem::forget(timer);
     }
 
@@ -941,32 +1368,166 @@ fn run_loop(ctx: LoopContext) -> Result<()> {
             }
         });
         let _ = timer.update_timer(
-            Some(std::time::Duration::from_millis(1500)),
-            Some(std::time::Duration::from_secs(5)),
+            Some(Duration::from_millis(1500)),
+            Some(Duration::from_secs(5)),
         );
         std::mem::forget(timer);
     }
 
-    let _ = ready.send(Ok(()));
-    mainloop.run();
-    log::info!("PipeWire loop stopped");
-    Ok(())
+    // Take-over that could not be applied immediately (the session manager
+    // or a real microphone was not known yet, or we just reconnected):
+    // retry every half second until it sticks.
+    {
+        let take_over_pending = take_over_pending.clone();
+        let capture = capture.clone();
+        let metadata = metadata.clone();
+        let devices = devices.clone();
+        let routing = routing.clone();
+        let source_name = source_name.clone();
+        let app_streams = app_streams.clone();
+        let capture_target = capture_target.clone();
+        let timer = mainloop.loop_().add_timer(move |_| {
+            if !take_over_pending.get() {
+                return;
+            }
+            if !routing.lock().map(|r| r.take_over).unwrap_or(false) {
+                take_over_pending.set(false);
+                return;
+            }
+            if apply_take_over(
+                &capture,
+                metadata.borrow().as_ref(),
+                &devices,
+                &routing,
+                &source_name,
+                &app_streams,
+                &capture_target,
+            ) {
+                take_over_pending.set(false);
+            }
+        });
+        let _ = timer.update_timer(
+            Some(Duration::from_millis(500)),
+            Some(Duration::from_millis(500)),
+        );
+        std::mem::forget(timer);
+    }
+
+    // Health: is the microphone delivering audio? (Checked every second.)
+    {
+        let stats = stats.clone();
+        let health = health.clone();
+        let last = Cell::new(0u64);
+        let since = Cell::new(0u32);
+        let timer = mainloop.loop_().add_timer(move |_| {
+            let now = stats.capture_callbacks.load(Ordering::Relaxed);
+            let alive = now != last.get();
+            last.set(now);
+            if alive {
+                since.set(0);
+            } else {
+                since.set(since.get().saturating_add(1));
+            }
+            // Two quiet seconds in a row: the capture has no source.
+            let mic_alive = alive || since.get() < 2;
+            set_health(&health, |h| h.mic_alive = mic_alive);
+        });
+        let _ = timer.update_timer(Some(Duration::from_secs(1)), Some(Duration::from_secs(1)));
+        std::mem::forget(timer);
+    }
+    // Re-apply a remembered take-over on every (re)connect once the
+    // metadata object is bound; the registry handler flips the flag.
+    if routing.lock().map(|r| r.take_over).unwrap_or(false) {
+        take_over_pending.set(true);
+    }
+
+    Ok(Session {
+        mainloop,
+        _context: context,
+        _core: core,
+        _core_listener: core_listener,
+        _vsource: vsource,
+        _capture: capture,
+        _output: output,
+        _monitor: monitor,
+        _capture_listener: capture_listener,
+        _output_listener: output_listener,
+        _monitor_listener: monitor_listener,
+        _registry: registry,
+        _registry_listener: registry_listener,
+        _metadata: metadata,
+        _metadata_listener: metadata_listener,
+        _source_node: source_node,
+        _feed_link: feed_link,
+        end,
+        receiver_slot,
+    })
 }
 
-/// Node/port ids used to wire our processed-audio output into the virtual
-/// microphone node. Linking by explicit ports is reliable where node-only
-/// linking is not.
-#[derive(Default)]
-struct FeedLink {
-    out_node: Option<u32>,
-    src_node: Option<u32>,
-    out_port: Option<u32>,
-    in_port: Option<u32>,
-    link: Option<pw::link::Link>,
+/// `EPIPE` as PipeWire reports it (negative errno), without pulling in libc.
+const fn libc_epipe() -> i32 {
+    32
+}
+
+/// Become the microphone for everything, if the pieces are in place.
+/// Returns false when it has to wait (no session manager yet, no real
+/// microphone known yet), in which case the caller retries later.
+fn apply_take_over(
+    capture: &pw::stream::Stream,
+    metadata: Option<&pw::metadata::Metadata>,
+    devices: &Mutex<Vec<DeviceInfo>>,
+    routing: &Mutex<Routing>,
+    source_name: &str,
+    app_streams: &Mutex<Vec<AppStream>>,
+    capture_target: &Mutex<Option<String>>,
+) -> bool {
+    let Some(md) = metadata else {
+        log::info!("take-over waits for the session manager");
+        return false;
+    };
+    if capture.node_id() == u32::MAX {
+        return false;
+    }
+    // Our own capture follows the system default source. If we become the
+    // default while it still follows, WirePlumber routes our capture onto
+    // our own output -- a feedback loop that silences the real microphone
+    // (and therefore Discord, routed apps and hear-myself). Pin the capture
+    // to a real microphone first: the user's choice, else the current default.
+    let chosen = capture_target.lock().ok().and_then(|t| t.clone());
+    let present = |name: &str| {
+        devices
+            .lock()
+            .map(|d| d.iter().any(|x| x.name == name))
+            .unwrap_or(false)
+    };
+    let pin = chosen
+        .filter(|n| present(n))
+        .or_else(|| real_default_source(routing, devices, source_name));
+    let Some(pin) = pin else {
+        log::info!("take-over waits for a microphone to appear");
+        return false;
+    };
+    retarget_capture(capture, Some(md), devices, Some(&pin));
+    set_default_source(Some(md), routing, source_name, true);
+    // Move every application that is recording right now onto the voice
+    // changer (default-following apps AND apps pinned to a specific device),
+    // and remember where each one was.
+    let ids: Vec<u32> = app_streams
+        .lock()
+        .map(|l| l.iter().map(|a| a.id).collect())
+        .unwrap_or_default();
+    for id in ids {
+        route_stream(Some(md), routing, source_name, id, true);
+    }
+    true
 }
 
 /// Create the output -> virtual-mic link once both ports are known.
-fn try_feed_link(core: &pw::core::CoreRc, feed_link: &Rc<RefCell<FeedLink>>) {
+fn try_feed_link(
+    core: &pw::core::CoreRc,
+    feed_link: &Rc<RefCell<FeedLink>>,
+    health: &Mutex<AudioHealth>,
+) {
     let mut fl = feed_link.borrow_mut();
     if fl.link.is_some() {
         return;
@@ -987,8 +1548,20 @@ fn try_feed_link(core: &pw::core::CoreRc, feed_link: &Rc<RefCell<FeedLink>>) {
         Ok(link) => {
             log::info!("virtual microphone connected to the processed voice");
             fl.link = Some(link);
+            set_health(health, |h| {
+                h.virtual_mic = true;
+                if h.message.contains("virtual microphone") {
+                    h.message.clear();
+                }
+            });
         }
-        Err(e) => log::warn!("could not link output to virtual mic: {e}"),
+        Err(e) => {
+            log::warn!("could not link output to virtual mic: {e}");
+            set_health(health, |h| {
+                h.virtual_mic = false;
+                h.message = format!("The virtual microphone could not be connected ({e}).");
+            });
+        }
     }
 }
 
@@ -1028,7 +1601,7 @@ fn set_unity_volume(node: &pw::node::Node) {
 }
 
 /// Serialize an `EnumFormat` pod for mono 32-bit float at `rate`.
-fn mono_f32_format(rate: u32) -> Vec<u8> {
+fn mono_f32_format(rate: u32) -> Result<Vec<u8>> {
     let mut info = spa::param::audio::AudioInfoRaw::new();
     info.set_format(spa::param::audio::AudioFormat::F32LE);
     info.set_rate(rate);
@@ -1037,7 +1610,7 @@ fn mono_f32_format(rate: u32) -> Vec<u8> {
     position[0] = spa::sys::SPA_AUDIO_CHANNEL_MONO;
     info.set_position(position);
 
-    spa::pod::serialize::PodSerializer::serialize(
+    let (cursor, _) = spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
         &spa::pod::Value::Object(spa::pod::Object {
             type_: spa::sys::SPA_TYPE_OBJECT_Format,
@@ -1045,9 +1618,8 @@ fn mono_f32_format(rate: u32) -> Vec<u8> {
             properties: info.into(),
         }),
     )
-    .expect("serialize audio format")
-    .0
-    .into_inner()
+    .map_err(|e| anyhow!("serialize audio format: {e:?}"))?;
+    Ok(cursor.into_inner())
 }
 
 /// An application's recording stream, if this node is one (and not ours).
@@ -1102,6 +1674,12 @@ fn real_default_source(
     devices: &Mutex<Vec<DeviceInfo>>,
     source_name: &str,
 ) -> Option<String> {
+    let present = |name: &str| {
+        devices
+            .lock()
+            .map(|d| d.iter().any(|x| x.name == name))
+            .unwrap_or(false)
+    };
     if let Ok(r) = routing.lock() {
         for json in [r.default_current.as_deref(), r.default_prev.as_deref()]
             .into_iter()
@@ -1110,6 +1688,7 @@ fn real_default_source(
             if let Some(name) = json_name(json)
                 && name != source_name
                 && !name.starts_with("voice_changer")
+                && present(&name)
             {
                 return Some(name);
             }
@@ -1210,7 +1789,9 @@ fn set_default_source(
     if on {
         if !r.default_is_us {
             let current = r.default_current.clone();
-            r.default_prev = current.filter(|c| !c.contains(source_name));
+            if let Some(c) = current.filter(|c| !c.contains(source_name)) {
+                r.default_prev = Some(c);
+            }
             r.default_is_us = true;
         }
         metadata.set_property(
@@ -1242,7 +1823,7 @@ fn device_from_global(global: &GlobalObject<&spa::utils::dict::DictRef>) -> Opti
         return None;
     }
     let name = props.get("node.name")?.to_string();
-    if name.starts_with("voice_changer") || name.starts_with("vc_test") {
+    if name.starts_with("voice_changer") || name.starts_with("vc_") {
         return None;
     }
     let description = props

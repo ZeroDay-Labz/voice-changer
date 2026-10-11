@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 pub struct StreamConfig {
     pub sample_rate: usize,
     pub crossfade_ms: f32,
+    /// Inference threads. `0` follows the parameters (`ai_threads`, where
+    /// 0 again means Auto: derived from the machine's cores).
     pub threads: usize,
 }
 
@@ -22,10 +24,16 @@ impl Default for StreamConfig {
         Self {
             sample_rate: 48_000,
             crossfade_ms: 60.0,
-            threads: 8,
+            threads: 0,
         }
     }
 }
+
+/// How long a voice that failed to load (or kept failing to run) is left
+/// alone before another attempt, unless the user changes something.
+const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Consecutive inference failures before the voice is parked.
+const MAX_INFER_FAILURES: u32 = 3;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +70,8 @@ pub struct AiStatus {
     pub f0_hz: AtomicF32,
     pub dropouts: AtomicU64,
     pub model_rate: AtomicU64,
+    /// Inference threads the loaded voice runs with (0 until loaded).
+    pub threads: AtomicUsize,
 }
 
 impl AiStatus {
@@ -274,8 +284,26 @@ struct Loaded {
     from_model: Option<Resampler>,
     voice: PathBuf,
     device: String,
+    threads: usize,
     /// Speakers in the model; `ds` is clamped to this.
     speakers: i64,
+}
+
+/// What the worker is asked to run: a change in any of these reloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Wanted {
+    voice: PathBuf,
+    device: String,
+    threads: usize,
+}
+
+/// A configuration that failed, left alone until `until` or until the
+/// user asks for something else. Without this the worker would retry a
+/// missing or broken model twenty times a second (and, on GPU builds,
+/// leak a session every time).
+struct Parked {
+    wanted: Wanted,
+    until: Instant,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -305,6 +333,9 @@ fn worker_loop(
     let mut window_len = context + block + crossfade + tail_margin;
 
     let mut loaded: Option<Loaded> = None;
+    let mut parked: Option<Parked> = None;
+    let mut infer_failures = 0u32;
+    let mut last_input = Instant::now();
     let mut history: Vec<f32> = vec![0.0; window_len];
     let mut audio16 = Vec::new();
     let mut synth = Vec::new();
@@ -373,37 +404,67 @@ fn worker_loop(
         }
 
         let wanted_device = params.ai_device();
-        let voice_changed = loaded.as_ref().map(|l| &l.voice) != wanted_path.as_ref()
-            || loaded.as_ref().is_some_and(|l| l.device != wanted_device);
-        if voice_changed {
+        let wanted = wanted_path.as_ref().map(|voice| {
+            let gpu = super::compute::resolve(&wanted_device) != super::compute::Backend::Cpu;
+            let threads = if cfg.threads > 0 {
+                cfg.threads
+            } else {
+                super::hardware::resolve_threads(params.ai_threads(), gpu)
+            };
+            Wanted {
+                voice: voice.clone(),
+                device: wanted_device.clone(),
+                threads,
+            }
+        });
+        let have = loaded.as_ref().map(|l| Wanted {
+            voice: l.voice.clone(),
+            device: l.device.clone(),
+            threads: l.threads,
+        });
+        // A parked (failed) configuration is retried only after a pause, or
+        // as soon as the user asks for something different.
+        if let Some(p) = &parked
+            && (wanted.as_ref() != Some(&p.wanted) || Instant::now() >= p.until)
+        {
+            parked = None;
+        }
+        let blocked = parked.is_some();
+        if have != wanted && !blocked {
             active.store(false, Ordering::Relaxed);
             release(loaded.take());
-            if let Some(voice) = &wanted_path {
+            if let Some(w) = &wanted {
                 status.set(
                     AiState::Loading,
                     format!(
                         "loading {}",
-                        voice.file_name().unwrap_or_default().to_string_lossy()
+                        w.voice.file_name().unwrap_or_default().to_string_lossy()
                     ),
                 );
-                match load(voice, cfg.threads, &wanted_device) {
+                match load(&w.voice, w.threads, &w.device, sr) {
                     Ok(mut l) => {
                         let synth_context = ms_to_samples(SYNTH_CONTEXT_MS, 16_000);
                         let tail16 = (block + crossfade + tail_margin) / 3 + synth_context;
                         l.rvc.warm_up(l.to16k.output_len(window_len), tail16);
                         let backend =
-                            super::compute::resolve(&wanted_device).label(&super::compute::gpus());
+                            super::compute::resolve(&w.device).label(&super::compute::gpus());
                         status
                             .has_index
                             .store(l.rvc.index.is_some(), Ordering::Relaxed);
+                        status.threads.store(w.threads, Ordering::Relaxed);
                         loaded = Some(l);
                         settle = SETTLE_BLOCKS;
                         slow_blocks = 0;
+                        infer_failures = 0;
                         status.set(AiState::Ready, backend);
                     }
                     Err(e) => {
                         log::error!("AI voice load failed: {e:#}");
                         status.set(AiState::Error, format!("{e:#}"));
+                        parked = Some(Parked {
+                            wanted: w.clone(),
+                            until: Instant::now() + RETRY_AFTER,
+                        });
                     }
                 }
             } else {
@@ -415,7 +476,8 @@ fn worker_loop(
         }
 
         let Some(l) = loaded.as_mut() else {
-            std::thread::sleep(Duration::from_millis(50));
+            while input.pop().is_ok() {}
+            std::thread::sleep(Duration::from_millis(if blocked { 200 } else { 50 }));
             continue;
         };
         if !enabled {
@@ -431,9 +493,13 @@ fn worker_loop(
 
         // ---- wait for a block of input ------------------------------------------
         if input.slots() < block {
-            std::thread::sleep(Duration::from_millis(5));
+            // Poll briskly while audio is flowing; back off when nothing has
+            // arrived for a while (no microphone, capture suspended).
+            let idle = last_input.elapsed() > Duration::from_secs(1);
+            std::thread::sleep(Duration::from_millis(if idle { 30 } else { 5 }));
             continue;
         }
+        last_input = Instant::now();
         for x in block_buf.iter_mut() {
             *x = input.pop().unwrap_or(0.0);
         }
@@ -485,12 +551,38 @@ fn worker_loop(
             &mut synth,
         );
         let timings = match result {
-            Ok(t) => t,
+            Ok(t) => {
+                infer_failures = 0;
+                t
+            }
             Err(e) => {
-                log::error!("AI inference failed: {e:#}");
+                infer_failures += 1;
+                log::error!("AI inference failed ({infer_failures}): {e:#}");
                 status.set(AiState::Error, format!("{e:#}"));
                 active.store(false, Ordering::Relaxed);
-                release(loaded.take());
+                let taken = loaded.take();
+                let was = taken.as_ref().map(|l| Wanted {
+                    voice: l.voice.clone(),
+                    device: l.device.clone(),
+                    threads: l.threads,
+                });
+                release(taken);
+                if infer_failures >= MAX_INFER_FAILURES
+                    && let Some(w) = was
+                {
+                    // Reloading a model that fails every time just burns the
+                    // CPU (and GPU memory); leave it until something changes.
+                    log::error!(
+                        "AI voice keeps failing; giving it a rest. Pick it again or change Compute to retry."
+                    );
+                    parked = Some(Parked {
+                        wanted: w,
+                        until: Instant::now() + RETRY_AFTER * 10,
+                    });
+                }
+                // Let the model's session go through the normal release path
+                // and give the system a moment before reloading.
+                std::thread::sleep(Duration::from_millis(250));
                 continue;
             }
         };
@@ -589,18 +681,32 @@ fn release(loaded: Option<Loaded>) {
     drop(loaded);
 }
 
-fn load(voice: &std::path::Path, threads: usize, device: &str) -> anyhow::Result<Loaded> {
+fn load(
+    voice: &std::path::Path,
+    threads: usize,
+    device: &str,
+    sample_rate: usize,
+) -> anyhow::Result<Loaded> {
+    if !voice.is_file() {
+        anyhow::bail!(
+            "the voice file is missing: {} (pick another voice on the Voices page)",
+            voice.display()
+        );
+    }
     let dir = super::models_dir().ok_or_else(|| anyhow::anyhow!("no data directory"))?;
     let (contentvec, rmvpe) = super::find_base_models(&dir).ok_or_else(|| {
         anyhow::anyhow!(
-            "base models missing in {}: need contentvec_768l12_q8.onnx and rmvpe_q8.onnx",
+            "the base models are not downloaded yet (Voices page → Download base models); looked for {} and {} in {}",
+            super::CONTENTVEC_FILES[0],
+            super::RMVPE_FILES[0],
             dir.display()
         )
     })?;
     let backend = super::compute::resolve(device);
     log::info!(
-        "loading AI voice on {}",
-        backend.label(&super::compute::gpus())
+        "loading AI voice on {} with {threads} thread{}",
+        backend.label(&super::compute::gpus()),
+        if threads == 1 { "" } else { "s" }
     );
     let mut rvc = Rvc::load_on(
         &ModelPaths {
@@ -631,10 +737,11 @@ fn load(voice: &std::path::Path, threads: usize, device: &str) -> anyhow::Result
     }
     Ok(Loaded {
         rvc,
-        to16k: Resampler::new(48_000, 16_000),
+        to16k: Resampler::new(sample_rate, 16_000),
         from_model: None,
         speakers,
         voice: voice.to_path_buf(),
         device: device.to_string(),
+        threads,
     })
 }

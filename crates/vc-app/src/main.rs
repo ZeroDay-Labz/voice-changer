@@ -9,11 +9,13 @@
 mod config;
 mod control;
 mod dbus;
+mod doctor;
 mod gui_ctx;
 mod hotkey;
 mod launcher;
 mod logger;
 mod pw;
+mod selftest;
 mod tray;
 mod window;
 
@@ -72,7 +74,8 @@ struct Cli {
     #[arg(long, hide = true)]
     no_dbus: bool,
 
-    /// Test input: loop a mono WAV (16-bit or float, any rate ≈ 48 kHz) instead of the mic.
+    /// Test input: loop a mono WAV (16-bit or float, any rate ≈ 48 kHz) instead of the mic;
+    /// "synth" loops a built-in synthetic voice (no file needed).
     #[arg(long, hide = true)]
     input_wav: Option<std::path::PathBuf>,
 
@@ -91,6 +94,14 @@ struct Cli {
     /// Page to show for --screenshot: home, voices, effects, mixer, settings.
     #[arg(long, default_value = "home")]
     page: String,
+
+    /// AI inference threads: a number, or "auto" (derived from your CPU). Overrides the saved setting.
+    #[arg(long, value_name = "N|auto")]
+    ai_threads: Option<String>,
+
+    /// Run the engine through every preset on synthetic speech and exit (no audio devices needed).
+    #[arg(long)]
+    self_test: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -140,25 +151,61 @@ enum Command {
     Show,
     /// Quit the running instance.
     Quit,
+    /// Check this computer: PipeWire, session manager, PulseAudio apps, microphones, GPU, models, tray, shortcut portal.
+    Doctor,
 }
 
 fn main() -> Result<()> {
     logger::init(
-        "info,zbus=error,tracing=error,ksni=warn,ashpd=warn,ort=error,wgpu_core=warn,wgpu_hal=warn,naga=warn,iced_wgpu=warn,cosmic_text=warn,sctk=warn",
+        "info,zbus=error,tracing=error,ksni=warn,ashpd=warn,ort=error,wgpu_core=warn,wgpu_hal=warn,naga=warn,iced_wgpu=warn,iced_winit=warn,winit=warn,cosmic_text=warn,sctk=warn",
     );
     let cli = Cli::parse();
 
     if let Some(Command::Voices { action }) = &cli.command {
         return manage_voices(action.as_ref());
     }
+    if let Some(Command::Doctor) = &cli.command {
+        let code = doctor::print(&doctor::run_checks());
+        std::process::exit(code);
+    }
+    if cli.self_test {
+        return selftest::run(cli.rate, cli.quantum);
+    }
     if let Some(cmd) = cli.command {
         return remote(cmd);
+    }
+
+    // Background services (D-Bus, tray, hotkey) on a tokio runtime thread.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+
+    // A second launch brings the running window to the front instead of
+    // creating a second virtual microphone.
+    if !cli.no_dbus
+        && cli.screenshot.is_none()
+        && let Ok(proxy) = runtime.block_on(dbus::client())
+    {
+        log::info!("Voice Changer is already running; showing its window");
+        let _ = runtime.block_on(proxy.show_window());
+        std::process::exit(0);
     }
 
     let mut cfg = AppConfig::load();
     if cli.mic.is_some() {
         cfg.mic = cli.mic.clone();
     }
+    if let Some(t) = &cli.ai_threads {
+        cfg.ai_threads = match t.trim().to_ascii_lowercase().as_str() {
+            "auto" | "0" => 0,
+            n => n
+                .parse::<u32>()
+                .with_context(|| format!("--ai-threads: {t:?} is not a number or \"auto\""))?,
+        };
+    }
+    #[cfg(feature = "ai")]
+    vc_core::ai::compute::probe_in_background();
 
     log::info!("PipeWire library {}", pw::library_version());
     let params = VcParams::new();
@@ -167,21 +214,51 @@ fn main() -> Result<()> {
     if let Some(state) = config::load_state() {
         state.apply_direct(&params, cli.rate as f32);
     }
-    let audio = pw::AudioThread::spawn(
-        pw::AudioConfig {
-            rate: cli.rate,
-            quantum: cli.quantum,
-            capture_target: cfg.mic.clone(),
-            source_name: cli.source_name.clone(),
-            input_wav: match &cli.input_wav {
-                Some(p) => Some(std::sync::Arc::new(read_wav_mono(p)?)),
-                None => None,
-            },
+    params.set_ai_threads(cfg.ai_threads);
+    let audio_config = pw::AudioConfig {
+        rate: cli.rate,
+        quantum: cli.quantum,
+        capture_target: cfg.mic.clone(),
+        source_name: cli.source_name.clone(),
+        input_wav: match &cli.input_wav {
+            Some(p) if p.as_os_str() == "synth" => Some(std::sync::Arc::new(
+                selftest::synth_voice(cli.rate as usize, 4.0),
+            )),
+            Some(p) => Some(std::sync::Arc::new(read_wav_mono(p)?)),
+            None => None,
         },
+    };
+    let stats = std::sync::Arc::new(pw::Stats::default());
+    let meters = std::sync::Arc::new(vc_core::Meters::default());
+    let audio = match pw::AudioThread::spawn(
+        audio_config.clone(),
         params.clone(),
-    )
-    .context("start PipeWire audio")?;
-    let shared = Shared::new(params, cli.rate as f32, cli.quantum, audio, cfg.clone());
+        stats.clone(),
+        meters.clone(),
+    ) {
+        Ok(a) => Ok(a),
+        Err(e) => {
+            // Explain in plain words; the window shows this with a Retry
+            // button, headless runs stop here.
+            let hint = doctor::audio_hint(&format!("{e:#}"));
+            log::error!("audio could not start: {e:#}. {hint}");
+            if cli.headless {
+                anyhow::bail!("{hint}");
+            }
+            Err(hint)
+        }
+    };
+    let shared = Shared::new(
+        params,
+        cli.rate as f32,
+        cli.quantum,
+        audio,
+        audio_config,
+        stats,
+        meters,
+        cfg.clone(),
+    );
+    install_panic_hook(&shared);
     // A preset named on the command line is applied. Otherwise the restored
     // state is authoritative (it keeps the user's own tweaks), so we only
     // *name* the last preset when the parameters still match it -- the UI must
@@ -210,6 +287,7 @@ fn main() -> Result<()> {
         shared.set_monitor(true);
     }
     if cfg.set_as_default {
+        // Applied by the audio thread once the session manager is known.
         shared.set_default_source(true);
     }
     if let Some(voice) = &cli.ai_voice
@@ -218,11 +296,7 @@ fn main() -> Result<()> {
         log::warn!("unknown AI voice {voice:?}");
     }
 
-    // Background services (D-Bus, tray, hotkey) on a tokio runtime thread.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
+    let start_hidden = cli.minimized || cfg.start_minimized;
     let services = {
         let shared = shared.clone();
         let hotkey = cfg.hotkey.clone();
@@ -248,10 +322,12 @@ fn main() -> Result<()> {
                 }
                 return;
             }
-            let tray = tokio::spawn(tray::run(shared.clone()));
+            // The tray and the hotkey are independent: a desktop without a
+            // tray host must not lose the global shortcut.
+            let tray = tokio::spawn(tray::run(shared.clone(), start_hidden));
             let keys = tokio::spawn(hotkey::run(shared.clone(), hotkey));
             let _ = tray.await;
-            keys.abort();
+            let _ = keys.await;
         })
     };
 
@@ -276,13 +352,19 @@ fn main() -> Result<()> {
             "settings" => vc_gui::Page::Settings,
             _ => vc_gui::Page::Home,
         };
-        window::run(
+        // A window that cannot open (no display, broken GPU stack) must not
+        // skip the state save and the microphone restore below.
+        if let Err(e) = window::run(
             shared.clone(),
             window::Options {
-                start_hidden: cli.minimized || cfg.start_minimized,
+                start_hidden,
                 screenshot: cli.screenshot.clone().map(|p| (p, page)),
             },
-        )?;
+        ) {
+            log::error!(
+                "{e:#}. If you have no display, run with --headless; on a VM try ICED_BACKEND=tiny-skia."
+            );
+        }
         shared.request_quit();
     }
 
@@ -293,8 +375,10 @@ fn main() -> Result<()> {
         .audio
         .lock()
         .ok()
-        .and_then(|a| a.as_ref().and_then(|a| a.capture_target()));
+        .and_then(|a| a.as_ref().and_then(|a| a.capture_target()))
+        .or(cfg.mic);
     cfg.start_bypassed = !shared.is_enabled();
+    cfg.ai_threads = shared.params.ai_threads();
     if let Err(e) = cfg.save() {
         log::warn!("could not save config: {e}");
     }
@@ -310,7 +394,9 @@ fn main() -> Result<()> {
     let audio = shared.audio.lock().ok().and_then(|mut a| a.take());
     if let Some(audio) = audio {
         let stats = audio.stats.clone();
-        audio.shutdown()?;
+        if let Err(e) = audio.shutdown() {
+            log::warn!("audio shutdown: {e:#}");
+        }
         log::info!(
             "callbacks: capture={} output={} underruns={} trimmed_frames={} process_avg={}us process_max={}us (quantum={}us)",
             stats.capture_callbacks.load(Ordering::Relaxed),
@@ -324,6 +410,30 @@ fn main() -> Result<()> {
     }
     // Everything is saved and torn down; skip slow Wayland/D-Bus destructors.
     std::process::exit(0);
+}
+
+/// Release builds abort on panic. Before that happens, give every
+/// application its own microphone back and restore the default source, so
+/// a crash never leaves the user's Discord pointed at a microphone that no
+/// longer exists.
+fn install_panic_hook(shared: &std::sync::Arc<Shared>) {
+    static HOOKED: std::sync::OnceLock<std::sync::Weak<Shared>> = std::sync::OnceLock::new();
+    let _ = HOOKED.set(std::sync::Arc::downgrade(shared));
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        if let Some(shared) = HOOKED.get().and_then(|w| w.upgrade())
+            && let Ok(audio) = shared.audio.try_lock()
+            && let Some(audio) = audio.as_ref()
+        {
+            log::error!("panic: restoring microphones before exiting");
+            if audio.take_over() {
+                audio.set_default_source(false);
+                // Give the PipeWire thread a moment to apply it.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+    }));
 }
 
 /// Voice library operations work on files directly; no running instance needed.
@@ -530,6 +640,7 @@ fn remote(cmd: Command) -> Result<()> {
             }
             Command::Show => proxy.show_window().await?,
             Command::Quit => proxy.quit().await?,
+            Command::Doctor => unreachable!("handled before connecting"),
         }
         Ok(())
     })

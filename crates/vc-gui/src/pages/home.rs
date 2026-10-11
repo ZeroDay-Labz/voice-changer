@@ -20,6 +20,12 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
     #[cfg(feature = "ai")]
     let lower = lower.push(container(ai_card(model, host, mode)).width(Length::Fill));
     let mut col = column![].spacing(14);
+    if let Some(card) = audio_card(model, mode) {
+        col = col.push(card);
+    }
+    if model.cache.settings.first_run && host.capabilities().standalone {
+        col = col.push(welcome(model, host, mode));
+    }
     if let Some(note) = nothing_changing(host) {
         col = col.push(notice(note, mode));
     }
@@ -41,6 +47,176 @@ fn nothing_changing(host: &dyn Host) -> Option<&'static str> {
     p.voice_is_neutral().then_some(
         "Nothing is changing your voice yet — pick a preset below, or turn a Quick tweak knob.",
     )
+}
+
+/// Audio trouble, said plainly, with the one button that helps.
+fn audio_card<'a>(model: &'a Model, mode: Mode) -> Option<Element<'a>> {
+    let a = model.cache.audio.as_ref()?;
+    let t = theme::tokens(mode);
+    match a.state {
+        crate::AudioState::Failed => {
+            let body = column![
+                text("Audio is not running").size(16).color(theme::DANGER),
+                text(a.message.as_str())
+                    .size(13)
+                    .color(t.text)
+                    .wrapping(iced_core::text::Wrapping::WordOrGlyph),
+                row![
+                    tip(
+                        button(text("Try again").size(13))
+                            .style(theme::button_primary)
+                            .padding([8, 14])
+                            .on_press(Message::RetryAudio),
+                        help::RETRY_AUDIO
+                    ),
+                    dim(
+                        "Details: run `voice-changer doctor` in a terminal.",
+                        12,
+                        mode
+                    ),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(8);
+            Some(
+                container(body)
+                    .padding(16)
+                    .width(Length::Fill)
+                    .style(theme::panel_accent(theme::DANGER))
+                    .into(),
+            )
+        }
+        crate::AudioState::Reconnecting | crate::AudioState::Starting => Some(notice(
+            "Reconnecting to the audio system… your settings are kept and the virtual microphone comes back by itself.",
+            mode,
+        )),
+        crate::AudioState::Running => {
+            if !a.message.is_empty() {
+                return Some(notice(a.message.as_str(), mode));
+            }
+            if !a.mic_alive {
+                return Some(notice(
+                    "No sound is arriving from the microphone. Check that it is plugged in and pick it in the top bar.",
+                    mode,
+                ));
+            }
+            None
+        }
+    }
+}
+
+/// First-run card: the three things a new user needs, with live state.
+fn welcome<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> {
+    let t = theme::tokens(mode);
+    let step = |n: &'a str, title: &'a str, done: bool| -> Element<'a> {
+        row![
+            container(if done {
+                icons::check(14.0, theme::ACCENT)
+            } else {
+                text(n).size(13).color(t.text_dim).into()
+            })
+            .width(Length::Fixed(20.0)),
+            text(title).size(14).color(t.text),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+    };
+    let mic_done = model.cache.capture_target.is_some()
+        || model.cache.audio.as_ref().is_some_and(|a| a.mic_alive);
+    let monitor_on = host.monitor().unwrap_or(false);
+    let listening = model.cache.audio.as_ref().is_some_and(|a| a.listeners > 0);
+    let step1 = column![
+        step("1", "Your microphone", mic_done),
+        container(super::topbar::mic_picker(model, host, 260.0, true))
+            .padding(crate::pad(0.0, 0.0, 0.0, 28.0)),
+        container(dim("System default is fine for most people.", 12, mode))
+            .padding(crate::pad(0.0, 0.0, 0.0, 28.0)),
+    ]
+    .spacing(6);
+    let step2 = column![
+        step("2", "Hear yourself", monitor_on),
+        container(
+            button(
+                row![
+                    icons::headphones(
+                        16.0,
+                        if monitor_on {
+                            iced_core::Color::from_rgb8(8, 30, 40)
+                        } else {
+                            t.text
+                        }
+                    ),
+                    text(if monitor_on {
+                        "Hear myself is on"
+                    } else {
+                        "Turn on Hear myself"
+                    })
+                    .size(13)
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .style(if monitor_on {
+                theme::button_sky
+            } else {
+                theme::button_soft
+            })
+            .padding([8, 12])
+            .on_press(Message::ToggleMonitor)
+        )
+        .padding(crate::pad(0.0, 0.0, 0.0, 28.0)),
+        container(dim(
+            "Use headphones, then pick a preset below and talk.",
+            12,
+            mode
+        ))
+        .padding(crate::pad(0.0, 0.0, 0.0, 28.0)),
+    ]
+    .spacing(6);
+    let mut step3 = column![step("3", "Send it to your apps", listening)].spacing(6);
+    step3 = step3.push(
+        container(dim(
+            "Pick “Voice Changer Mic” as the microphone in Discord, OBS or your browser, or use “Replace my microphone everywhere” on the Mixer page.",
+            12,
+            mode,
+        ))
+        .padding(crate::pad(0.0, 0.0, 0.0, 28.0)),
+    );
+    step3 = step3.push(
+        container(
+            button(text("Open the Mixer page").size(13))
+                .style(theme::button_soft)
+                .padding([8, 12])
+                .on_press(Message::Go(crate::Page::Mixer)),
+        )
+        .padding(crate::pad(0.0, 0.0, 0.0, 28.0)),
+    );
+    let steps = row![
+        container(step1).width(Length::FillPortion(1)),
+        container(step2).width(Length::FillPortion(1)),
+        container(step3).width(Length::FillPortion(1)),
+    ]
+    .spacing(20)
+    .wrap();
+    let header = row![
+        text("Welcome").size(16).color(t.text),
+        iced_widget::space::horizontal(),
+        tip(
+            button(text("Got it").size(13))
+                .style(theme::button_soft)
+                .padding([6, 10])
+                .on_press(Message::DismissWelcome),
+            help::WELCOME_DONE
+        )
+    ]
+    .align_y(Alignment::Center);
+    container(column![header, steps].spacing(12))
+        .padding(16)
+        .width(Length::Fill)
+        .style(theme::panel_accent(theme::ACCENT))
+        .into()
 }
 
 /// A one-line amber banner.

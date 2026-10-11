@@ -3,6 +3,83 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-10-11
+
+The "runs everywhere, runs smoothly" release.
+
+### Added
+- **Portable builds.** The x86_64 release binary is linked against glibc 2.35, so it
+  starts on Ubuntu 22.04, Debian 12, Linux Mint 21, Zorin 17 and everything newer
+  (previous releases needed glibc 2.39). A native **aarch64** build (Raspberry Pi 5,
+  Asahi, ARM laptops) ships alongside, each as tarball, `.rpm` and `.deb`, plus a
+  **Flatpak** bundle and an **AUR** recipe (`packaging/aur`). Every release carries a
+  `SHA256SUMS` file. The release workflow refuses a binary that needs a newer glibc or
+  libstdc++ than that (`scripts/check-portable.sh`).
+- **`voice-changer doctor`** checks the machine the way a support person would: is
+  PipeWire the sound server (or only PulseAudio?), is WirePlumber running, can virtual
+  devices be created, which microphones, GPU and AI runtime are present, are the base
+  models and voices installed, is there a tray and a shortcut portal. Each problem comes
+  with the command that fixes it.
+- **`voice-changer --self-test`** runs the engine through every preset on synthetic
+  speech and fails on silence, NaN or runaway levels. CI and packagers use it; the CI
+  also starts a private PipeWire session, records the virtual microphone through the
+  PulseAudio API the way Discord does, and checks that the voice came out changed.
+- **AI threads follow your hardware.** The number of inference threads is derived from
+  the processor (physical cores, hybrid P/E cores, SMT) and whether a GPU is used,
+  keeping one core free for audio and the window; it used to be a fixed 8, too many for
+  a laptop and too few for a workstation. Settings → AI shows what the machine has and
+  lets you pick a number, bounded by the threads actually present; `--ai-threads N|auto`
+  does the same from the terminal.
+- **Welcome card** on the first start: microphone, hear yourself, send it to your apps,
+  each with its own live checkmark.
+- The sidebar and the Mixer page show **how many apps are hearing the voice**, and say
+  what to do when none is.
+- An unplugged microphone now **falls back to the system default and comes back** when
+  it is plugged in again, with a line in Settings while it is away.
+
+### Fixed
+- **Starting without a working audio system no longer exits silently.** When PipeWire is
+  missing, refused, or PulseAudio still owns the sound, the window opens with a plain
+  explanation and a **Try again** button; headless runs print the same text. Every
+  set-up failure inside the audio thread is now reported, not only the first connect.
+- **A PipeWire or WirePlumber restart no longer leaves a dead app.** The audio side
+  reconnects by itself with a short back-off, re-creates the virtual microphone, and
+  re-applies the chosen microphone and "Replace my microphone everywhere". The AI
+  models stay loaded across the gap.
+- **"Replace my microphone everywhere" saved from a previous run now actually applies**
+  at start. It used to race the session manager and silently do nothing; it now waits
+  for the session manager and a real microphone, then takes over (and never pins the
+  capture to itself, so no feedback loop).
+- **A missing or broken AI voice no longer makes the worker retry twenty times a
+  second** (and, on GPU builds, leak a model session each time). A failed voice is left
+  alone for thirty seconds or until you change something; a voice that keeps failing
+  during inference is parked with a clear message.
+- Base-model downloads are checked against their size and SHA-256; a cut-off or corrupt
+  download is deleted and reported instead of being installed as a model that cannot load.
+- ONNX Runtime libraries are compared by version number (an old `1.9` library sorted
+  after `1.22` by string order), and libraries older than the API this build needs are
+  skipped. GPU probing (`rocminfo`, `nvidia-smi`) runs in the background, so the window
+  never waits for it.
+- The window no longer freezes on the Settings page when a very long log record arrives
+  (iced logs its whole window configuration, icon pixels included; the in-app log now
+  keeps one bounded line per record).
+- A tray that cannot be created no longer cancels the global shortcut, and
+  "Start minimized" without a tray opens the window instead of leaving no way in.
+- A crash restores every application's own microphone and the default source before
+  the process exits. A capture buffer with a bad offset can no longer panic the
+  realtime thread, and underruns are counted rather than logged from it.
+- The AI resampler follows the engine sample rate instead of assuming 48 kHz; the
+  misleading "need contentvec_768l12_q8.onnx" message names the files actually used.
+- With the window closed to the tray the app ticks at 4 Hz instead of 60 Hz.
+
+### Changed
+- A second launch brings the running window to the front instead of starting a second
+  instance.
+- The monitor ("Hear myself") stream is tagged as music rather than communication so a
+  Bluetooth headset is not switched to its low-quality profile by a silent stream.
+- Technical wording in the window was replaced with plain language; the AI runtime line
+  is now "AI engine".
+
 ## [0.2.5] - 2026-10-10
 
 ### Fixed

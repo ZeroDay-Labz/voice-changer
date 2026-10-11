@@ -323,7 +323,7 @@ impl Psola {
         self.recent_periods.rotate_left(1);
         self.recent_periods[2] = period;
         let mut sorted = self.recent_periods;
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(f32::total_cmp);
         let smoothed = sorted[1];
         // Glide between frames instead of stepping; snap when voicing (re)starts.
         if self.since_voiced == 0 && (self.period_lp - smoothed).abs() < 0.3 * smoothed {

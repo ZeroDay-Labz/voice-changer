@@ -22,6 +22,10 @@ pub struct AppConfig {
     pub set_as_default: bool,
     /// Last window geometry: x, y, width, height (NaN position = let the desktop choose).
     pub window: Option<[f32; 4]>,
+    /// AI inference threads: 0 = Auto (from the machine's cores), else a count.
+    pub ai_threads: u32,
+    /// Show the welcome card until the user dismisses it.
+    pub first_run: bool,
 }
 
 impl Default for AppConfig {
@@ -36,6 +40,8 @@ impl Default for AppConfig {
             theme: "dark".into(),
             set_as_default: false,
             window: None,
+            ai_threads: 0,
+            first_run: true,
         }
     }
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use vc_core::{Meters, VcParams};
-use vc_gui::host::{Device, HostSettings};
+use vc_gui::host::{AudioState, AudioStatus, Device, HardwareSummary, HostSettings};
 use vc_gui::{Capabilities, Host, HostSetting, HostStats, Mode, Model, Page};
 
 use crate::config::{self, AppConfig};
@@ -187,6 +187,8 @@ impl Host for AppHost {
             close_to_tray: c.close_to_tray,
             start_minimized: c.start_minimized,
             autostart: Some(config::autostart_enabled()),
+            ai_threads: c.ai_threads,
+            first_run: c.first_run,
         }
     }
     fn apply_setting(&self, setting: HostSetting) {
@@ -208,7 +210,65 @@ impl Host for AppHost {
                     }
                 });
             }
+            HostSetting::AiThreads(n) => {
+                self.shared.set_ai_threads(n);
+                self.with_config(|_| {});
+            }
+            HostSetting::DismissWelcome => self.with_config(|c| c.first_run = false),
         }
+    }
+    fn audio_status(&self) -> Option<AudioStatus> {
+        let h = self.shared.audio_health();
+        let describe = |name: &Option<String>| -> Option<String> {
+            let name = name.as_ref()?;
+            Some(
+                self.shared
+                    .devices()
+                    .into_iter()
+                    .find(|d| &d.name == name)
+                    .map(|d| d.description)
+                    .unwrap_or_else(|| name.clone()),
+            )
+        };
+        let chosen = self.capture_target();
+        let active = self.shared.active_target();
+        Some(AudioStatus {
+            state: match h.state {
+                crate::pw::AudioState::Starting => AudioState::Starting,
+                crate::pw::AudioState::Running => AudioState::Running,
+                crate::pw::AudioState::Reconnecting => AudioState::Reconnecting,
+                crate::pw::AudioState::Failed => AudioState::Failed,
+            },
+            message: h.message,
+            virtual_mic: h.virtual_mic,
+            mic_alive: h.mic_alive,
+            listeners: self.shared.listeners(),
+            chosen_mic: describe(&chosen),
+            active_mic: if chosen.is_some() && active != chosen {
+                Some(describe(&active).unwrap_or_else(|| "the system default".into()))
+            } else {
+                describe(&active)
+            },
+        })
+    }
+    fn retry_audio(&self) {
+        self.shared.retry_audio();
+    }
+    #[cfg(feature = "ai")]
+    fn hardware(&self) -> Option<HardwareSummary> {
+        use vc_core::ai::{compute, hardware};
+        let gpu = compute::gpus_if_probed().is_some_and(|g| !g.is_empty())
+            && compute::resolve(&self.shared.params.ai_device()) != compute::Backend::Cpu;
+        let in_use = self
+            .ai_status()
+            .map(|s| s.threads.load(Ordering::Relaxed) as u32)
+            .unwrap_or(0);
+        Some(HardwareSummary {
+            line: hardware::summary(),
+            max_threads: hardware::max_threads() as u32,
+            auto_threads: hardware::recommended_threads(hardware::info(), gpu) as u32,
+            in_use,
+        })
     }
     fn log_lines(&self) -> Vec<String> {
         crate::logger::lines()
@@ -338,14 +398,27 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let t2 = app.ui(vc_gui::Message::Tick);
             if let (Some((_, _, frames)), Some(id)) = (app.screenshot.as_mut(), app.window) {
                 *frames += 1;
-                if *frames == 45 {
+                // `VC_SCREENSHOT_FRAMES` delays the capture (default 45 frames).
+                let want: u32 = std::env::var("VC_SCREENSHOT_FRAMES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(45);
+                if *frames == want {
                     return window::screenshot(id).map(Message::Shot);
                 }
             }
             Task::batch([task, t2])
         }
         Message::Ui(m) => app.ui(m),
-        Message::Opened => Task::none(),
+        Message::Opened => {
+            // A screenshot run is launched from a terminal and never gets
+            // focus; on Wayland an unfocused window that is never touched can
+            // stay on its first frame. Ask for focus like a user click would.
+            match (app.screenshot.as_ref(), app.window) {
+                (Some(_), Some(id)) => window::gain_focus(id),
+                _ => Task::none(),
+            }
+        }
         Message::CloseRequested(id) => {
             let to_tray = app
                 .shared
@@ -413,6 +486,26 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::Window(iced::window::Event::Rescaled(_)) => {
+            // A window that opens on a monitor with a different scale gets
+            // this right after its first frame. In normal use the focus
+            // change that follows makes the surface commit again; a
+            // screenshot run is never focused and would stay frozen on
+            // that first frame, so re-commit it with a same-size resize.
+            match (app.screenshot.as_ref(), app.window) {
+                (Some(_), Some(id)) => {
+                    let size = app
+                        .shared
+                        .config
+                        .lock()
+                        .ok()
+                        .and_then(|c| c.window.map(|w| iced::Size::new(w[2], w[3])))
+                        .unwrap_or_else(screenshot_size);
+                    window::resize(id, size)
+                }
+                _ => Task::none(),
+            }
+        }
         Message::Window(..) => Task::none(),
         Message::Shot(shot) => {
             if let Some((path, _, _)) = app.screenshot.take() {
@@ -441,9 +534,12 @@ fn view(app: &App, _id: window::Id) -> Element<'_, Message> {
     vc_gui::view(&app.model, &app.host).map(Message::Ui)
 }
 
-fn subscription(_app: &App) -> Subscription<Message> {
+fn subscription(app: &App) -> Subscription<Message> {
+    // With no window open there is nothing to draw: tick just often enough
+    // to notice "show" and "quit" requests.
+    let tick = if app.window.is_some() { 16 } else { 250 };
     Subscription::batch([
-        iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick),
+        iced::time::every(Duration::from_millis(tick)).map(|_| Message::Tick),
         window::close_requests().map(Message::CloseRequested),
         keyboard::listen().map(Message::Keyboard),
         window::events().map(|(_, e)| Message::Window(e)),

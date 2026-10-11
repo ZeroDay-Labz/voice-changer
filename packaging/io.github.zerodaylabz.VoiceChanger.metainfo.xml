@@ -63,6 +63,11 @@
   </supports>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.0" date="2026-10-11">
+      <description>
+        <p>Runs on many more Linux computers: portable builds for glibc 2.35 and newer (Ubuntu 22.04, Debian 12, Mint 21, Zorin 17), an aarch64 build, a Flatpak bundle and an AUR recipe. The AI picks its thread count from your processor, with an override in Settings. Audio problems are explained in the window with a Retry button, PipeWire restarts are survived, an unplugged microphone falls back and comes back, and a "voice-changer doctor" command checks the machine. A welcome card guides the first start and the window shows how many apps are hearing the voice.</p>
+      </description>
+    </release>
     <release version="0.2.5" date="2026-10-10">
       <description>
         <p>Fixes the AI voice muting your microphone while it warms up or drops a block, keeps the voice effects working during warm-up, and makes "Replace my microphone everywhere" move every recording app.</p>

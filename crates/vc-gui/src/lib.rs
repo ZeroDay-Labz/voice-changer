@@ -16,7 +16,10 @@ use nice_plug::prelude::*;
 use std::time::Instant;
 use vc_core::{Preset, PresetEntry};
 
-pub use host::{AppStream, Capabilities, Device, Host, HostSetting, HostStats};
+pub use host::{
+    AppStream, AudioState, AudioStatus, Capabilities, Device, HardwareSummary, Host, HostSetting,
+    HostSettings, HostStats,
+};
 pub use iced_runtime::Task;
 pub use theme::Mode;
 
@@ -122,6 +125,9 @@ pub enum Message {
     ResetMany(Vec<ParamPtr>),
     Escape,
     FocusSearch,
+    /// Start the audio side again after a failed start.
+    RetryAudio,
+    DismissWelcome,
 }
 
 pub fn search_id() -> iced_core::widget::Id {
@@ -152,6 +158,7 @@ pub struct Model {
     pub cache: Cache,
     last_tick: Instant,
     last_refresh: Instant,
+    last_status: Instant,
 }
 
 /// Values that are expensive or non-trivial to compute, snapshotted for `view`.
@@ -167,6 +174,10 @@ pub struct Cache {
     pub compute_options: Vec<(String, String)>,
     pub gpu_note: Option<String>,
     pub runtime: Option<String>,
+    /// Audio health, refreshed twice a second.
+    pub audio: Option<AudioStatus>,
+    pub hardware: Option<HardwareSummary>,
+    pub settings: HostSettings,
 }
 
 impl Default for Model {
@@ -198,7 +209,14 @@ impl Model {
             cache: Cache::default(),
             last_tick: Instant::now(),
             last_refresh: Instant::now() - std::time::Duration::from_secs(10),
+            last_status: Instant::now() - std::time::Duration::from_secs(10),
         }
+    }
+
+    /// The cheap, fast-changing part of the host snapshot.
+    pub fn refresh_status(&mut self, host: &dyn Host) {
+        self.last_status = Instant::now();
+        self.cache.audio = host.audio_status();
     }
 
     pub fn refresh(&mut self) {
@@ -218,6 +236,9 @@ impl Model {
         self.cache.app_streams = host.app_streams();
         self.cache.default_source = host.default_source();
         self.cache.runtime = host.runtime_description();
+        self.cache.audio = host.audio_status();
+        self.cache.hardware = host.hardware();
+        self.cache.settings = host.settings();
         #[cfg(feature = "ai")]
         {
             use vc_core::ai::compute;
@@ -225,7 +246,14 @@ impl Model {
             self.cache.voices_dir = vc_core::ai::voices_dir()
                 .map(|d| d.display().to_string())
                 .unwrap_or_default();
-            let gpus = compute::gpus();
+            // Never block the window on `rocminfo`/`nvidia-smi`: until the
+            // background probe is done the picker only offers Auto.
+            let Some(gpus) = compute::gpus_if_probed() else {
+                self.cache.compute_options =
+                    vec![("auto".to_string(), "Auto (detecting…)".to_string())];
+                self.cache.gpu_note = None;
+                return;
+            };
             let mut opts = vec![
                 (
                     "auto".to_string(),
@@ -344,6 +372,8 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
             model.last_tick = now;
             if now.duration_since(model.last_refresh).as_secs_f32() > 2.0 {
                 model.refresh_cache(host);
+            } else if now.duration_since(model.last_status).as_secs_f32() > 0.5 {
+                model.refresh_status(host);
             }
             let (i, o, gate) = host.meters().read();
             model.meters.push(i, o, gate, dt);
@@ -477,7 +507,19 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
             model.cache.capture_target = t;
         }
         Message::ConfigureHotkey => host.configure_hotkey(),
-        Message::Setting(s) => host.apply_setting(s),
+        Message::Setting(s) => {
+            host.apply_setting(s);
+            model.cache.settings = host.settings();
+            model.cache.hardware = host.hardware();
+        }
+        Message::RetryAudio => {
+            host.retry_audio();
+            model.refresh_cache(host);
+        }
+        Message::DismissWelcome => {
+            host.apply_setting(HostSetting::DismissWelcome);
+            model.cache.settings = host.settings();
+        }
         Message::OpenDataFolder => host.open_data_folder(),
         Message::Quit => host.quit(),
         Message::DismissToast => model.toast = None,

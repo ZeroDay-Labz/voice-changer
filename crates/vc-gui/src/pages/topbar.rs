@@ -213,11 +213,35 @@ pub fn mic_picker<'a>(
 }
 
 /// Latency / compute / dropouts summary for the sidebar.
-pub fn status_pill<'a>(_model: &'a Model, host: &'a dyn Host) -> Element<'a> {
+pub fn status_pill<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
     let mode = host.theme_mode();
     let t = theme::tokens(mode);
     let mut lines = column![].spacing(2);
     let mut dot = theme::ACCENT;
+    if let Some(a) = &model.cache.audio {
+        match a.state {
+            crate::AudioState::Failed => {
+                dot = theme::DANGER;
+                lines = lines.push(text("Audio not running").size(12).color(theme::DANGER));
+            }
+            crate::AudioState::Reconnecting | crate::AudioState::Starting => {
+                dot = theme::WARN;
+                lines = lines.push(text("Reconnecting audio…").size(12).color(theme::WARN));
+            }
+            crate::AudioState::Running => {
+                let line = match a.listeners {
+                    0 => "No app listening".to_string(),
+                    1 => "1 app listening".to_string(),
+                    n => format!("{n} apps listening"),
+                };
+                lines = lines.push(text(line).size(12).color(if a.listeners == 0 {
+                    t.text_dim
+                } else {
+                    theme::SKY
+                }));
+            }
+        }
+    }
     lines = lines.push(text(format!("{:.1} ms latency", host.latency_ms())).size(12));
     if let Some(stats) = host.stats()
         && stats.underruns > 0

@@ -168,6 +168,10 @@ pub struct VcParams {
     /// Where the models run: "auto", "cpu" or "rocm:N".
     #[persist = "ai_device"]
     pub ai_device: std::sync::RwLock<String>,
+    /// Inference threads: 0 = Auto (derived from the machine's cores), else
+    /// a count the worker clamps to the hardware threads present.
+    #[persist = "ai_threads"]
+    pub ai_threads: std::sync::RwLock<u32>,
 }
 
 impl Default for VcParams {
@@ -247,6 +251,7 @@ impl Default for VcParams {
             ai_speaker: IntParam::new("AI Speaker", 0, IntRange::Linear { min: 0, max: 15 }),
             ai_voice: std::sync::RwLock::new(String::new()),
             ai_device: std::sync::RwLock::new("auto".into()),
+            ai_threads: std::sync::RwLock::new(0),
         }
     }
 }
@@ -305,6 +310,17 @@ impl VcParams {
     pub fn set_ai_voice(&self, path: &str) {
         if let Ok(mut v) = self.ai_voice.write() {
             *v = path.to_string();
+        }
+    }
+
+    /// Inference thread setting: 0 = Auto.
+    pub fn ai_threads(&self) -> u32 {
+        self.ai_threads.read().map(|v| *v).unwrap_or(0)
+    }
+
+    pub fn set_ai_threads(&self, threads: u32) {
+        if let Ok(mut v) = self.ai_threads.write() {
+            *v = threads;
         }
     }
 

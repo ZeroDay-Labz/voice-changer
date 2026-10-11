@@ -61,7 +61,10 @@ jobs:
           MULTIARCH="$(gcc -print-multiarch)"
           mkdir -p /tmp/zig-include
           ln -sfn "/usr/include/$MULTIARCH/openssl" /tmp/zig-include/openssl
-          export RUSTFLAGS="-L native=/usr/lib/$MULTIARCH"
+          # The runner's libpipewire was built against a newer glibc than
+          # our 2.35 target; its internal references are resolved by the
+          # user's own glibc at run time, so do not let lld reject them.
+          export RUSTFLAGS="-L native=/usr/lib/$MULTIARCH -C link-arg=-Wl,--allow-shlib-undefined"
           export CFLAGS="-I/tmp/zig-include"
           cargo zigbuild --release -p vc-app --target ${{ matrix.target }}.${GLIBC_TARGET}
           # The plugin goes through the same link: on Linux a .clap bundle

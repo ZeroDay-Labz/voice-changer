@@ -55,15 +55,22 @@ jobs:
         run: |
           # zig's compiler and linker do not search the distribution's
           # multiarch directories (where Ubuntu keeps libpipewire and the
-          # OpenSSL headers that a build-time dependency needs).
+          # OpenSSL headers that a build-time dependency needs). Expose only
+          # the OpenSSL headers: adding the whole directory lets the system's
+          # bits/ headers shadow zig's own glibc headers.
           MULTIARCH="$(gcc -print-multiarch)"
+          mkdir -p /tmp/zig-include
+          ln -sfn "/usr/include/$MULTIARCH/openssl" /tmp/zig-include/openssl
           export RUSTFLAGS="-L native=/usr/lib/$MULTIARCH"
-          export CFLAGS="-I/usr/include/$MULTIARCH"
+          export CFLAGS="-I/tmp/zig-include"
           cargo zigbuild --release -p vc-app --target ${{ matrix.target }}.${GLIBC_TARGET}
+          # The plugin goes through the same link: on Linux a .clap bundle
+          # is the shared object itself, so no bundler step is needed.
+          cargo zigbuild --release -p vc-plugin --target ${{ matrix.target }}.${GLIBC_TARGET}
           unset RUSTFLAGS CFLAGS
-          cargo xtask bundle vc-plugin --release
-          mkdir -p target/release
+          mkdir -p target/release target/bundled
           cp target/${{ matrix.target }}/release/voice-changer target/release/voice-changer
+          cp target/${{ matrix.target }}/release/libvc_plugin.so target/bundled/vc-plugin.clap
 
       - name: Strip debug symbols
         run: |
@@ -71,7 +78,7 @@ jobs:
           strip -s target/bundled/vc-plugin.clap
 
       - name: Check portability (glibc / libstdc++ requirements)
-        run: scripts/check-portable.sh target/release/voice-changer
+        run: scripts/check-portable.sh target/release/voice-changer target/bundled/vc-plugin.clap
 
       - name: Self-test on the runner
         run: |

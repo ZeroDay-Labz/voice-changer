@@ -59,63 +59,11 @@ jobs:
           sudo apt-get install -y libpipewire-0.3-dev libclang-dev pkg-config \
             libxkbcommon-dev libwayland-dev libasound2-dev \
             pipewire pipewire-pulse pipewire-audio-client-libraries wireplumber \
-            pulseaudio-utils python3-numpy
+            pulseaudio-utils dbus-x11 python3-numpy
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p vc-app --no-default-features --features ai
-      - name: Start a private PipeWire session
-        run: |
-          export XDG_RUNTIME_DIR=/tmp/pw-runtime
-          mkdir -p "$XDG_RUNTIME_DIR"
-          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
-          # No sound card on a runner: a null sink gives the monitor stream
-          # somewhere to go, and WirePlumber a default device.
-          cat > /tmp/pw.conf <<'EOF'
-          context.properties = { default.clock.rate = 48000 default.clock.quantum = 256 }
-          context.spa-libs = { audio.convert.* = audioconvert/libspa-audioconvert support.* = support/libspa-support }
-          context.modules = [
-            { name = libpipewire-module-rt args = { nice.level = -11 } flags = [ ifexists nofail ] }
-            { name = libpipewire-module-protocol-native }
-            { name = libpipewire-module-client-node }
-            { name = libpipewire-module-adapter }
-            { name = libpipewire-module-metadata }
-            { name = libpipewire-module-link-factory }
-            { name = libpipewire-module-session-manager }
-          ]
-          context.objects = [
-            { factory = adapter args = { factory.name = support.null-audio-sink node.name = ci-speakers media.class = Audio/Sink audio.position = [ FL FR ] } }
-            { factory = adapter args = { factory.name = support.null-audio-sink node.name = ci-microphone media.class = Audio/Source/Virtual audio.position = [ MONO ] } }
-          ]
-          EOF
-          PIPEWIRE_CONFIG_DIR=/tmp pipewire -c pw.conf > /tmp/pipewire.log 2>&1 &
-          sleep 1
-          wireplumber > /tmp/wireplumber.log 2>&1 &
-          pipewire-pulse > /tmp/pipewire-pulse.log 2>&1 &
-          sleep 2
-          pactl info
-          pw-cli ls Node | grep -E "node.name|media.class" | head -20
-      - name: Doctor
-        run: target/debug/voice-changer doctor || true
-      - name: Run the voice changer on a test file and record its microphone
-        run: |
-          target/debug/voice-changer --no-dbus --headless --on --preset Robot \
-            --input-wav synth --source-name vc_ci > /tmp/vc.log 2>&1 &
-          APP=$!
-          sleep 4
-          timeout 6 parec -d vc_ci --file-format=wav --channels=1 --rate=48000 /tmp/robot.wav || true
-          kill -INT $APP; sleep 2
-          target/debug/voice-changer --no-dbus --headless --bypass \
-            --input-wav synth --source-name vc_ci2 > /tmp/vc2.log 2>&1 &
-          APP=$!
-          sleep 4
-          timeout 6 parec -d vc_ci2 --file-format=wav --channels=1 --rate=48000 /tmp/bypass.wav || true
-          kill -INT $APP; sleep 1
-          cat /tmp/vc.log | grep -vE "ort::" | tail -30
-      - name: Check that audio came through and was changed
-        run: python3 scripts/ci/check-capture.py /tmp/robot.wav /tmp/bypass.wav
+      - name: Private PipeWire session, run the app, record its microphone, judge
+        run: scripts/ci/smoke.sh target/debug/voice-changer
       - name: Logs on failure
         if: failure()
-        run: |
-          echo "--- pipewire"; cat /tmp/pipewire.log
-          echo "--- wireplumber"; cat /tmp/wireplumber.log
-          echo "--- pipewire-pulse"; cat /tmp/pipewire-pulse.log
-          echo "--- app"; cat /tmp/vc.log /tmp/vc2.log
+        run: for f in /tmp/vc-smoke/*.log; do echo "--- $f"; cat "$f"; done

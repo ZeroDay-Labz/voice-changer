@@ -101,10 +101,10 @@ modules:
       env:
         ORT_DYLIB_PATH: /app/lib/voice-changer/libonnxruntime.so
     build-commands:
-      - cargo --offline build --release --locked -p vc-app
-      - cargo --offline run --release --locked -p xtask -- bundle vc-plugin --release
+      - cargo --offline build --release --locked -p vc-app -p vc-plugin
       - install -Dm755 target/release/voice-changer /app/bin/voice-changer
-      - install -Dm755 target/bundled/vc-plugin.clap /app/lib/clap/vc-plugin.clap
+      # A Linux .clap bundle is the shared object itself.
+      - install -Dm755 target/release/libvc_plugin.so /app/lib/clap/vc-plugin.clap
       - install -Dm644 packaging/io.github.zerodaylabz.VoiceChanger.desktop
         /app/share/applications/io.github.zerodaylabz.VoiceChanger.desktop
       - install -Dm644 packaging/io.github.zerodaylabz.VoiceChanger.metainfo.xml

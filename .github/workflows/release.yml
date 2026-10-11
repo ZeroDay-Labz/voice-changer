@@ -53,10 +53,14 @@ jobs:
       # 2.35 so the result also starts on 22.04-era systems.
       - name: Build the app (portable) and the CLAP plugin
         run: |
-          # zig's linker does not search the distribution's library directory.
-          export RUSTFLAGS="-L native=/usr/lib/$(gcc -print-multiarch)"
+          # zig's compiler and linker do not search the distribution's
+          # multiarch directories (where Ubuntu keeps libpipewire and the
+          # OpenSSL headers that a build-time dependency needs).
+          MULTIARCH="$(gcc -print-multiarch)"
+          export RUSTFLAGS="-L native=/usr/lib/$MULTIARCH"
+          export CFLAGS="-I/usr/include/$MULTIARCH"
           cargo zigbuild --release -p vc-app --target ${{ matrix.target }}.${GLIBC_TARGET}
-          unset RUSTFLAGS
+          unset RUSTFLAGS CFLAGS
           cargo xtask bundle vc-plugin --release
           mkdir -p target/release
           cp target/${{ matrix.target }}/release/voice-changer target/release/voice-changer

@@ -83,5 +83,31 @@ run_capture() { # label, output.wav, app args...
 run_capture robot "$OUT/robot.wav" --on --preset Robot
 run_capture bypass "$OUT/bypass.wav" --bypass
 
+# Taking over as the default microphone must be undone on quit, and "Hear
+# myself" must not leave a stream behind while it is off.
+echo "== default microphone is restored on quit"
+default_source() { pw-metadata -n default 0 default.configured.audio.source | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p' | tail -1; }
+pactl set-default-source ci-microphone
+sleep 1
+mkdir -p "$XDG_CONFIG_HOME/voice-changer"
+echo '(set_as_default: true, first_run: false)' > "$XDG_CONFIG_HOME/voice-changer/config.ron"
+"$APP" --no-dbus --headless --input-wav synth --source-name vc_takeover > "$OUT/app-takeover.log" 2>&1 &
+app=$!
+wait_for "take-over" sh -c "pw-metadata -n default 0 default.configured.audio.source | grep -q vc_takeover"
+if pw-cli ls Node | grep -q voice_changer.monitor; then
+    echo "FAIL: the monitor stream exists while Hear myself is off" >&2
+    exit 1
+fi
+kill -INT "$app"
+wait "$app" 2>/dev/null || true
+sleep 1
+rm -f "$XDG_CONFIG_HOME/voice-changer/config.ron"
+restored="$(default_source)"
+if [ "$restored" != "ci-microphone" ]; then
+    echo "FAIL: default microphone after quit is '$restored', expected ci-microphone" >&2
+    exit 1
+fi
+echo "   default microphone after quit: $restored"
+
 echo "== judging the captures"
 python3 "$HERE/check-capture.py" "$OUT/robot.wav" "$OUT/bypass.wav"

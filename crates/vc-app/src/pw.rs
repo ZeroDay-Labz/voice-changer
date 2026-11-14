@@ -1,10 +1,20 @@
 //! PipeWire I/O: one capture stream from the microphone, one output stream
-//! published as a virtual source ("Voice Changer Mic").
+//! feeding the virtual source ("Voice Changer Mic"), and an on-demand
+//! monitor stream ("Hear myself").
 //!
-//! Both streams live on a dedicated thread that runs the PipeWire main loop.
+//! The streams live on a dedicated thread that runs the PipeWire main loop.
 //! Their realtime `process` callbacks run on PipeWire's data thread and talk
-//! to each other through a lock-free SPSC ring buffer. The engine runs inside
+//! to each other through lock-free SPSC ring buffers. The engine runs inside
 //! the *capture* callback so processing never stops while nobody listens.
+//!
+//! All our nodes share one `node.group`, so PipeWire schedules them in the
+//! same graph cycle under one driver (the microphone's clock). Without it
+//! the microphone, the virtual source's timer and the headphones each run on
+//! their own clock, and the rings between them slowly drift until they
+//! underrun or have to be trimmed -- a click every minute or so. They also
+//! share a `node.link-group`, which tells the session manager never to link
+//! our capture to our own virtual microphone (a feedback loop) even while
+//! that is the default source.
 //!
 //! The thread runs *sessions*: one connection to the daemon with all its
 //! streams and listeners. When the daemon goes away (restart, crash, a
@@ -31,6 +41,8 @@ use std::sync::{Arc, Mutex, Once};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use vc_core::{Meters, Pipeline, VcParams};
+
+use crate::fold::StereoFold;
 
 pub const SOURCE_NODE_NAME: &str = "voice_changer.source";
 pub const SOURCE_DESCRIPTION: &str = "Voice Changer Mic";
@@ -69,6 +81,9 @@ pub struct AudioConfig {
     pub source_name: String,
     /// Test input: loop this mono 48 kHz buffer instead of the microphone.
     pub input_wav: Option<Arc<Vec<f32>>>,
+    /// Play "Hear myself" to this sink (`node.name`) instead of the default
+    /// output. Used by tests.
+    pub monitor_target: Option<String>,
 }
 
 enum Command {
@@ -193,6 +208,9 @@ pub struct Stats {
     /// capture callback, in microseconds. Compare with the quantum period.
     pub process_max_us: AtomicU64,
     pub process_avg_us: AtomicU64,
+    /// Capture callbacks skipped because the pipeline was busy elsewhere
+    /// (only while a session is being torn down).
+    pub skipped_callbacks: AtomicU64,
 }
 
 pub struct AudioThread {
@@ -387,6 +405,10 @@ struct CaptureData {
     to_monitor: rtrb::Producer<f32>,
     monitor_on: Arc<AtomicBool>,
     format: spa::param::audio::AudioInfoRaw,
+    /// Picks the live channel(s) of a stereo input (see `fold.rs`).
+    fold: StereoFold,
+    left: Vec<f32>,
+    right: Vec<f32>,
     /// Shared with the thread so it survives a reconnect. Only this callback
     /// ever locks it while a session runs; `try_lock` keeps the RT path free
     /// of blocking.
@@ -402,17 +424,68 @@ struct CaptureData {
 /// mic and the monitor.
 struct SinkData {
     consumer: rtrb::Consumer<f32>,
+    /// Interleaved channels of the stream; the mono voice goes to all of them.
+    channels: usize,
     /// Keep roughly this many frames queued so a late producer doesn't
     /// starve us; trim anything beyond 2x it. Grows by one quantum on every
-    /// underrun (up to `max_slack`), trading a little latency for silence-free output.
+    /// underrun (up to `max_slack`), trading a little latency for
+    /// silence-free output, and shrinks back after a calm stretch.
     target_slack: usize,
+    min_slack: usize,
     quantum: usize,
     max_slack: usize,
+    /// Frames delivered since the last underrun; `relax_after` of them
+    /// without one take a quantum of slack back.
+    calm_frames: usize,
+    relax_after: usize,
     /// Output silence until the queue holds a block plus the slack, so the
     /// capture/output callback order within a cycle can't starve us.
     primed: bool,
+    /// Frames of fade-in still to apply after a gap or a trim, so the voice
+    /// comes back without a click.
+    fade_left: usize,
+    /// Set from the main thread to throw away whatever is queued (the monitor
+    /// was just switched on: what the ring holds is stale).
+    flush: Arc<AtomicBool>,
     stats: Arc<Stats>,
     count_callbacks: bool,
+}
+
+/// Length of the fade-in after a discontinuity (about 2.7 ms at 48 kHz).
+const FADE_FRAMES: usize = 128;
+
+impl SinkData {
+    fn new(
+        consumer: rtrb::Consumer<f32>,
+        channels: usize,
+        config: &AudioConfig,
+        stats: Arc<Stats>,
+        count_callbacks: bool,
+    ) -> Self {
+        let quantum = (config.quantum as usize).max(64);
+        Self {
+            consumer,
+            channels: channels.max(1),
+            target_slack: quantum,
+            min_slack: quantum,
+            quantum,
+            max_slack: quantum * 4,
+            calm_frames: 0,
+            relax_after: config.rate as usize * 30,
+            primed: false,
+            fade_left: 0,
+            flush: Arc::new(AtomicBool::new(false)),
+            stats,
+            count_callbacks,
+        }
+    }
+
+    /// Drop `frames` queued frames.
+    fn discard(&mut self, frames: usize) {
+        if let Ok(chunk) = self.consumer.read_chunk(frames.min(self.consumer.slots())) {
+            chunk.commit_all();
+        }
+    }
 }
 
 fn drain_into(stream: &pw::stream::Stream, data: &mut SinkData) {
@@ -426,30 +499,40 @@ fn drain_into(stream: &pw::stream::Stream, data: &mut SinkData) {
     let datas = buffer.datas_mut();
     let Some(d) = datas.first_mut() else { return };
     let Some(bytes) = d.data() else { return };
-    let max_frames = bytes.len() / SAMPLE_BYTES;
+    let frame_bytes = SAMPLE_BYTES * data.channels;
+    let max_frames = bytes.len() / frame_bytes;
     let n = if requested > 0 {
         requested.min(max_frames)
     } else {
         max_frames
     };
 
+    if data.flush.swap(false, Ordering::Relaxed) {
+        data.discard(usize::MAX);
+        data.primed = false;
+    }
     let available = data.consumer.slots();
     let max_queue = n + 2 * data.target_slack;
     if available > max_queue {
+        // Too much queued (nobody was reading, or the slack just shrank):
+        // skip ahead to keep the delay bounded, and fade back in over the cut.
         let excess = available - max_queue;
-        for _ in 0..excess {
-            let _ = data.consumer.pop();
-        }
+        data.discard(excess);
+        data.fade_left = FADE_FRAMES;
         data.stats
             .trimmed_frames
             .fetch_add(excess as u64, Ordering::Relaxed);
     }
     if !data.primed {
         data.primed = data.consumer.slots() >= n + data.target_slack;
+        if data.primed {
+            data.fade_left = FADE_FRAMES;
+        }
     }
     let have = data.primed && data.consumer.slots() >= n;
     if data.primed && !have {
         data.primed = false;
+        data.calm_frames = 0;
         if data.target_slack < data.max_slack {
             data.target_slack += data.quantum;
         }
@@ -459,18 +542,60 @@ fn drain_into(stream: &pw::stream::Stream, data: &mut SinkData) {
             data.stats.underruns.fetch_add(1, Ordering::Relaxed);
         }
     }
-    for dst in bytes.as_chunks_mut::<SAMPLE_BYTES>().0.iter_mut().take(n) {
-        let s = if have {
+    if have {
+        data.calm_frames += n;
+        if data.calm_frames >= data.relax_after {
+            data.calm_frames = 0;
+            if data.target_slack > data.min_slack {
+                data.target_slack -= data.quantum.min(data.target_slack - data.min_slack);
+            }
+        }
+    }
+    let frames = bytes.as_chunks_mut::<SAMPLE_BYTES>().0;
+    for frame in frames.chunks_exact_mut(data.channels).take(n) {
+        let mut s = if have {
             data.consumer.pop().unwrap_or(0.0)
         } else {
             0.0
         };
-        *dst = s.to_le_bytes();
+        if data.fade_left > 0 && have {
+            s *= 1.0 - data.fade_left as f32 / FADE_FRAMES as f32;
+            data.fade_left -= 1;
+        }
+        let le = s.to_le_bytes();
+        for dst in frame {
+            *dst = le;
+        }
     }
     let chunk = d.chunk_mut();
     *chunk.offset_mut() = 0;
-    *chunk.stride_mut() = SAMPLE_BYTES as i32;
-    *chunk.size_mut() = (n * SAMPLE_BYTES) as u32;
+    *chunk.stride_mut() = frame_bytes as i32;
+    *chunk.size_mut() = (n * frame_bytes) as u32;
+}
+
+/// Flush denormal numbers to zero on this thread. Filters and reverb tails
+/// decaying into silence otherwise produce denormals, which are up to a
+/// hundred times slower to compute and show up as dropouts after you stop
+/// talking.
+#[inline]
+fn no_denormals() {
+    #[cfg(target_arch = "x86_64")]
+    #[allow(deprecated)]
+    // SAFETY: SSE is part of the x86_64 baseline; setting FTZ (bit 15) and
+    // DAZ (bit 6) only changes how this thread rounds denormal floats.
+    unsafe {
+        use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+        _mm_setcsr(_mm_getcsr() | 0x8040);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: sets the FZ bit (24) of this thread's floating-point control
+    // register; no memory is touched.
+    unsafe {
+        let mut fpcr: u64;
+        std::arch::asm!("mrs {}, fpcr", out(reg) fpcr);
+        fpcr |= 1 << 24;
+        std::arch::asm!("msr fpcr, {}", in(reg) fpcr);
+    }
 }
 
 /// Everything a session needs, owned by the thread for its whole life.
@@ -712,12 +837,23 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
             let mut e = end.borrow_mut();
             if e.is_none() {
                 *e = Some(SessionEnd::Lost(why));
-                mainloop.quit();
             }
+            // Also when a quit is waiting for its round trip: the daemon is
+            // gone, nothing more will arrive.
+            mainloop.quit();
         })
     };
+    // The sequence number of the round trip a quit waits for (see `Command::Quit`).
+    let quit_seq: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
 
     let latency = format!("{}/{}", config.quantum, config.rate);
+    // One scheduling group (same driver, same cycle) and one link group (the
+    // session manager never links us to ourselves) for all our nodes.
+    let group = format!(
+        "voice-changer.{}.{}",
+        std::process::id(),
+        config.source_name
+    );
 
     // The virtual microphone apps capture from is a `support.null-audio-sink`
     // node published as a virtual source. Unlike a plain pw_stream source it
@@ -732,6 +868,8 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
         *pw::keys::NODE_VIRTUAL => "true",
         *pw::keys::AUDIO_CHANNELS => "1",
         "audio.position" => "[MONO]",
+        "node.group" => group.as_str(),
+        "node.link-group" => group.as_str(),
         "object.linger" => "false",
     };
     let vsource: pw::node::Node = core
@@ -743,6 +881,15 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
     // the proxy, a dead connection names the core (id 0).
     let core_listener = core
         .add_listener_local()
+        .done({
+            let quit_seq = quit_seq.clone();
+            let mainloop = mainloop.clone();
+            move |id, seq| {
+                if id == pw::core::PW_ID_CORE && quit_seq.get() == Some(seq.seq()) {
+                    mainloop.quit();
+                }
+            }
+        })
         .error({
             let lose = lose.clone();
             let health = health.clone();
@@ -778,8 +925,13 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
         *pw::keys::NODE_NAME => CAPTURE_NODE_NAME,
         *pw::keys::NODE_DESCRIPTION => "Voice Changer (mic input)",
         *pw::keys::NODE_LATENCY => latency.as_str(),
-        *pw::keys::AUDIO_CHANNELS => "1",
-        "audio.position" => "[MONO]",
+        // Stereo, folded down by `StereoFold`: a mono microphone arrives on
+        // both channels, an interface with the microphone on one input is
+        // not halved the way the graph's own stereo-to-mono mix would.
+        *pw::keys::AUDIO_CHANNELS => "2",
+        "audio.position" => "[FL,FR]",
+        "node.group" => group.as_str(),
+        "node.link-group" => group.as_str(),
     };
     let initial_target = active_target.lock().ok().and_then(|t| t.clone());
     if let Some(target) = &initial_target {
@@ -793,6 +945,9 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
             to_monitor,
             monitor_on: ctx.monitor_on.clone(),
             format: Default::default(),
+            fold: StereoFold::new(config.rate as f32),
+            left: vec![0.0; MAX_BLOCK],
+            right: vec![0.0; MAX_BLOCK],
             pipeline: ctx.pipeline.clone(),
             scratch: vec![0.0; MAX_BLOCK],
             input_wav: config.input_wav.clone(),
@@ -821,6 +976,8 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
                 return;
             }
             if data.format.parse(param).is_ok() {
+                // A new format means a new microphone: learn its channels afresh.
+                data.fold.reset();
                 log::info!(
                     "capture format: {:?} {} Hz x{}",
                     data.format.format(),
@@ -830,6 +987,7 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
             }
         })
         .process(|stream, data| {
+            no_denormals();
             data.stats.capture_callbacks.fetch_add(1, Ordering::Relaxed);
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
@@ -846,16 +1004,24 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
             let frame_bytes = SAMPLE_BYTES * channels;
             let frames = ((end - offset) / frame_bytes).min(data.scratch.len());
             let scratch = &mut data.scratch[..frames];
-            for (out, frame) in scratch
-                .iter_mut()
-                .zip(bytes[offset..end].chunks_exact(frame_bytes))
-            {
-                // Mono fold-down if the capture side ever negotiates >1 channel.
-                let mut acc = 0.0f32;
-                for s in frame.as_chunks::<SAMPLE_BYTES>().0 {
-                    acc += f32::from_le_bytes(*s);
+            let interleaved = bytes[offset..end].chunks_exact(frame_bytes);
+            if channels == 2 {
+                let (left, right) = (&mut data.left[..frames], &mut data.right[..frames]);
+                for ((l, r), frame) in left.iter_mut().zip(right.iter_mut()).zip(interleaved) {
+                    let (samples, _) = frame.as_chunks::<SAMPLE_BYTES>();
+                    *l = f32::from_le_bytes(samples[0]);
+                    *r = f32::from_le_bytes(samples[1]);
                 }
-                *out = acc / channels as f32;
+                data.fold.process(left, right, scratch);
+            } else {
+                // Whatever else was negotiated: a plain average.
+                for (out, frame) in scratch.iter_mut().zip(interleaved) {
+                    let mut acc = 0.0f32;
+                    for s in frame.as_chunks::<SAMPLE_BYTES>().0 {
+                        acc += f32::from_le_bytes(*s);
+                    }
+                    *out = acc / channels as f32;
+                }
             }
             if let Some(wav) = &data.input_wav
                 && !wav.is_empty()
@@ -868,6 +1034,7 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
 
             // Uncontended except for the instant a session is torn down.
             let Ok(mut pipeline) = data.pipeline.try_lock() else {
+                data.stats.skipped_callbacks.fetch_add(1, Ordering::Relaxed);
                 return;
             };
             let started = std::time::Instant::now();
@@ -883,14 +1050,10 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
             data.meters.publish_auto_gain(pipeline.auto_gain_db());
             drop(pipeline);
 
-            let monitor = data.monitor_on.load(Ordering::Relaxed);
-            for &s in scratch.iter() {
-                if data.to_source.push(s).is_err() {
-                    data.stats.trimmed_frames.fetch_add(1, Ordering::Relaxed);
-                }
-                // Feed the always-on monitor stream the processed voice when
-                // "Hear myself" is on, otherwise silence.
-                let _ = data.to_monitor.push(if monitor { s } else { 0.0 });
+            push_all(&mut data.to_source, scratch, Some(&data.stats));
+            // The monitor stream only exists while "Hear myself" is on.
+            if data.monitor_on.load(Ordering::Relaxed) {
+                push_all(&mut data.to_monitor, scratch, None);
             }
         })
         .register()
@@ -906,19 +1069,19 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
         *pw::keys::NODE_LATENCY => latency.as_str(),
         *pw::keys::AUDIO_CHANNELS => "1",
         "audio.position" => "[MONO]",
+        "node.group" => group.as_str(),
+        "node.link-group" => group.as_str(),
     };
     let output = pw::stream::StreamRc::new(core.clone(), "Voice Changer output", out_props)
         .context("create output stream")?;
     let output_listener = output
-        .add_local_listener_with_user_data(SinkData {
-            consumer: from_capture,
-            target_slack: (config.quantum as usize).max(64),
-            quantum: config.quantum as usize,
-            max_slack: (config.quantum as usize) * 4,
-            primed: false,
-            stats: stats.clone(),
-            count_callbacks: true,
-        })
+        .add_local_listener_with_user_data(SinkData::new(
+            from_capture,
+            1,
+            config,
+            stats.clone(),
+            true,
+        ))
         .state_changed({
             let lose = lose.clone();
             move |_, _, old, new| {
@@ -936,35 +1099,38 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
     // Role "Music" rather than "Communication": a communication stream
     // makes WirePlumber switch Bluetooth headsets into the low-quality
     // headset profile even while this stream only carries silence.
-    let mon_props = properties! {
+    // Stereo with the voice on both channels, so it is in both ears and in
+    // the front pair of a surround output whatever the graph's up-mix
+    // settings are.
+    let mut mon_props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Playback",
         *pw::keys::MEDIA_ROLE => "Music",
         *pw::keys::NODE_NAME => MONITOR_NODE_NAME,
         *pw::keys::NODE_DESCRIPTION => "Voice Changer monitor",
         *pw::keys::NODE_LATENCY => latency.as_str(),
-        *pw::keys::AUDIO_CHANNELS => "1",
-        "audio.position" => "[MONO]",
+        *pw::keys::AUDIO_CHANNELS => "2",
+        "audio.position" => "[FL,FR]",
+        "node.group" => group.as_str(),
+        "node.link-group" => group.as_str(),
     };
+    if let Some(target) = &config.monitor_target {
+        mon_props.insert(*pw::keys::TARGET_OBJECT, target.as_str());
+    }
     let monitor = pw::stream::StreamRc::new(core.clone(), "Voice Changer monitor", mon_props)
         .context("create monitor stream")?;
+    let monitor_data = SinkData::new(from_capture_mon, 2, config, stats.clone(), false);
+    let monitor_flush = monitor_data.flush.clone();
     let monitor_listener = monitor
-        .add_local_listener_with_user_data(SinkData {
-            consumer: from_capture_mon,
-            target_slack: (config.quantum as usize).max(64),
-            quantum: config.quantum as usize,
-            max_slack: (config.quantum as usize) * 4,
-            primed: false,
-            stats: stats.clone(),
-            count_callbacks: false,
-        })
+        .add_local_listener_with_user_data(monitor_data)
         .state_changed(|_, _, old, new| log::info!("monitor stream: {old:?} -> {new:?}"))
         .process(drain_into)
         .register()
         .context("register monitor listener")?;
 
-    let format = mono_f32_format(config.rate)?;
-    let mut cap_params = [Pod::from_bytes(&format).ok_or_else(|| anyhow!("bad format pod"))?];
+    let format = f32_format(config.rate, 1)?;
+    let stereo = f32_format(config.rate, 2)?;
+    let mut cap_params = [Pod::from_bytes(&stereo).ok_or_else(|| anyhow!("bad format pod"))?];
     capture
         .connect(
             spa::utils::Direction::Input,
@@ -982,19 +1148,12 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
             &mut out_params,
         )
         .context("connect output stream")?;
-    let mut mon_params = [Pod::from_bytes(&format).ok_or_else(|| anyhow!("bad format pod"))?];
-    // The monitor plays to the default output and is always streaming; the
-    // `monitor_on` flag decides whether it carries the processed voice or
-    // silence. (Activating a parked AUTOCONNECT stream at runtime leaves its
-    // link stuck in `init`, so "Hear myself" never actually started.)
-    monitor
-        .connect(
-            spa::utils::Direction::Output,
-            None,
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
-            &mut mon_params,
-        )
-        .context("connect monitor stream")?;
+    // The monitor is connected only while "Hear myself" is on: a stream
+    // that is always there keeps the headphones awake, sits in every volume
+    // mixer and ties the output device into our graph for nothing.
+    if ctx.monitor_on.load(Ordering::Relaxed) {
+        set_monitor_stream(&monitor, true, config.rate, &monitor_flush);
+    }
 
     // ---- registry: microphone list + the "default" metadata object -------------------
     let registry = core.get_registry_rc().context("get registry")?;
@@ -1194,6 +1353,7 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
             let active_target = active_target.clone();
             let capture = capture.clone();
             let metadata = metadata.clone();
+            let source_name = source_name.clone();
             move |id| {
                 let mut unplugged: Option<DeviceInfo> = None;
                 if let Ok(mut list) = devices.lock()
@@ -1220,10 +1380,22 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
                             "microphone {:?} was unplugged; using the system default until it is back",
                             dev.description
                         );
+                        // While we are the default source "the default"
+                        // would be ourselves: name another real microphone.
+                        let fallback = if routing.lock().map(|r| r.default_is_us).unwrap_or(false) {
+                            real_default_source(&routing, &devices, &source_name)
+                        } else {
+                            None
+                        };
                         if let Ok(mut a) = active_target.lock() {
-                            *a = None;
+                            *a = fallback.clone();
                         }
-                        retarget_capture(&capture, metadata.borrow().as_ref(), &devices, None);
+                        retarget_capture(
+                            &capture,
+                            metadata.borrow().as_ref(),
+                            &devices,
+                            fallback.as_deref(),
+                        );
                     }
                 }
             }
@@ -1245,6 +1417,9 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
         let app_streams = app_streams.clone();
         let end = end.clone();
         let take_over_pending = take_over_pending.clone();
+        let core = core.clone();
+        let quit_seq = quit_seq.clone();
+        let rate = config.rate;
         let handler: Box<dyn Fn(Command)> = Box::new(move |cmd| match cmd {
             Command::Quit => {
                 // Put every application back on its own microphone, then
@@ -1254,7 +1429,15 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
                 }
                 set_default_source(metadata.borrow().as_ref(), &routing, &source_name, false);
                 *end.borrow_mut() = Some(SessionEnd::Quit);
-                mainloop.quit()
+                // The restores above are only queued. Leaving now would
+                // drop them with the connection and leave the desktop's
+                // default microphone pointing at a node that is gone, so
+                // wait for the daemon to answer a round trip first (a timer
+                // below gives up after a second if it never does).
+                match core.sync(0) {
+                    Ok(seq) => quit_seq.set(Some(seq.seq())),
+                    Err(_) => mainloop.quit(),
+                }
             }
             Command::RouteApp { stream_id, on } => {
                 route_stream(
@@ -1313,11 +1496,7 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
                 );
             }
             Command::SetMonitor(on) => {
-                // The audio is gated by the `monitor_on` flag in the capture
-                // callback (already set by the caller); the stream itself
-                // stays connected so the link is reliably active.
-                let _ = &monitor;
-                log::info!("monitor {}", if on { "on" } else { "off" });
+                set_monitor_stream(&monitor, on, rate, &monitor_flush);
             }
         });
         *receiver_slot.borrow_mut() = Some(handler);
@@ -1386,7 +1565,27 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
         let source_name = source_name.clone();
         let app_streams = app_streams.clone();
         let capture_target = capture_target.clone();
+        let end = end.clone();
+        let quit_loop = mainloop.clone();
+        let quit_ticks = Cell::new(0u32);
+        let metadata_ticks = Cell::new(0u32);
         let timer = mainloop.loop_().add_timer(move |_| {
+            // A quit whose round trip never came back.
+            if matches!(*end.borrow(), Some(SessionEnd::Quit)) {
+                quit_ticks.set(quit_ticks.get() + 1);
+                if quit_ticks.get() >= 2 {
+                    quit_loop.quit();
+                }
+                return;
+            }
+            // Once the session manager's values are in: undo a take-over
+            // that a crash or a kill left behind.
+            if metadata.borrow().is_some() && metadata_ticks.get() < 2 {
+                metadata_ticks.set(metadata_ticks.get() + 1);
+                if metadata_ticks.get() == 2 {
+                    recover_default_source(metadata.borrow().as_ref(), &routing, &source_name);
+                }
+            }
             if !take_over_pending.get() {
                 return;
             }
@@ -1600,14 +1799,78 @@ fn set_unity_volume(node: &pw::node::Node) {
     }
 }
 
-/// Serialize an `EnumFormat` pod for mono 32-bit float at `rate`.
-fn mono_f32_format(rate: u32) -> Result<Vec<u8>> {
+/// Queue a block for one of the sink callbacks. A full ring (nobody has been
+/// reading for a second) drops the block; the reader trims anyway.
+fn push_all(ring: &mut rtrb::Producer<f32>, block: &[f32], stats: Option<&Stats>) {
+    match ring.write_chunk_uninit(block.len()) {
+        Ok(chunk) => {
+            chunk.fill_from_iter(block.iter().copied());
+        }
+        Err(_) => {
+            if let Some(stats) = stats {
+                stats
+                    .trimmed_frames
+                    .fetch_add(block.len() as u64, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Connect or disconnect the "Hear myself" stream.
+fn set_monitor_stream(monitor: &pw::stream::Stream, on: bool, rate: u32, flush: &AtomicBool) {
+    use pw::stream::StreamState;
+    let connected = !matches!(
+        monitor.state(),
+        StreamState::Unconnected | StreamState::Error(_)
+    );
+    if on == connected {
+        return;
+    }
+    if !on {
+        if let Err(e) = monitor.disconnect() {
+            log::warn!("could not stop the monitor: {e}");
+        }
+        log::info!("monitor off");
+        return;
+    }
+    // A stream that ended in an error has to be disconnected before it can
+    // be connected again.
+    if matches!(monitor.state(), StreamState::Error(_)) {
+        let _ = monitor.disconnect();
+    }
+    let Some(format) = f32_format(rate, 2).ok() else {
+        return;
+    };
+    let Some(pod) = Pod::from_bytes(&format) else {
+        return;
+    };
+    // Whatever the ring still holds is from the last time it was on.
+    flush.store(true, Ordering::Relaxed);
+    match monitor.connect(
+        spa::utils::Direction::Output,
+        None,
+        StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+        &mut [pod],
+    ) {
+        Ok(()) => log::info!("monitor on"),
+        Err(e) => log::warn!("could not start the monitor: {e}"),
+    }
+}
+
+/// Serialize an `EnumFormat` pod for 32-bit float at `rate`: mono, or stereo
+/// front left/right.
+fn f32_format(rate: u32, channels: u32) -> Result<Vec<u8>> {
     let mut info = spa::param::audio::AudioInfoRaw::new();
     info.set_format(spa::param::audio::AudioFormat::F32LE);
     info.set_rate(rate);
-    info.set_channels(1);
+    info.set_channels(channels);
     let mut position = [0u32; spa::param::audio::MAX_CHANNELS];
-    position[0] = spa::sys::SPA_AUDIO_CHANNEL_MONO;
+    if channels == 2 {
+        position[0] = spa::sys::SPA_AUDIO_CHANNEL_FL;
+        position[1] = spa::sys::SPA_AUDIO_CHANNEL_FR;
+    } else {
+        position[0] = spa::sys::SPA_AUDIO_CHANNEL_MONO;
+    }
     info.set_position(position);
 
     let (cursor, _) = spa::pod::serialize::PodSerializer::serialize(
@@ -1789,9 +2052,18 @@ fn set_default_source(
     if on {
         if !r.default_is_us {
             let current = r.default_current.clone();
-            if let Some(c) = current.filter(|c| !c.contains(source_name)) {
-                r.default_prev = Some(c);
+            match current {
+                Some(c) if !c.contains(source_name) => r.default_prev = Some(c),
+                // The default already names us: left behind by a run that
+                // did not get to restore it. What it was before that is on disk.
+                Some(_) if r.default_prev.is_none() => {
+                    r.default_prev = saved_default::load(source_name).flatten();
+                }
+                _ => {}
             }
+            // Remembered on disk too, so a crash or a kill can be undone on
+            // the next start.
+            saved_default::store(source_name, r.default_prev.as_deref());
             r.default_is_us = true;
         }
         metadata.set_property(
@@ -1812,7 +2084,92 @@ fn set_default_source(
             ),
             None => metadata.set_property(0, "default.configured.audio.source", None, None),
         }
+        saved_default::clear();
         log::info!("default microphone restored");
+    }
+}
+
+/// A previous run made us the default microphone and never restored it (it
+/// crashed or was killed). If this run is not asked to take over, put the
+/// remembered default back.
+fn recover_default_source(
+    metadata: Option<&pw::metadata::Metadata>,
+    routing: &Mutex<Routing>,
+    source_name: &str,
+) {
+    let Some(metadata) = metadata else { return };
+    let Some(saved) = saved_default::load(source_name) else {
+        return;
+    };
+    let Ok(r) = routing.lock() else { return };
+    if r.take_over || r.default_is_us {
+        // Taking over again: `set_default_source` picks the saved value up.
+        return;
+    }
+    let stale = r
+        .default_current
+        .as_deref()
+        .and_then(json_name)
+        .is_some_and(|n| n == source_name);
+    drop(r);
+    if stale {
+        match saved {
+            Some(prev) => metadata.set_property(
+                0,
+                "default.configured.audio.source",
+                Some("Spa:String:JSON"),
+                Some(&prev),
+            ),
+            None => metadata.set_property(0, "default.configured.audio.source", None, None),
+        }
+        log::info!("restored the default microphone left over from the last run");
+    }
+    saved_default::clear();
+}
+
+/// The default source as it was before we took over, kept in the config
+/// folder while we are the default. The file holds our source's name on the
+/// first line (so a test instance does not undo the real one) and the
+/// metadata value on the second (empty = there was none).
+mod saved_default {
+    use std::path::PathBuf;
+
+    fn path() -> Option<PathBuf> {
+        vc_core::presets::config_dir().map(|d| d.join("default-source.prev"))
+    }
+
+    pub fn store(source_name: &str, previous: Option<&str>) {
+        let Some(path) = path() else { return };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let text = format!("{source_name}\n{}\n", previous.unwrap_or(""));
+        if let Err(e) = std::fs::write(&path, text) {
+            log::debug!("could not remember the default microphone: {e}");
+        }
+    }
+
+    /// `None` = nothing saved for this source; `Some(None)` = saved, and
+    /// there was no configured default before.
+    pub fn load(source_name: &str) -> Option<Option<String>> {
+        let text = std::fs::read_to_string(path()?).ok()?;
+        let mut lines = text.lines();
+        if lines.next()? != source_name {
+            return None;
+        }
+        Some(
+            lines
+                .next()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string),
+        )
+    }
+
+    pub fn clear() {
+        if let Some(path) = path() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 

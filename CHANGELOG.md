@@ -3,6 +3,59 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-11-13
+
+### Fixed
+- **Picking an AI voice aborted the whole app on machines using the CPU engine**, which is
+  every NVIDIA and Intel machine by default (`std::vector<const OrtEpDevice*>::front()
+  ... Assertion '!this->empty()' failed`, [#1](https://github.com/ZeroDay-Labz/voice-changer/issues/1)).
+  The app asked ONNX Runtime 1.22 to choose a device by itself, which that version cannot
+  do without a GPU provider. It no longer asks.
+- **The NVIDIA set-up could never work.** `scripts/get-onnxruntime.sh --cuda` copied the
+  runtime but not the CUDA provider library next to it, and used the wrong folder when
+  `XDG_DATA_HOME` was set. An install without the provider is no longer treated as a
+  CUDA runtime.
+- **A GPU that cannot be used is no longer reported as in use.** When the provider failed
+  to load (CUDA or cuDNN missing, a driver problem) the status still named the GPU and
+  the AI kept the small thread count meant for GPU runs, too few to keep up on the
+  processor. It now switches to the processor with the right thread count and says why.
+- **Quitting could leave "Voice Changer Mic" as the system's default microphone.** The
+  restore was queued and the connection closed before it was sent. Quit now waits for the
+  audio system to confirm. The previous default is also written to
+  `~/.config/voice-changer/default-source.prev` while the app is the default, so a crash
+  or a kill is undone on the next start.
+- **The app can no longer be linked to its own virtual microphone.** Its nodes share a
+  link group, which the session manager never links to itself. Unplugging the microphone
+  while "Replace my microphone everywhere" is on now moves to another real microphone
+  instead of "the default", which at that moment is the app itself.
+- Denormal numbers are flushed to zero on the audio thread, so reverb and filter tails
+  fading into silence cannot cause CPU spikes.
+
+### Added
+- **`voice-changer get-runtime [--cuda]`** downloads the AI engine for packaged installs,
+  which do not have the `scripts` folder.
+- **`voice-changer doctor` checks NVIDIA end to end**: the CUDA build of the runtime, the
+  CUDA 12 libraries and cuDNN 9, with what to install for each missing piece.
+
+### Changed
+- **One clock for the whole audio path.** The microphone input, the processed-voice
+  output, the virtual microphone and "Hear myself" now share one PipeWire scheduling
+  group, so they run in the same graph cycle under the microphone's clock. Before, the
+  microphone, the virtual microphone's timer and the headphones each ran on their own
+  clock and the buffers between them slowly drifted apart until one ran dry or had to be
+  cut short.
+- **"Hear myself" is a stereo stream that exists only while it is on.** The voice is on
+  both channels (both ears, front pair on surround outputs). When it is off there is no
+  stream at all: it no longer keeps the headphones awake, sits in the volume mixer or
+  ties the output device into the microphone's graph.
+- **Smarter microphone channels.** The input is captured in stereo and folded down by the
+  app. An interface or jack with the microphone on one channel is no longer halved, and a
+  balanced cable whose two channels cancel each other is no longer silent. Mono and real
+  stereo microphones sound as before.
+- After a dropout the extra safety buffer is given back once things have been calm for
+  half a minute (it used to stay for the rest of the session), and the voice fades back
+  in after a gap instead of clicking.
+
 ## [0.3.1] - 2026-10-11
 
 ### Fixed

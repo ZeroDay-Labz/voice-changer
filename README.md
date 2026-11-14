@@ -63,8 +63,10 @@ pick a microphone can use it. There is nothing to configure in PulseAudio or JAC
 Every asset comes for **x86_64** and **aarch64** (Raspberry Pi 5, Asahi Linux, ARM
 laptops), with a `SHA256SUMS` file next to them.
 
-AMD GPUs work out of the box with the `onnxruntime-rocm` package; NVIDIA GPUs after
-`scripts/get-onnxruntime.sh --cuda` (see [Compute](#compute-cpu-or-gpu)).
+AI voices run on the processor everywhere. AMD GPUs are used out of the box with the
+`onnxruntime-rocm` package; NVIDIA GPUs after `voice-changer get-runtime --cuda` (see
+[Compute](#compute-cpu-or-gpu)). `voice-changer doctor` tells you what your machine has
+and what is missing.
 
 The packages install the app, the CLAP plugin (`/usr/lib64/clap/` or `/usr/lib/clap/`), a
 launcher and the icon. AI voice models are downloaded separately (see [AI voices](#ai-voices)).
@@ -200,8 +202,8 @@ The app loads ONNX Runtime at start and uses whichever it finds first:
 | Runtime | Where it comes from | Result |
 |---|---|---|
 | ROCm build | Fedora: `sudo dnf install onnxruntime-rocm` (or `ORT_DYLIB_PATH`) | AMD GPUs appear under Compute |
-| CUDA build | `scripts/get-onnxruntime.sh --cuda` (needs NVIDIA's driver, CUDA 12 runtime and cuDNN 9) | NVIDIA GPUs appear under Compute |
-| CPU build | bundled with the packages, `scripts/get-onnxruntime.sh`, or the distribution's `onnxruntime` | CPU only |
+| CUDA build | `voice-changer get-runtime --cuda` (needs NVIDIA's driver, CUDA 12 runtime and cuDNN 9) | NVIDIA GPUs appear under Compute |
+| CPU build | bundled with the packages, `voice-changer get-runtime`, or the distribution's `onnxruntime` | CPU only |
 
 Settings → AI shows which library is loaded. The first load of a voice on an AMD GPU
 compiles kernels, which takes tens of seconds and is cached in `~/.cache/miopen`.
@@ -212,11 +214,20 @@ chips, at most 12, and just a few when the models run on a GPU. Settings → AI 
 was detected and lets you choose a number up to the threads you have; `--ai-threads N`
 does the same from the terminal. Lower it if other programs stutter while the AI runs.
 
-NVIDIA in short: install the driver and CUDA (Fedora: RPM Fusion's `xorg-x11-drv-nvidia-cuda`
-plus `cuda-toolkit-12` and `cudnn9` from NVIDIA's repository; Ubuntu: `nvidia-driver-5xx`,
-`cuda-toolkit-12-x`, `cudnn9-cuda-12`), run `scripts/get-onnxruntime.sh --cuda`, start the app
-and pick the GPU under Compute (Auto chooses it). The same binary serves AMD, NVIDIA and
-CPU-only machines.
+**NVIDIA.** Nothing is needed for the app, the effects or AI voices on the processor.
+To run the AI on the graphics card:
+
+1. Install the driver and the CUDA 12 runtime with cuDNN 9. Fedora: RPM Fusion's
+   `xorg-x11-drv-nvidia-cuda` plus `cuda-toolkit-12` and `cudnn9` from NVIDIA's
+   repository. Ubuntu: `nvidia-driver-5xx`, `cuda-toolkit-12-x`, `cudnn9-cuda-12`.
+   Arch: `cuda`, `cudnn`.
+2. `voice-changer get-runtime --cuda` downloads Microsoft's CUDA build of ONNX Runtime
+   into `~/.local/lib/voice-changer/cuda`.
+3. `voice-changer doctor` says whether everything was found; then start the app and pick
+   the GPU under Compute (Auto chooses it).
+
+If a piece is missing the AI runs on the processor and Settings → AI says which piece.
+The same binary serves AMD, NVIDIA and CPU-only machines.
 
 ## Plugin
 
@@ -250,8 +261,12 @@ portal, and prints the fix for anything missing.
 - **The app looks right but there is no "Voice Changer Mic" in Discord or the browser.**
   Those apps talk PulseAudio; make sure `pipewire-pulse` is installed and
   `pactl info` says `Server Name: PulseAudio (on PipeWire …)`.
-- **Blank or very slow window in a VM.** Run with `ICED_BACKEND=tiny-skia voice-changer`
-  (software rendering) or `WGPU_BACKEND=gl` (OpenGL instead of Vulkan).
+- **Blank, frozen or very slow window (VMs, some NVIDIA driver and Wayland combinations).**
+  Run with `WGPU_BACKEND=gl voice-changer` (OpenGL instead of Vulkan) or
+  `ICED_BACKEND=tiny-skia voice-changer` (software rendering). The audio side is not
+  affected by either.
+- **The app closes when an AI voice is picked** (0.3.1 and older, on machines without an
+  AMD GPU). Fixed in 0.4.0; update.
 - **No window and no tray icon.** GNOME needs the AppIndicator extension for a tray; the
   app opens its window instead when "Start minimized" finds no tray. `voice-changer show`
   always brings it up.

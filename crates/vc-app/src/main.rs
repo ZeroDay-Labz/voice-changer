@@ -10,6 +10,7 @@ mod config;
 mod control;
 mod dbus;
 mod doctor;
+mod fold;
 mod gui_ctx;
 mod hotkey;
 mod launcher;
@@ -83,6 +84,10 @@ struct Cli {
     #[arg(long)]
     monitor: bool,
 
+    /// Play "Hear myself" to this sink (node.name) instead of the default output.
+    #[arg(long, hide = true)]
+    monitor_target: Option<String>,
+
     /// PipeWire node name of the published microphone.
     #[arg(long, hide = true, default_value = pw::SOURCE_NODE_NAME)]
     source_name: String,
@@ -153,6 +158,12 @@ enum Command {
     Quit,
     /// Check this computer: PipeWire, session manager, PulseAudio apps, microphones, GPU, models, tray, shortcut portal.
     Doctor,
+    /// Download the AI engine (ONNX Runtime) into ~/.local/lib/voice-changer: the CPU build, or with --cuda the NVIDIA build.
+    GetRuntime {
+        /// The NVIDIA (CUDA 12) build instead of the CPU one.
+        #[arg(long)]
+        cuda: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -167,6 +178,9 @@ fn main() -> Result<()> {
     if let Some(Command::Doctor) = &cli.command {
         let code = doctor::print(&doctor::run_checks());
         std::process::exit(code);
+    }
+    if let Some(Command::GetRuntime { cuda }) = &cli.command {
+        return get_runtime(*cuda);
     }
     if cli.self_test {
         return selftest::run(cli.rate, cli.quantum);
@@ -227,6 +241,7 @@ fn main() -> Result<()> {
             Some(p) => Some(std::sync::Arc::new(read_wav_mono(p)?)),
             None => None,
         },
+        monitor_target: cli.monitor_target.clone(),
     };
     let stats = std::sync::Arc::new(pw::Stats::default());
     let meters = std::sync::Arc::new(vc_core::Meters::default());
@@ -398,11 +413,12 @@ fn main() -> Result<()> {
             log::warn!("audio shutdown: {e:#}");
         }
         log::info!(
-            "callbacks: capture={} output={} underruns={} trimmed_frames={} process_avg={}us process_max={}us (quantum={}us)",
+            "callbacks: capture={} output={} underruns={} trimmed_frames={} skipped={} process_avg={}us process_max={}us (quantum={}us)",
             stats.capture_callbacks.load(Ordering::Relaxed),
             stats.output_callbacks.load(Ordering::Relaxed),
             stats.underruns.load(Ordering::Relaxed),
             stats.trimmed_frames.load(Ordering::Relaxed),
+            stats.skipped_callbacks.load(Ordering::Relaxed),
             stats.process_avg_us.load(Ordering::Relaxed),
             stats.process_max_us.load(Ordering::Relaxed),
             cli.quantum as u64 * 1_000_000 / cli.rate as u64,
@@ -434,6 +450,35 @@ fn install_panic_hook(shared: &std::sync::Arc<Shared>) {
             }
         }
     }));
+}
+
+/// Run the bundled download script (the same one as `scripts/get-onnxruntime.sh`),
+/// so packaged installs have it too.
+fn get_runtime(cuda: bool) -> Result<()> {
+    use std::io::Write as _;
+    const SCRIPT: &str = include_str!("../../../scripts/get-onnxruntime.sh");
+    let mut child = std::process::Command::new("bash")
+        .arg("-s")
+        .arg("--")
+        .args(cuda.then_some("--cuda"))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("could not start bash")?;
+    child
+        .stdin
+        .take()
+        .context("no stdin for bash")?
+        .write_all(SCRIPT.as_bytes())?;
+    let status = child.wait()?;
+    if !status.success() {
+        anyhow::bail!(
+            "the download did not finish (it needs curl and tar, and a network connection)"
+        );
+    }
+    if cuda {
+        println!("Now run `voice-changer doctor` to check that CUDA 12 and cuDNN 9 are found.");
+    }
+    Ok(())
 }
 
 /// Voice library operations work on files directly; no running instance needed.
@@ -640,7 +685,9 @@ fn remote(cmd: Command) -> Result<()> {
             }
             Command::Show => proxy.show_window().await?,
             Command::Quit => proxy.quit().await?,
-            Command::Doctor => unreachable!("handled before connecting"),
+            Command::Doctor | Command::GetRuntime { .. } => {
+                unreachable!("handled before connecting")
+            }
         }
         Ok(())
     })

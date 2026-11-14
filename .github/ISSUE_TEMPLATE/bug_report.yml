@@ -1,0 +1,32 @@
+name: Bug report
+description: Something does not work
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `voice-changer doctor`
+      description: It lists your audio system, microphones, GPU and AI runtime, which answers most of our questions.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version and how it was installed
+      placeholder: "0.4.0, rpm / deb / Flatpak / AUR / tarball / from source"
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Settings → Log, or the terminal output when started as `voice-changer`.
+      render: text

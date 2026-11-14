@@ -63,6 +63,11 @@
   </supports>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.4.0" date="2026-11-13">
+      <description>
+        <p>AI voices no longer crash the app on machines that use the CPU engine (every NVIDIA and Intel machine by default). NVIDIA set-up is one command, and the app says plainly when a GPU cannot be used. The microphone, the virtual microphone and Hear myself now run on one clock; quitting always gives the system its default microphone back.</p>
+      </description>
+    </release>
     <release version="0.3.1" date="2026-10-11">
       <description>
         <p>Fixes a crash at start on machines that have the ROCm ONNX Runtime installed but no AMD GPU: the CPU runtime is used there instead.</p>

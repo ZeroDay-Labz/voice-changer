@@ -346,15 +346,48 @@ pub fn run_checks() -> Vec<Finding> {
                     out.push(Finding::warn(
                         "ONNX Runtime",
                         "no libonnxruntime.so found",
-                        "AI voices need it. Reinstall the package, or run scripts/get-onnxruntime.sh (AMD: `dnf install onnxruntime-rocm`).",
+                        "AI voices need it. Reinstall the package, or run `voice-changer get-runtime` (AMD: `dnf install onnxruntime-rocm`; NVIDIA: `voice-changer get-runtime --cuda`).",
                     ));
                 } else {
                     out.push(Finding::ok("ONNX Runtime", "built in (CPU)"));
                 }
             }
         }
+        // NVIDIA needs three things beyond the driver: our CUDA build of the
+        // runtime, the CUDA 12 libraries and cuDNN 9. Say which is missing.
+        let nvidia = compute::nvidia_gpus();
+        if !nvidia.is_empty() && cfg!(feature = "gpu") {
+            let names = nvidia
+                .iter()
+                .map(|g| g.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if compute::cuda_runtime_lib().is_none() {
+                out.push(Finding::warn(
+                    "NVIDIA GPU",
+                    format!("{names}: the CUDA build of ONNX Runtime is not installed, AI runs on the CPU"),
+                    "Run `voice-changer get-runtime --cuda`, then start the app again.",
+                ));
+            } else {
+                if let Some(missing) = compute::missing_cuda_summary() {
+                    out.push(Finding::warn(
+                        "NVIDIA GPU",
+                        format!("{names}: {missing}, AI runs on the CPU"),
+                        "Install the CUDA 12 runtime and cuDNN 9 (Fedora: cuda-toolkit-12 and cudnn9 from NVIDIA's repository; Ubuntu: cuda-toolkit-12-x and cudnn9-cuda-12; Arch: cuda and cudnn).",
+                    ));
+                } else {
+                    out.push(Finding::ok(
+                        "NVIDIA GPU",
+                        format!("{names}: CUDA runtime, CUDA 12 and cuDNN 9 found"),
+                    ));
+                }
+            }
+        }
         let gpus = compute::gpus();
-        if gpus.is_empty() {
+        let gpu_in_use = compute::resolve("auto") != compute::Backend::Cpu;
+        if compute::gpu_failure().is_some() {
+            // Already explained above.
+        } else if gpus.is_empty() {
             out.push(Finding::ok(
                 "GPU",
                 compute::gpu_note().unwrap_or_else(|| "none; AI runs on the CPU".into()),
@@ -369,7 +402,7 @@ pub fn run_checks() -> Vec<Finding> {
             ));
         }
         let info = hardware::info();
-        let auto = hardware::recommended_threads(info, !gpus.is_empty());
+        let auto = hardware::recommended_threads(info, gpu_in_use);
         out.push(Finding::ok(
             "Processor",
             format!(
@@ -378,7 +411,7 @@ pub fn run_checks() -> Vec<Finding> {
                 if auto == 1 { "" } else { "s" }
             ),
         ));
-        if info.performance_cores <= 2 && gpus.is_empty() {
+        if info.performance_cores <= 2 && !gpu_in_use {
             out.push(Finding::warn(
                 "AI on this CPU",
                 "two cores or fewer",

@@ -303,6 +303,19 @@ fn append_rocm(builder: &ort::session::builder::SessionBuilder, device: i32) -> 
     }
 }
 
+/// The useful end of an ONNX Runtime error: what follows the last
+/// "with error:" (the loader's own message), cut to one short line.
+#[cfg(feature = "gpu")]
+fn short_reason(error: &str) -> String {
+    let tail = error.rsplit("with error:").next().unwrap_or(error);
+    let line = tail.lines().next().unwrap_or(tail).trim();
+    let mut short: String = line.chars().take(120).collect();
+    if line.chars().count() > 120 {
+        short.push('…');
+    }
+    short
+}
+
 impl Rvc {
     pub fn load(paths: &ModelPaths, threads: usize) -> Result<Self> {
         Self::load_on(paths, threads, super::compute::Backend::Cpu)
@@ -350,6 +363,7 @@ impl Rvc {
                     // A failed registration leaves the options object unusable
                     // (ONNX Runtime 1.22 aborts on it), so start over on the CPU.
                     log::warn!("{e}; this session will run on the CPU");
+                    super::compute::mark_gpu_failed(&short_reason(&format!("{e}")));
                     builder = make_builder()?;
                 }
             }

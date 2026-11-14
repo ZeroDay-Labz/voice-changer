@@ -153,7 +153,104 @@ pub fn cuda_runtime_lib() -> Option<PathBuf> {
     }
     dirs.push("/usr/lib64/voice-changer/cuda".into());
     dirs.push("/usr/lib/voice-changer/cuda".into());
-    dirs.iter().find_map(|d| newest_lib(d))
+    // The runtime alone is not enough: the CUDA provider is a separate
+    // library next to it (an install that lacks it can only ever run on the
+    // CPU, so it does not count).
+    dirs.iter()
+        .filter(|d| d.join("libonnxruntime_providers_cuda.so").is_file())
+        .find_map(|d| newest_lib(d))
+}
+
+/// The NVIDIA libraries Microsoft's CUDA build of ONNX Runtime links
+/// against: the CUDA 12 runtime and cuDNN 9.
+pub const CUDA_LIBS: [&str; 7] = [
+    "libcudart.so.12",
+    "libcublas.so.12",
+    "libcublasLt.so.12",
+    "libcufft.so.11",
+    "libcurand.so.10",
+    "libnvrtc.so.12",
+    "libcudnn.so.9",
+];
+
+/// Which of [`CUDA_LIBS`] the dynamic loader cannot find. Cached.
+pub fn missing_cuda_libs() -> Vec<&'static str> {
+    static CACHE: OnceLock<Vec<&'static str>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            #[cfg(feature = "gpu")]
+            {
+                CUDA_LIBS
+                    .iter()
+                    .copied()
+                    .filter(|name| {
+                        // SAFETY: these are NVIDIA's own runtime libraries;
+                        // loading one runs only its initialisers. Kept open
+                        // (the provider needs them anyway).
+                        match unsafe { libloading::Library::new(name) } {
+                            Ok(lib) => {
+                                std::mem::forget(lib);
+                                false
+                            }
+                            Err(_) => true,
+                        }
+                    })
+                    .collect()
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                Vec::new()
+            }
+        })
+        .clone()
+}
+
+/// What is missing for CUDA in a few words, `None` when everything is found.
+pub fn missing_cuda_summary() -> Option<String> {
+    let missing = missing_cuda_libs();
+    if missing.is_empty() {
+        None
+    } else if missing.len() == CUDA_LIBS.len() {
+        Some("the CUDA 12 runtime and cuDNN 9 are not installed".into())
+    } else if missing == ["libcudnn.so.9"] {
+        Some("cuDNN 9 is not installed (libcudnn.so.9)".into())
+    } else {
+        Some(format!("{} not found", missing.join(", ")))
+    }
+}
+
+static GPU_FAILED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The GPU was tried and could not be used (the provider failed to load or
+/// to register). From here on everything resolves to the CPU, so the status
+/// line and the thread count match what is really running.
+pub fn mark_gpu_failed(reason: &str) {
+    let mut slot = GPU_FAILED.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        log::warn!("the GPU cannot be used ({reason}); the AI runs on the CPU until restart");
+        *slot = Some(reason.to_string());
+    }
+}
+
+/// Why the GPU that is present is not in use, in words for the user.
+/// `None` when the GPU works or there is none to use.
+pub fn gpu_failure() -> Option<String> {
+    if runtime_kind() == RuntimeKind::Cuda
+        && let Some(missing) = missing_cuda_summary()
+    {
+        return Some(format!(
+            "The NVIDIA GPU cannot be used yet: {missing}. Install the CUDA 12 runtime and cuDNN 9, then restart. The AI runs on the CPU meanwhile."
+        ));
+    }
+    GPU_FAILED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|reason| {
+            format!(
+                "The GPU could not be used ({reason}). The AI runs on the CPU until you restart."
+            )
+        })
 }
 
 /// Fedora's `onnxruntime-rocm` install location (override with ORT_DYLIB_PATH).
@@ -266,7 +363,7 @@ pub fn runtime_lib() -> Option<(PathBuf, RuntimeKind)> {
 pub fn rocm_note() -> Option<String> {
     if cfg!(feature = "gpu")
         && rocm_runtime_lib().is_some()
-        && runtime_kind() != RuntimeKind::Rocm
+        && runtime_kind() == RuntimeKind::Cpu
         && std::env::var_os("ORT_DYLIB_PATH").is_none()
     {
         Some("onnxruntime-rocm is installed but rocminfo reports no AMD GPU, so the CPU runtime is used (the ROCm one would crash without a GPU).".into())
@@ -302,6 +399,9 @@ pub fn runtime_description_full() -> String {
 
 /// Why no GPU is offered, for the Compute picker. `None` when GPUs are listed.
 pub fn gpu_note() -> Option<String> {
+    if let Some(why) = gpu_failure() {
+        return Some(why);
+    }
     if !gpus().is_empty() {
         return None;
     }
@@ -309,12 +409,12 @@ pub fn gpu_note() -> Option<String> {
         return Some("GPU support needs the gpu build.".into());
     }
     if !nvidia_gpus().is_empty() {
-        return Some("NVIDIA GPU found. Run scripts/get-onnxruntime.sh --cuda (needs the CUDA 12 runtime and cuDNN 9), then restart.".into());
+        return Some("NVIDIA GPU found. Run `voice-changer get-runtime --cuda` (it also needs the CUDA 12 runtime and cuDNN 9), then restart.".into());
     }
     if rocm_runtime_lib().is_some() {
         return Some("No AMD GPU detected by ROCm; the AI runs on the CPU runtime.".into());
     }
-    Some("AMD: install onnxruntime-rocm. NVIDIA: run scripts/get-onnxruntime.sh --cuda.".into())
+    Some("AMD: install onnxruntime-rocm. NVIDIA: run `voice-changer get-runtime --cuda`.".into())
 }
 
 /// GPUs the loaded runtime can use: NVIDIA via `nvidia-smi` with the CUDA
@@ -395,8 +495,13 @@ pub fn rocm_gpus() -> Vec<GpuInfo> {
         .clone()
 }
 
-/// Resolve "auto" to the best available backend.
+/// Resolve the setting to the backend that will really be used: "auto"
+/// becomes the best available one, and a GPU that turned out not to work
+/// becomes the CPU.
 pub fn resolve(setting: &str) -> Backend {
+    if gpu_failure().is_some() {
+        return Backend::Cpu;
+    }
     match parse_setting(setting) {
         Some(b) => b,
         None => match (runtime_kind(), gpus().first()) {

@@ -18,7 +18,8 @@ while [[ "${1:-}" == --* ]]; do
         *) echo "unknown option $1" >&2; exit 2 ;;
     esac
 done
-DIR="${1:-${XDG_DATA_HOME:-$HOME/.local}/lib/voice-changer}"
+# The app looks in ~/.local/lib/voice-changer (and its cuda/ subfolder).
+DIR="${1:-$HOME/.local/lib/voice-changer}"
 if [[ $CUDA == 1 ]]; then DIR="$DIR/cuda"; fi
 case "$MACHINE" in
     x86_64) ARCH=x64 ;;
@@ -34,11 +35,18 @@ trap 'rm -rf "$TMP"' EXIT
 echo "downloading $URL"
 curl -fL --progress-bar -o "$TMP/ort.tgz" "$URL"
 tar -xzf "$TMP/ort.tgz" -C "$TMP"
-cp "$TMP/$NAME/lib/libonnxruntime.so"* "$DIR/"
+if [[ $CUDA == 1 ]]; then
+    # The CUDA provider is a separate library the runtime loads from its own
+    # folder; without it the GPU can never be used.
+    cp "$TMP/$NAME/lib/libonnxruntime"*.so* "$DIR/"
+else
+    cp "$TMP/$NAME/lib/libonnxruntime.so"* "$DIR/"
+fi
 ln -sf "libonnxruntime.so.$VERSION" "$DIR/libonnxruntime.so" 2>/dev/null || true
 if [[ $CUDA == 1 ]]; then
     echo "ONNX Runtime $VERSION (CUDA) installed in $DIR"
-    echo "It needs the NVIDIA driver, the CUDA 12 runtime and cuDNN 9 on this machine; the app lists your GPU under Compute once they are present."
+    echo "It needs the NVIDIA driver, the CUDA 12 runtime and cuDNN 9 on this machine."
+    echo "Run 'voice-changer doctor' to see whether they are found, then restart the app."
 else
     echo "ONNX Runtime $VERSION installed in $DIR"
 fi

@@ -3,11 +3,6 @@ use std::sync::Arc;
 use vc_dsp::util::db_to_gain;
 use vc_dsp::{EngineParams, PitchMode};
 
-/// Whether the AI runs on a GPU build (affects how much context is affordable).
-fn vc_dsp_gpu_hint() -> bool {
-    cfg!(feature = "gpu")
-}
-
 /// Host-visible mirror of [`PitchMode`] (nice-plug needs its own `Enum` derive).
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PitchEngine {
@@ -23,40 +18,64 @@ pub enum PitchEngine {
     Natural,
 }
 
-/// Block size trade-off for the AI worker: shorter blocks = less delay but
-/// the models must finish faster.
+/// How much delay the AI voice trades for safety. New variants go at the
+/// end: saved states store the position.
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiSpeed {
-    #[name = "Auto (backs off if needed)"]
+    #[name = "Auto (fastest your machine keeps up with)"]
     Auto,
-    #[name = "Fast (~0.55 s delay)"]
+    #[name = "Fast (~0.65 s delay)"]
     Fast,
-    #[name = "Normal (~0.7 s delay)"]
+    #[name = "Normal (~0.8 s delay)"]
     Normal,
     #[name = "Safe (~1 s delay)"]
     Safe,
+    #[name = "Fastest (~0.47 s delay, needs a GPU)"]
+    Fastest,
+}
+
+/// The sizes one AI block is cut to, in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AiBlock {
+    /// New audio converted per block: the wait before a block can start.
+    pub block_ms: f32,
+    /// Earlier audio the content encoder sees with it (steadier timbre).
+    pub context_ms: f32,
+    /// Earlier audio the synthesizer re-renders with it. This is the
+    /// expensive part: its cost grows with the length.
+    pub synth_context_ms: f32,
 }
 
 impl AiSpeed {
-    /// (block_ms, context_ms). `Auto` starts like `Fast`. With a GPU the
-    /// content encoder gets far more context (that is what keeps the timbre
-    /// steady from block to block) because it is nearly free there.
-    pub fn block_context_ms(self) -> (f32, f32) {
-        let gpu = cfg!(feature = "ai") && vc_dsp_gpu_hint();
-        match (self, gpu) {
-            (AiSpeed::Auto | AiSpeed::Fast, false) => (300.0, 200.0),
-            (AiSpeed::Normal, false) => (400.0, 250.0),
-            (AiSpeed::Safe, false) => (550.0, 350.0),
-            (AiSpeed::Auto | AiSpeed::Fast, true) => (300.0, 1000.0),
-            (AiSpeed::Normal, true) => (400.0, 1000.0),
-            (AiSpeed::Safe, true) => (550.0, 1000.0),
+    /// Block sizes for this setting on the processor or on a GPU. `Auto`
+    /// starts at the fastest setting and backs off when blocks come late.
+    ///
+    /// On a GPU the content encoder is nearly free, so it always gets a
+    /// full second of context. The synthesizer is not: `Fastest` gives it
+    /// the short context the processor settings use, which is what makes a
+    /// 200 ms block affordable.
+    pub fn block(self, gpu: bool) -> AiBlock {
+        let (block_ms, context_ms, synth_context_ms) = match (self, gpu) {
+            (AiSpeed::Auto | AiSpeed::Fastest | AiSpeed::Fast, false) => (300.0, 200.0, 200.0),
+            (AiSpeed::Normal, false) => (400.0, 250.0, 200.0),
+            (AiSpeed::Safe, false) => (550.0, 350.0, 200.0),
+            (AiSpeed::Auto | AiSpeed::Fastest, true) => (200.0, 1000.0, 200.0),
+            (AiSpeed::Fast, true) => (300.0, 1000.0, 500.0),
+            (AiSpeed::Normal, true) => (400.0, 1000.0, 500.0),
+            (AiSpeed::Safe, true) => (550.0, 1000.0, 500.0),
+        };
+        AiBlock {
+            block_ms,
+            context_ms,
+            synth_context_ms,
         }
     }
 
     /// Next slower setting, if any.
     pub fn slower(self) -> Option<AiSpeed> {
         match self {
-            AiSpeed::Auto | AiSpeed::Fast => Some(AiSpeed::Normal),
+            AiSpeed::Auto | AiSpeed::Fastest => Some(AiSpeed::Fast),
+            AiSpeed::Fast => Some(AiSpeed::Normal),
             AiSpeed::Normal => Some(AiSpeed::Safe),
             AiSpeed::Safe => None,
         }

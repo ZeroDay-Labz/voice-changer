@@ -3,6 +3,29 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+- **The AI voice is about 0.3 s closer to real time.** The converted voice used to wait
+  until two whole blocks were ready and then kept a block of audio in hand that was
+  never needed: about 0.9 s from mouth to output where the app reported 0.5 s. It now
+  starts with the first block and keeps a 50 ms cushion, which grows by itself when
+  blocks come late and is given back afterwards. The reported delay is now the real one.
+- **New "Fastest" AI speed** for GPUs (200 ms blocks); Auto starts there and backs off if
+  the machine cannot keep up. Measured on a Radeon RX 6900 XT: 0.47 s from sound in to
+  converted voice out (0.92 s before), at 60% load.
+- **AI block sizes follow where the models really run.** A GPU build whose models run on
+  the processor (no GPU, or one that could not be used) used the long GPU windows and
+  worked the processor about a third harder than needed.
+- The path to the virtual microphone no longer holds a block back (5 to 10 ms less).
+
+### Fixed
+- **"Hear myself" could make all other sound stutter.** Since 0.4.0 it put the output
+  device on the microphone's clock, so a late microphone cycle was heard in everything
+  playing, a call included. It is back on the output device's own clock; the slow drift
+  between the two devices is absorbed by stretching a block by one sample now and then
+  instead of dropping or repeating audio.
+
 ## [0.4.0] - 2026-11-13
 
 ### Fixed

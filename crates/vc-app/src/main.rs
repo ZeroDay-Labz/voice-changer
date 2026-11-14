@@ -17,6 +17,7 @@ mod launcher;
 mod logger;
 mod pw;
 mod selftest;
+mod slip;
 mod tray;
 mod window;
 

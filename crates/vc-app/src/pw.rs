@@ -7,11 +7,12 @@
 //! to each other through lock-free SPSC ring buffers. The engine runs inside
 //! the *capture* callback so processing never stops while nobody listens.
 //!
-//! All our nodes share one `node.group`, so PipeWire schedules them in the
-//! same graph cycle under one driver (the microphone's clock). Without it
-//! the microphone, the virtual source's timer and the headphones each run on
-//! their own clock, and the rings between them slowly drift until they
-//! underrun or have to be trimmed -- a click every minute or so. They also
+//! The capture, the output and the virtual source share one `node.group`, so
+//! PipeWire schedules them in the same graph cycle under one driver (the
+//! microphone's clock) and nothing drifts between them. The monitor is left
+//! out on purpose: it plays on the output device, which keeps its own clock
+//! (grouping it would put all desktop playback on the microphone's clock);
+//! the drift between the two is absorbed in the monitor callback. All four
 //! share a `node.link-group`, which tells the session manager never to link
 //! our capture to our own virtual microphone (a feedback loop) even while
 //! that is the default source.
@@ -43,6 +44,7 @@ use std::time::{Duration, Instant};
 use vc_core::{Meters, Pipeline, VcParams};
 
 use crate::fold::StereoFold;
+use crate::slip::Slip;
 
 pub const SOURCE_NODE_NAME: &str = "voice_changer.source";
 pub const SOURCE_DESCRIPTION: &str = "Voice Changer Mic";
@@ -449,6 +451,13 @@ struct SinkData {
     flush: Arc<AtomicBool>,
     stats: Arc<Stats>,
     count_callbacks: bool,
+    /// Set for a stream that plays on another device's clock (the monitor):
+    /// the fill level is steered by stretching blocks by one sample.
+    drift: Option<Slip>,
+    /// Samples popped from the ring for this block (one more than a block
+    /// when catching up), and the block as it will be played.
+    staging: Vec<f32>,
+    block: Vec<f32>,
 }
 
 /// Length of the fade-in after a discontinuity (about 2.7 ms at 48 kHz).
@@ -461,13 +470,19 @@ impl SinkData {
         config: &AudioConfig,
         stats: Arc<Stats>,
         count_callbacks: bool,
+        own_clock: bool,
     ) -> Self {
         let quantum = (config.quantum as usize).max(64);
+        // In our own scheduling group the producer and this reader run once
+        // each per cycle, so nothing needs to be held back (an unlucky
+        // callback order shows up as one underrun and adds a quantum). On
+        // another clock a quantum of cushion absorbs the two devices' jitter.
+        let slack = if own_clock { quantum } else { 0 };
         Self {
             consumer,
             channels: channels.max(1),
-            target_slack: quantum,
-            min_slack: quantum,
+            target_slack: slack,
+            min_slack: slack,
             quantum,
             max_slack: quantum * 4,
             calm_frames: 0,
@@ -477,6 +492,9 @@ impl SinkData {
             flush: Arc::new(AtomicBool::new(false)),
             stats,
             count_callbacks,
+            drift: own_clock.then(Slip::default),
+            staging: vec![0.0; MAX_BLOCK + 1],
+            block: vec![0.0; MAX_BLOCK],
         }
     }
 
@@ -551,13 +569,31 @@ fn drain_into(stream: &pw::stream::Stream, data: &mut SinkData) {
             }
         }
     }
+    // Fetch the block: straight from the ring, or one sample more or fewer
+    // stretched to fit when this stream follows another clock.
+    let n = n.min(MAX_BLOCK);
+    if have && n > 0 {
+        let available = data.consumer.slots();
+        let take = match &data.drift {
+            Some(_) => Slip::take(available, n, n + data.target_slack, data.quantum / 2),
+            None => n,
+        }
+        .min(available);
+        for staged in data.staging[..take].iter_mut() {
+            *staged = data.consumer.pop().unwrap_or(0.0);
+        }
+        match data.drift.as_mut() {
+            Some(slip) => slip.stretch(&data.staging[..take], &mut data.block[..n]),
+            None => data.block[..n].copy_from_slice(&data.staging[..n]),
+        }
+    }
     let frames = bytes.as_chunks_mut::<SAMPLE_BYTES>().0;
-    for frame in frames.chunks_exact_mut(data.channels).take(n) {
-        let mut s = if have {
-            data.consumer.pop().unwrap_or(0.0)
-        } else {
-            0.0
-        };
+    for (frame, &sample) in frames
+        .chunks_exact_mut(data.channels)
+        .take(n)
+        .zip(&data.block)
+    {
+        let mut s = if have { sample } else { 0.0 };
         if data.fade_left > 0 && have {
             s *= 1.0 - data.fade_left as f32 / FADE_FRAMES as f32;
             data.fade_left -= 1;
@@ -1081,6 +1117,7 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
             config,
             stats.clone(),
             true,
+            false,
         ))
         .state_changed({
             let lose = lose.clone();
@@ -1111,7 +1148,11 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
         *pw::keys::NODE_LATENCY => latency.as_str(),
         *pw::keys::AUDIO_CHANNELS => "2",
         "audio.position" => "[FL,FR]",
-        "node.group" => group.as_str(),
+        // Deliberately not in our scheduling group: that would put the
+        // output device, and with it every application playing sound, on
+        // the microphone's clock, so a late microphone cycle would be heard
+        // in everything. The monitor stays on the output device's clock and
+        // absorbs the drift between the two itself (see `slip.rs`).
         "node.link-group" => group.as_str(),
     };
     if let Some(target) = &config.monitor_target {
@@ -1119,7 +1160,7 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
     }
     let monitor = pw::stream::StreamRc::new(core.clone(), "Voice Changer monitor", mon_props)
         .context("create monitor stream")?;
-    let monitor_data = SinkData::new(from_capture_mon, 2, config, stats.clone(), false);
+    let monitor_data = SinkData::new(from_capture_mon, 2, config, stats.clone(), false, true);
     let monitor_flush = monitor_data.flush.clone();
     let monitor_listener = monitor
         .add_local_listener_with_user_data(monitor_data)

@@ -107,11 +107,24 @@ pub struct AiStage {
     latency: Arc<AtomicUsize>,
     seen_latency: usize,
     primed: bool,
+    /// Cushion kept between the worker and the audio thread, in samples:
+    /// how late a block may arrive before the live voice has to fill in.
+    margin: usize,
+    /// Samples still to wait after the first block arrived before playing it.
+    hold: usize,
+    /// Lowest fill level seen since the last check, and samples since then.
+    low_water: usize,
+    since_check: usize,
+    check_every: usize,
     was_active: bool,
     /// 0 = live voice, 1 = fully converted. Ramped so handing over to and
     /// from the model does not click.
     fade: f32,
 }
+
+/// How late a block may be before the live voice fills in. Inference time
+/// varies by a few tens of milliseconds from block to block.
+const MARGIN_MS: f32 = 50.0;
 
 /// ~20 ms at 48 kHz for the AI/live-voice handover.
 const AI_FADE_SAMPLES: f32 = 960.0;
@@ -159,9 +172,20 @@ impl AiStage {
             let _ = self.input.push(x);
         }
         if !self.primed {
-            if self.output.slots() >= self.latency_samples() {
-                self.primed = true;
+            // Blocks arrive one block apart, so playing the first one the
+            // moment it lands would leave nothing in hand when the next is a
+            // little late. Wait out the margin first; no more than that,
+            // because every sample waited here is delay for good.
+            if self.output.slots() == 0 {
+                self.hold = self.margin;
+            } else if self.hold > buf.len() {
+                self.hold -= buf.len();
             } else {
+                self.primed = true;
+                self.low_water = usize::MAX;
+                self.since_check = 0;
+            }
+            if !self.primed {
                 // Still filling the model's first window.
                 self.status.warming.store(true, Ordering::Relaxed);
                 self.ease_out(buf.len());
@@ -183,7 +207,30 @@ impl AiStage {
             let (w_ai, w_live) = (self.fade * core::f32::consts::FRAC_PI_2).sin_cos();
             *x = converted * w_ai + *x * w_live;
         }
+        self.reclaim_delay(buf.len());
         true
+    }
+
+    /// Every late block pushes the converted voice a little further behind
+    /// (the audio thread waits instead of skipping). After one bad moment
+    /// that delay would stay for the rest of the session, so when the queue
+    /// has not come near empty for a while, the surplus is dropped.
+    fn reclaim_delay(&mut self, frames: usize) {
+        self.low_water = self.low_water.min(self.output.slots());
+        self.since_check += frames;
+        if self.since_check < self.check_every {
+            return;
+        }
+        let surplus = self.low_water.saturating_sub(self.margin);
+        if surplus > self.latency_samples() / 4
+            && let Ok(chunk) = self.output.read_chunk(surplus)
+        {
+            chunk.commit_all();
+            // Hand over through the live voice so the cut is not a click.
+            self.fade = 0.0;
+        }
+        self.low_water = usize::MAX;
+        self.since_check = 0;
     }
 
     /// Let the converted voice recede so the next handover fades back in.
@@ -214,7 +261,13 @@ impl AiWorker {
     /// `ai_pitch`) and loads models on demand.
     pub fn spawn(params: Arc<VcParams>, cfg: StreamConfig) -> (AiStage, AiHandle) {
         let sr = cfg.sample_rate;
-        let (block_ms, _) = params.ai_speed.value().block_context_ms();
+        // The worker settles the real sizes once it knows where the models
+        // run; this is only the first guess for the reported latency.
+        let block_ms = params
+            .ai_speed
+            .value()
+            .block(cfg!(feature = "gpu"))
+            .block_ms;
         let block = ms_to_samples(block_ms, sr);
         let crossfade = ms_to_samples(cfg.crossfade_ms, sr);
         let (in_prod, in_cons) = rtrb::RingBuffer::<f32>::new(sr * 4);
@@ -223,7 +276,7 @@ impl AiWorker {
         let status = Arc::new(AiStatus::default());
         status.block_ms.store(block_ms, Ordering::Relaxed);
         let stop = Arc::new(AtomicBool::new(false));
-        let latency = Arc::new(AtomicUsize::new(stage_latency(block, crossfade)));
+        let latency = Arc::new(AtomicUsize::new(stage_latency(sr, block, crossfade)));
 
         let stage = AiStage {
             input: in_prod,
@@ -233,6 +286,11 @@ impl AiWorker {
             latency: latency.clone(),
             seen_latency: 0,
             primed: false,
+            margin: ms_to_samples(MARGIN_MS, sr),
+            hold: 0,
+            low_water: usize::MAX,
+            since_check: 0,
+            check_every: sr * 10,
             was_active: false,
             fade: 0.0,
         };
@@ -259,8 +317,6 @@ fn ms_to_samples(ms: f32, sr: usize) -> usize {
     (ms * 0.001 * sr as f32).round() as usize
 }
 
-/// Audio before the new block that the pitch model and synthesizer also see.
-const SYNTH_CONTEXT_MS: f32 = if cfg!(feature = "gpu") { 500.0 } else { 200.0 };
 /// Blocks after a (re)configuration during which timing is not judged:
 /// GPU kernels compile for the new shapes and the first blocks are slow.
 const SETTLE_BLOCKS: u32 = 4;
@@ -272,10 +328,14 @@ const SOLA_SEARCH_MS: f32 = 6.0;
 /// Mean-square level below which a window counts as silence (about -80 dBFS).
 const SILENCE_FLOOR: f32 = 1e-8;
 
-/// One block waiting to be processed, half a block of inference headroom,
-/// plus the crossfade region.
-fn stage_latency(block: usize, crossfade: usize) -> usize {
-    block + block / 2 + crossfade
+/// The delay through the stage for a sound that starts right at the
+/// beginning of a block: the block has to fill, be converted (taken as
+/// two-thirds of a block, about what a machine that keeps up needs), sit
+/// out the margin, and the newest audio is held back for the crossfade and
+/// the vocoder's unreliable edge.
+fn stage_latency(sr: usize, block: usize, crossfade: usize) -> usize {
+    let edge = ms_to_samples(20.0 + SOLA_SEARCH_MS, sr);
+    block + block * 2 / 3 + ms_to_samples(MARGIN_MS, sr) + crossfade + edge
 }
 
 struct Loaded {
@@ -326,11 +386,21 @@ fn worker_loop(
     let mut effective = speed;
     let mut slow_blocks = 0u32;
     let mut settle = SETTLE_BLOCKS;
-    let (mut block, mut context) = {
-        let (b, c) = effective.block_context_ms();
-        (ms_to_samples(b, sr), ms_to_samples(c, sr))
+    // Whether the models run on a GPU; decides how much context is
+    // affordable. Follows the Compute setting (and a GPU that failed).
+    let mut gpu = cfg!(feature = "gpu");
+    let (mut block, mut context, mut synth_context) = {
+        let b = effective.block(gpu);
+        (
+            ms_to_samples(b.block_ms, sr),
+            ms_to_samples(b.context_ms, sr),
+            ms_to_samples(b.synth_context_ms, 16_000),
+        )
     };
     let mut window_len = context + block + crossfade + tail_margin;
+    // How long the last real conversion took: silent blocks are held back
+    // by the same time so the output keeps its rhythm (see below).
+    let mut typical_infer = Duration::ZERO;
 
     let mut loaded: Option<Loaded> = None;
     let mut parked: Option<Parked> = None;
@@ -374,6 +444,13 @@ fn worker_loop(
             slow_blocks = 0;
             reconfigure = true;
         }
+        let now_gpu = super::compute::resolve(&params.ai_device()) != super::compute::Backend::Cpu;
+        if now_gpu != gpu {
+            gpu = now_gpu;
+            effective = speed;
+            slow_blocks = 0;
+            reconfigure = true;
+        }
         if speed == crate::AiSpeed::Auto && slow_blocks >= SLOW_BLOCKS_TO_BACK_OFF {
             if let Some(next) = effective.slower() {
                 log::info!("AI can't keep up at {effective:?}; switching to {next:?}");
@@ -383,20 +460,21 @@ fn worker_loop(
             slow_blocks = 0;
         }
         if reconfigure {
-            let (b, c) = effective.block_context_ms();
-            block = ms_to_samples(b, sr);
-            context = ms_to_samples(c, sr);
+            let b = effective.block(gpu);
+            block = ms_to_samples(b.block_ms, sr);
+            context = ms_to_samples(b.context_ms, sr);
+            synth_context = ms_to_samples(b.synth_context_ms, 16_000);
             window_len = context + block + crossfade + tail_margin;
             history.clear();
             history.resize(window_len, 0.0);
             block_buf.resize(block, 0.0);
             have_tail = false;
-            latency.store(stage_latency(block, crossfade), Ordering::Relaxed);
-            status.block_ms.store(b, Ordering::Relaxed);
+            latency.store(stage_latency(sr, block, crossfade), Ordering::Relaxed);
+            status.block_ms.store(b.block_ms, Ordering::Relaxed);
+            typical_infer = Duration::ZERO;
             while input.pop().is_ok() {}
             // New window shapes: compile/tune kernels now, not on live audio.
             if let Some(l) = loaded.as_mut() {
-                let synth_context = ms_to_samples(SYNTH_CONTEXT_MS, 16_000);
                 let tail16 = (block + crossfade + tail_margin) / 3 + synth_context;
                 l.rvc.warm_up(l.to16k.output_len(window_len), tail16);
             }
@@ -443,7 +521,6 @@ fn worker_loop(
                 );
                 match load(&w.voice, w.threads, &w.device, sr) {
                     Ok(mut l) => {
-                        let synth_context = ms_to_samples(SYNTH_CONTEXT_MS, 16_000);
                         let tail16 = (block + crossfade + tail_margin) / 3 + synth_context;
                         l.rvc.warm_up(l.to16k.output_len(window_len), tail16);
                         let backend =
@@ -512,6 +589,11 @@ fn worker_loop(
         // window is effectively empty, and add a hair of dither otherwise.
         let energy = history.iter().map(|v| v * v).sum::<f32>() / history.len() as f32;
         if energy < SILENCE_FLOOR {
+            // A converted block reaches the audio thread one inference time
+            // after its input is complete. Keep that rhythm for silent
+            // blocks: delivered at once, they would let the queue run ahead
+            // and the first spoken block afterwards would arrive "late".
+            std::thread::sleep(typical_infer);
             for _ in 0..block {
                 let _ = output.push(0.0);
             }
@@ -531,7 +613,6 @@ fn worker_loop(
         let semitones = params.ai_pitch.value();
         // Synthesize the new block (+crossfade and margin) plus a little
         // context; the content encoder still sees the whole window.
-        let synth_context = ms_to_samples(SYNTH_CONTEXT_MS, 16_000);
         let tail16 = (block + crossfade + tail_margin) / 3 + synth_context;
         // Breathiness 50% maps to the model's native noise level; below that
         // the excitation is tamed, above it exaggerated.
@@ -600,7 +681,8 @@ fn worker_loop(
             }
             None => &synth,
         };
-        let infer_ms = started.elapsed().as_secs_f32() * 1000.0;
+        typical_infer = started.elapsed();
+        let infer_ms = typical_infer.as_secs_f32() * 1000.0;
         status.infer_ms.store(infer_ms, Ordering::Relaxed);
         status.f0_hz.store(l.rvc.last_f0_hz, Ordering::Relaxed);
         let _ = timings;

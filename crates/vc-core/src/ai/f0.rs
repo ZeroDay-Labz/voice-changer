@@ -58,20 +58,78 @@ pub fn coarse(f0: f32) -> i64 {
     (m.round() as i64).clamp(1, 255)
 }
 
-/// Light smoothing of voiced runs to tame octave flicker between frames.
-pub fn median3(f0: &mut [f32]) {
-    if f0.len() < 3 {
+/// Median over five frames inside voiced runs, to tame octave flicker
+/// between frames. Frames next to an unvoiced one are left as they are.
+pub fn median5(f0: &mut [f32], scratch: &mut Vec<f32>) {
+    if f0.len() < 5 {
         return;
     }
-    let src = f0.to_vec();
-    for i in 1..src.len() - 1 {
-        let (a, b, c) = (src[i - 1], src[i], src[i + 1]);
-        if a > 0.0 && b > 0.0 && c > 0.0 {
-            let mut v = [a, b, c];
-            v.sort_by(|x, y| x.partial_cmp(y).unwrap());
-            f0[i] = v[1];
+    scratch.clear();
+    scratch.extend_from_slice(f0);
+    for i in 2..scratch.len() - 2 {
+        let mut v = [
+            scratch[i - 2],
+            scratch[i - 1],
+            scratch[i],
+            scratch[i + 1],
+            scratch[i + 2],
+        ];
+        if v.iter().all(|x| *x > 0.0) {
+            v.sort_by(|x, y| x.total_cmp(y));
+            f0[i] = v[2];
         }
     }
+}
+
+/// Unvoice voiced runs shorter than `min_run` frames: a cough, a click or a
+/// plosive that the pitch model heard a note in for a frame or two. Runs
+/// that touch either end are kept, they may continue outside what we see.
+pub fn despeckle(f0: &mut [f32], min_run: usize) {
+    let n = f0.len();
+    let mut i = 0;
+    while i < n {
+        if f0[i] <= 0.0 {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && f0[i] > 0.0 {
+            i += 1;
+        }
+        if start > 0 && i < n && i - start < min_run {
+            f0[start..i].fill(0.0);
+        }
+    }
+}
+
+/// Bring pitch outside `lo..=hi` back by whole octaves when that lands
+/// inside (an octave error of the pitch model), and unvoice it otherwise
+/// (not a pitch this speaker produces).
+pub fn fold_into(f0: &mut [f32], lo: f32, hi: f32) {
+    for v in f0.iter_mut() {
+        if *v <= 0.0 || (*v >= lo && *v <= hi) {
+            continue;
+        }
+        let mut f = *v;
+        while f > hi {
+            f *= 0.5;
+        }
+        while f < lo {
+            f *= 2.0;
+        }
+        *v = if f <= hi { f } else { 0.0 };
+    }
+}
+
+/// Median of the voiced frames, 0 when there are none.
+pub fn voiced_median(f0: &[f32], scratch: &mut Vec<f32>) -> f32 {
+    scratch.clear();
+    scratch.extend(f0.iter().copied().filter(|v| *v > 0.0));
+    if scratch.is_empty() {
+        return 0.0;
+    }
+    scratch.sort_by(|a, b| a.total_cmp(b));
+    scratch[scratch.len() / 2]
 }
 
 #[cfg(test)]
@@ -98,5 +156,42 @@ mod tests {
         let b = coarse(200.0);
         let c = coarse(2000.0);
         assert!(a < b && b <= c && c == 255);
+    }
+
+    #[test]
+    fn despeckle_removes_short_inner_runs_only() {
+        let mut f = vec![0.0, 200.0, 0.0, 0.0, 150.0, 150.0, 150.0, 0.0, 300.0];
+        despeckle(&mut f, 3);
+        assert_eq!(f, vec![0.0, 0.0, 0.0, 0.0, 150.0, 150.0, 150.0, 0.0, 300.0]);
+        // A run at the very start may be the end of a longer one: kept.
+        let mut g = vec![120.0, 0.0, 0.0, 0.0];
+        despeckle(&mut g, 3);
+        assert_eq!(g[0], 120.0);
+    }
+
+    #[test]
+    fn fold_fixes_octave_errors_and_drops_the_impossible() {
+        let mut f = vec![0.0, 120.0, 480.0, 55.0, 1500.0];
+        fold_into(&mut f, 80.0, 300.0);
+        assert_eq!(f[0], 0.0);
+        assert_eq!(f[1], 120.0);
+        assert_eq!(f[2], 240.0);
+        assert_eq!(f[3], 110.0);
+        assert_eq!(f[4], 187.5);
+        // A range narrower than an octave cannot always be reached.
+        let mut g = vec![400.0];
+        fold_into(&mut g, 210.0, 300.0);
+        assert_eq!(g[0], 0.0);
+    }
+
+    #[test]
+    fn median5_smooths_a_spike_inside_a_voiced_run() {
+        let mut f = vec![100.0, 101.0, 300.0, 102.0, 103.0, 104.0, 0.0];
+        let mut scratch = Vec::new();
+        median5(&mut f, &mut scratch);
+        assert_eq!(f[2], 102.0);
+        assert_eq!(f[5], 104.0);
+        assert_eq!(f[3], 103.0);
+        assert_eq!(voiced_median(&f, &mut scratch), 103.0);
     }
 }

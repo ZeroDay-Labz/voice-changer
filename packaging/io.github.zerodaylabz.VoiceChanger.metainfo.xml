@@ -63,6 +63,11 @@
   </supports>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.5.0" date="2026-11-14">
+      <description>
+        <p>The AI voice answers about twice as fast (around half a second on a GPU). Coughs, burps and sneezes are silenced instead of converted; quiet breaths stay quiet; each voice remembers its own pitch and index settings. A test bench replays a recording of you through any voice while you tune it, and new voices are checked for problems at import. Voice pages from voice-models.com can be pasted directly. Hear myself no longer makes other sound stutter.</p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-11-13">
       <description>
         <p>AI voices no longer crash the app on machines that use the CPU engine (every NVIDIA and Intel machine by default). NVIDIA set-up is one command, and the app says plainly when a GPU cannot be used. The microphone, the virtual microphone and Hear myself now run on one clock; quitting always gives the system its default microphone back.</p>

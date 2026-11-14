@@ -40,6 +40,10 @@ pub enum Stage {
     Extracting,
     PreparingConverter,
     Converting,
+    /// Trying the installed voice out to see what it is worth.
+    Checking,
+    /// A quality check finished: "voice: grade".
+    Checked(String),
     Done(String),
     Failed(String),
 }
@@ -105,6 +109,14 @@ pub struct VoiceInfo {
     pub default_speaker: u32,
     /// Optional names per speaker ("Male", "Female"…), may be shorter than `speakers`.
     pub speaker_names: Vec<String>,
+    /// Result of the quality check ("good", "fair", "poor") and what it
+    /// noticed; `None` until the voice has been checked.
+    pub quality: Option<String>,
+    pub quality_notes: Vec<String>,
+    /// The notes as one paragraph, for a tooltip.
+    pub quality_summary: String,
+    /// The voice has its own saved pitch, index and loudness settings.
+    pub has_settings: bool,
 }
 
 impl VoiceInfo {
@@ -218,10 +230,125 @@ pub fn voices() -> Vec<VoiceInfo> {
                             .collect()
                     })
                     .unwrap_or_default(),
+                quality: meta["quality"]["grade"].as_str().map(str::to_string),
+                quality_notes: meta["quality"]["notes"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                quality_summary: match meta["quality"]["notes"].as_array() {
+                    Some(a) if !a.is_empty() => a
+                        .iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    _ => "Nothing stood out when a test phrase was converted.".to_string(),
+                },
+                has_settings: meta["settings"].is_object(),
                 path: v.path,
             }
         })
         .collect()
+}
+
+/// Parameters that belong to a voice rather than to the session: what suits
+/// one voice is wrong for the next.
+pub const VOICE_SETTING_IDS: [&str; 6] = [
+    "ai_pitch",
+    "ai_index_on",
+    "ai_index_rate",
+    "ai_breath",
+    "ai_protect",
+    "ai_vol_follow",
+];
+
+/// Whether a parameter id is one of the per-voice settings.
+pub fn is_voice_setting(id: &str) -> bool {
+    VOICE_SETTING_IDS.contains(&id)
+}
+
+/// Remember the current values of the per-voice settings for this voice.
+pub fn save_voice_settings(path: &Path, params: &crate::VcParams) -> Result<()> {
+    use nice_plug::prelude::Params as _;
+    let mut settings = serde_json::Map::new();
+    for (id, ptr, _group) in params.param_map() {
+        if is_voice_setting(&id) {
+            // SAFETY: `ptr` points into `params`, alive for this call.
+            let plain = unsafe { ptr.unmodulated_plain_value() };
+            settings.insert(id, serde_json::json!(plain));
+        }
+    }
+    let mut meta = read_sidecar(path);
+    meta["settings"] = serde_json::Value::Object(settings);
+    write_sidecar(path, &meta)
+}
+
+/// Apply the settings saved for this voice through `set(param, normalized)`.
+/// A voice without saved settings changes nothing. Returns whether any were applied.
+pub fn apply_voice_settings(
+    path: &Path,
+    params: &crate::VcParams,
+    mut set: impl FnMut(nice_plug::prelude::ParamPtr, f32),
+) -> bool {
+    use nice_plug::prelude::Params as _;
+    let meta = read_sidecar(path);
+    let Some(settings) = meta["settings"].as_object() else {
+        return false;
+    };
+    let mut any = false;
+    for (id, ptr, _group) in params.param_map() {
+        if !is_voice_setting(&id) {
+            continue;
+        }
+        if let Some(plain) = settings.get(&id).and_then(|v| v.as_f64()) {
+            // SAFETY: as above.
+            let normalized = unsafe { ptr.preview_normalized(plain as f32) };
+            set(ptr, normalized);
+            any = true;
+        }
+    }
+    any
+}
+
+/// Run the quality check on an installed voice and store the result next
+/// to it. Takes a few seconds; call from a background thread.
+pub fn check_voice(path: &Path) -> Result<super::check::Report> {
+    let threads = super::hardware::resolve_threads(0, false).min(8);
+    let report = super::check::check_voice(path, &super::check::test_phrase(), threads)?;
+    let mut meta = read_sidecar(path);
+    meta["quality"] = serde_json::json!({ "grade": report.grade, "notes": report.notes });
+    write_sidecar(path, &meta)?;
+    Ok(report)
+}
+
+/// Check a voice in the background; progress and result arrive through the
+/// same status object the importer uses.
+pub fn start_voice_check(path: PathBuf) -> Arc<ImportStatus> {
+    let status = Arc::new(ImportStatus::default());
+    status.set(Stage::Checking);
+    let st = status.clone();
+    std::thread::Builder::new()
+        .name("voice-check".into())
+        .spawn(move || {
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            match check_voice(&path) {
+                Ok(report) => {
+                    for note in &report.notes {
+                        st.note(note.clone());
+                    }
+                    st.set(Stage::Checked(format!("{name}: {}", report.grade)));
+                }
+                Err(e) => st.set(Stage::Failed(format!("{e:#}"))),
+            }
+        })
+        .expect("spawn check thread");
+    status
 }
 
 /// Remove a voice and its sidecar.
@@ -281,6 +408,19 @@ pub fn start_base_models_download() -> Arc<ImportStatus> {
                     let url = format!("https://huggingface.co/{HF_BASE_REPO}/resolve/main/{f}");
                     download_verified(&url, &dest, &st, Some(*size), Some(sha))?;
                 }
+                // The cough and burp blocker's classifier: small and
+                // optional, so a failure here does not fail the rest.
+                let (f, size, sha) = super::events::MODEL;
+                let dest = dir.join(f);
+                if !dest.is_file() {
+                    let url = format!(
+                        "https://huggingface.co/{}/resolve/main/{f}",
+                        super::events::MODEL_REPO
+                    );
+                    if let Err(e) = download_verified(&url, &dest, &st, Some(size), Some(sha)) {
+                        st.note(format!("cough blocker model not downloaded: {e:#}"));
+                    }
+                }
                 Ok(())
             };
             match run() {
@@ -328,6 +468,10 @@ enum Source {
     HfRepo {
         repo: String,
     },
+    /// A voice page on voice-models.com: the download link is on the page.
+    Page {
+        url: String,
+    },
 }
 
 fn classify(url: &str) -> Result<Source> {
@@ -346,7 +490,7 @@ fn classify(url: &str) -> Result<Source> {
         let repo = format!("{}/{}", parts[0], parts[1]);
         if parts.len() >= 4 && (parts[2] == "blob" || parts[2] == "resolve") {
             let file = parts[4..].join("/");
-            let file_name = file.rsplit('/').next().unwrap_or(&file).to_string();
+            let file_name = percent_decode(file.rsplit('/').next().unwrap_or(&file));
             return Ok(Source::File {
                 url: format!("https://huggingface.co/{repo}/resolve/{}/{file}", parts[3]),
                 hint: parts[1].to_string(),
@@ -355,11 +499,26 @@ fn classify(url: &str) -> Result<Source> {
         }
         return Ok(Source::HfRepo { repo });
     }
-    let file_name = no_query
-        .rsplit('/')
-        .next()
-        .unwrap_or("download")
-        .to_string();
+    if let Some(rest) = lower
+        .strip_prefix("https://voice-models.com/")
+        .or_else(|| lower.strip_prefix("https://www.voice-models.com/"))
+        .or_else(|| lower.strip_prefix("http://voice-models.com/"))
+    {
+        if !rest.starts_with("model/") {
+            bail!(
+                "open the voice's own page on voice-models.com and paste that link (it contains /model/)"
+            );
+        }
+        return Ok(Source::Page {
+            url: no_query.to_string(),
+        });
+    }
+    if lower.contains("drive.google.com") || lower.contains("mega.nz") {
+        bail!(
+            "links to Google Drive or MEGA cannot be fetched from here; download the file in your browser and import it from disk"
+        );
+    }
+    let file_name = percent_decode(no_query.rsplit('/').next().unwrap_or("download"));
     Ok(Source::File {
         url: url.to_string(),
         hint: file_name
@@ -369,6 +528,107 @@ fn classify(url: &str) -> Result<Source> {
             .unwrap_or_default(),
         file_name,
     })
+}
+
+/// `%20` and friends in a URL path segment, for file names.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// What a voice-models.com page tells us: where the model file is, and the
+/// voice's name from the page title.
+#[derive(Debug, PartialEq)]
+struct PageInfo {
+    download: String,
+    name: Option<String>,
+}
+
+/// Find the model download in a voice page: the first Hugging Face link to
+/// a `.zip`, `.pth` or `.onnx` (the page also wraps it in a "run" link,
+/// URL-encoded, which is used when no plain link is present).
+fn parse_voice_page(html: &str) -> Result<PageInfo> {
+    let is_model = |url: &str| {
+        let path = url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(url)
+            .to_ascii_lowercase();
+        path.ends_with(".zip") || path.ends_with(".pth") || path.ends_with(".onnx")
+    };
+    let links_in = |text: &str| -> Vec<String> {
+        let mut found = Vec::new();
+        let mut rest = text;
+        while let Some(at) = rest.find("https://huggingface.co/") {
+            let tail = &rest[at..];
+            let end = tail
+                .find(|c: char| c == '"' || c == '\'' || c == '<' || c == '>' || c.is_whitespace())
+                .unwrap_or(tail.len());
+            found.push(tail[..end].replace("&amp;", "&"));
+            rest = &tail[end..];
+        }
+        found
+    };
+    let mut candidates = links_in(html);
+    candidates.extend(links_in(&percent_decode(html)));
+    let download = candidates
+        .into_iter()
+        .map(|l| l.split('&').next().unwrap_or(&l).to_string())
+        .find(|l| is_model(l));
+    let Some(download) = download else {
+        if html.contains("drive.google.com") || html.contains("mega.nz") {
+            bail!(
+                "this voice is hosted on Google Drive or MEGA; download it in your browser and import the file from disk"
+            );
+        }
+        bail!("no model download link found on that page");
+    };
+    let name = html
+        .split_once("<title>")
+        .and_then(|(_, rest)| rest.split_once("</title>"))
+        .map(|(title, _)| {
+            let title = title.replace("&amp;", "&").replace("&#39;", "'");
+            // "(Luigi (CrazyMarioBros)) (English) [RVC v2] ... AI Voice Model"
+            let head = title.split(" [").next().unwrap_or(&title).trim();
+            // The name is the first parenthesised group; a language group
+            // may follow it.
+            let head = match head.split_once(") (") {
+                Some((name, _)) => format!("{name})"),
+                None => head.to_string(),
+            };
+            let inner = head
+                .strip_prefix('(')
+                .and_then(|h| h.strip_suffix(')'))
+                .unwrap_or(&head);
+            inner.trim().to_string()
+        })
+        .filter(|n| !n.is_empty());
+    Ok(PageInfo { download, name })
+}
+
+fn fetch_voice_page(url: &str) -> Result<PageInfo> {
+    let html = agent()
+        .get(url)
+        .set("User-Agent", "Mozilla/5.0 (voice-changer importer)")
+        .call()
+        .with_context(|| format!("opening {url}"))?
+        .into_string()
+        .context("reading the page")?;
+    parse_voice_page(&html)
 }
 
 fn agent() -> ureq::Agent {
@@ -663,6 +923,21 @@ fn import(url: &str, name: Option<&str>, status: &ImportStatus) -> Result<String
     std::fs::create_dir_all(&downloads)?;
 
     let (file_url, file_name, hint, index_url) = match classify(url)? {
+        Source::Page { url: page } => {
+            status.note("reading the voice page".to_string());
+            let info = fetch_voice_page(&page)?;
+            match classify(&info.download)? {
+                Source::File {
+                    url,
+                    file_name,
+                    hint,
+                } => (url, file_name, info.name.unwrap_or(hint), None),
+                _ => bail!(
+                    "the page links to {}, which is not a model file",
+                    info.download
+                ),
+            }
+        }
         Source::File {
             url,
             file_name,
@@ -742,12 +1017,87 @@ fn import(url: &str, name: Option<&str>, status: &ImportStatus) -> Result<String
     let _ = std::fs::remove_file(&downloaded);
     let _ = std::fs::remove_dir_all(downloaded.with_extension("unzipped"));
     status.note(format!("installed {display}"));
+    // Tell the user up front what kind of model this is.
+    status.set(Stage::Checking);
+    match check_voice(&target) {
+        Ok(report) => {
+            status.note(format!("quality check: {}", report.grade));
+            for note in report.notes {
+                status.note(note);
+            }
+        }
+        Err(e) => status.note(format!("quality check skipped: {e:#}")),
+    }
     Ok(display)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_page_links_are_found() {
+        let html = r#"<html><head><title>(Luigi (CrazyMarioBros)) (English) [RVC v2] [300 Epochs] AI Voice Model</title></head>
+            <a href="https://easyaivoice.com/run?url%5B%5D=https%3A%2F%2Fhuggingface.co%2FLeon%2FCMBLuigi%2Fresolve%2Fmain%2FCMB%2520Luigi.zip%3Fdownload%3Dtrue&amp;pitch%5B%5D=0">Run</a>
+            <a href="https://huggingface.co/Leon/CMBLuigi/resolve/main/CMB%20Luigi.zip?download=true">Download</a>"#;
+        let info = parse_voice_page(html).unwrap();
+        assert_eq!(
+            info.download,
+            "https://huggingface.co/Leon/CMBLuigi/resolve/main/CMB%20Luigi.zip?download=true"
+        );
+        assert_eq!(info.name.as_deref(), Some("Luigi (CrazyMarioBros)"));
+        // Only the wrapped link present: still found.
+        let wrapped = r#"<a href="https://easyaivoice.com/run?url%5B%5D=https%3A%2F%2Fhuggingface.co%2Fa%2Fb%2Fresolve%2Fmain%2Fv.pth&amp;pitch%5B%5D=0">Run</a>"#;
+        assert_eq!(
+            parse_voice_page(wrapped).unwrap().download,
+            "https://huggingface.co/a/b/resolve/main/v.pth"
+        );
+        assert!(parse_voice_page("<a href=\"https://drive.google.com/file/d/x\">x</a>").is_err());
+    }
+
+    #[test]
+    fn voice_page_urls_are_recognised() {
+        assert!(matches!(
+            classify("https://voice-models.com/model/acc").unwrap(),
+            Source::Page { .. }
+        ));
+        assert!(classify("https://voice-models.com/top").is_err());
+        assert!(classify("https://drive.google.com/file/d/abc/view").is_err());
+        match classify("https://huggingface.co/a/b/resolve/main/CMB%20Luigi.zip?download=true")
+            .unwrap()
+        {
+            Source::File { file_name, .. } => assert_eq!(file_name, "CMB Luigi.zip"),
+            _ => panic!("expected a file"),
+        }
+    }
+
+    #[test]
+    fn voice_settings_round_trip() {
+        use nice_plug::prelude::Param as _;
+        let dir = std::env::temp_dir().join(format!("vc-settings-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let voice = dir.join("v.onnx");
+        let params = crate::VcParams::new();
+        let set = |ptr: nice_plug::prelude::ParamPtr, n: f32| {
+            unsafe { ptr._internal_set_normalized_value(n) };
+        };
+        set(
+            params.ai_pitch.as_ptr(),
+            params.ai_pitch.preview_normalized(7.5),
+        );
+        set(params.ai_protect.as_ptr(), 0.2);
+        assert!(!apply_voice_settings(&voice, &params, set));
+        save_voice_settings(&voice, &params).unwrap();
+        set(
+            params.ai_pitch.as_ptr(),
+            params.ai_pitch.preview_normalized(-3.0),
+        );
+        set(params.ai_protect.as_ptr(), 0.9);
+        assert!(apply_voice_settings(&voice, &params, set));
+        assert!((params.ai_pitch.value() - 7.5).abs() < 0.06);
+        assert!((params.ai_protect.value() - 0.2).abs() < 0.011);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn classifies_links() {

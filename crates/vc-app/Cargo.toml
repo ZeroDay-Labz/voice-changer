@@ -16,6 +16,7 @@ gpu = ["ai", "vc-core/gpu", "vc-gui/gpu"]
 gpu-rocm = ["gpu"]
 
 [dependencies]
+arc-swap = { workspace = true }
 vc-dsp = { path = "../vc-dsp" }
 vc-core = { path = "../vc-core" }
 vc-gui = { path = "../vc-gui" }

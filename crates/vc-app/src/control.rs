@@ -31,6 +31,38 @@ pub struct Shared {
     pub hotkey_trigger: Mutex<Option<String>>,
     /// Name of the last preset applied (for the window and the saved state).
     pub current_preset: Mutex<Option<String>>,
+    /// Test bench: the clip being recorded, the clip being replayed, and
+    /// the names of the clips on disk.
+    bench_recording: Mutex<Option<String>>,
+    bench_playing: Mutex<Option<String>>,
+    bench_clips: Mutex<Vec<String>>,
+}
+
+/// How long a bench clip is, in seconds.
+const BENCH_SECONDS: usize = 8;
+
+/// `~/.local/share/voice-changer/bench`
+fn bench_dir() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "echo", "voice-changer").map(|d| d.data_dir().join("bench"))
+}
+
+fn bench_clips_on_disk() -> Vec<String> {
+    let Some(dir) = bench_dir() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            (p.extension().is_some_and(|x| x == "wav"))
+                .then(|| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+                .flatten()
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 impl Shared {
@@ -64,7 +96,141 @@ impl Shared {
             configure_hotkey: AtomicBool::new(false),
             hotkey_trigger: Mutex::new(None),
             current_preset: Mutex::new(None),
+            bench_recording: Mutex::new(None),
+            bench_playing: Mutex::new(None),
+            bench_clips: Mutex::new(bench_clips_on_disk()),
         })
+    }
+
+    /// Record the raw microphone for a few seconds as bench clip `name`.
+    pub fn bench_record(&self, name: &str) {
+        let name: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if name.is_empty() {
+            return;
+        }
+        if let Ok(audio) = self.audio.lock()
+            && let Some(a) = audio.as_ref()
+        {
+            a.bench.play(None);
+            a.bench.record(self.sample_rate as usize * BENCH_SECONDS);
+            if let Ok(mut p) = self.bench_playing.lock() {
+                *p = None;
+            }
+            if let Ok(mut r) = self.bench_recording.lock() {
+                *r = Some(name);
+            }
+        }
+    }
+
+    /// Replay a bench clip in place of the microphone, or stop with `None`.
+    /// The clip is heard through "Hear myself" only.
+    pub fn bench_play(&self, name: Option<&str>) -> bool {
+        let clip = match name {
+            None => None,
+            Some(name) => {
+                let Some(path) = bench_dir().map(|d| d.join(format!("{name}.wav"))) else {
+                    return false;
+                };
+                match self.bench_load(&path) {
+                    Some(c) => Some(c),
+                    None => return false,
+                }
+            }
+        };
+        self.bench_play_clip(name.map(str::to_string), clip)
+    }
+
+    /// Replay any WAV file as a bench clip (for tests).
+    pub fn bench_play_file(&self, path: &std::path::Path) -> bool {
+        match self.bench_load(path) {
+            Some(clip) => self.bench_play_clip(Some(path.display().to_string()), Some(clip)),
+            None => false,
+        }
+    }
+
+    fn bench_load(&self, path: &std::path::Path) -> Option<Arc<Vec<f32>>> {
+        match vc_core::wav::read_mono(path) {
+            Ok((audio, rate)) if rate as f32 == self.sample_rate => Some(Arc::new(audio)),
+            Ok((_, rate)) => {
+                log::warn!(
+                    "{}: {rate} Hz, need {} Hz",
+                    path.display(),
+                    self.sample_rate
+                );
+                None
+            }
+            Err(e) => {
+                log::warn!("could not load the bench clip: {e:#}");
+                None
+            }
+        }
+    }
+
+    fn bench_play_clip(&self, name: Option<String>, clip: Option<Arc<Vec<f32>>>) -> bool {
+        let Ok(audio) = self.audio.lock() else {
+            return false;
+        };
+        let Some(a) = audio.as_ref() else {
+            return false;
+        };
+        let starting = clip.is_some();
+        a.bench.play(clip);
+        drop(audio);
+        if let Ok(mut p) = self.bench_playing.lock() {
+            *p = name;
+        }
+        // The clip goes to "Hear myself" only: without it nothing is heard.
+        if starting && !self.monitor() {
+            self.set_monitor(true);
+        }
+        true
+    }
+
+    /// What the bench is doing; also finishes a recording (writes the file)
+    /// once the audio side has collected it. Cheap enough for every frame.
+    pub fn bench_state(&self) -> vc_gui::BenchState {
+        let mut progress = None;
+        if let Ok(audio) = self.audio.lock()
+            && let Some(a) = audio.as_ref()
+        {
+            if let Some(done) = a.bench.take_recording() {
+                let name = self.bench_recording.lock().ok().and_then(|mut r| r.take());
+                if let (Some(name), Some(dir)) = (name, bench_dir()) {
+                    let path = dir.join(format!("{name}.wav"));
+                    match vc_core::wav::write_mono(&path, &done, self.sample_rate as usize) {
+                        Ok(()) => log::info!("bench clip saved: {}", path.display()),
+                        Err(e) => log::warn!("could not save the bench clip: {e:#}"),
+                    }
+                    if let Ok(mut clips) = self.bench_clips.lock() {
+                        *clips = bench_clips_on_disk();
+                    }
+                }
+            }
+            progress = a.bench.record_progress();
+            if !a.bench.playing()
+                && let Ok(mut p) = self.bench_playing.lock()
+            {
+                *p = None;
+            }
+        }
+        let recording = self
+            .bench_recording
+            .lock()
+            .ok()
+            .and_then(|r| r.clone())
+            .zip(progress);
+        vc_gui::BenchState {
+            clips: self
+                .bench_clips
+                .lock()
+                .map(|c| c.clone())
+                .unwrap_or_default(),
+            recording,
+            playing: self.bench_playing.lock().ok().and_then(|p| p.clone()),
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -316,6 +482,13 @@ impl Shared {
                 &self.params.ai_speaker,
                 vc_core::ai::library::default_speaker_for(&v.path),
             );
+            vc_core::ai::library::apply_voice_settings(&v.path, &self.params, |ptr, n| {
+                // SAFETY: `ptr` points into `self.params`.
+                unsafe {
+                    ptr._internal_set_normalized_value(n);
+                    ptr._internal_update_smoother(self.sample_rate, true);
+                }
+            });
             self.set_param(&self.params.ai_enabled, true);
             log::info!("AI voice: {}", v.name);
             true

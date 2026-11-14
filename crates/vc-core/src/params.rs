@@ -180,6 +180,16 @@ pub struct VcParams {
     /// Speaker id (`ds`) for multi-speaker voice models.
     #[id = "ai_speaker"]
     pub ai_speaker: IntParam,
+    /// How much breaths and consonants keep of what was actually said
+    /// instead of being pulled toward the voice's index.
+    #[id = "ai_protect"]
+    pub ai_protect: FloatParam,
+    /// How closely the converted voice follows the loudness of the input.
+    #[id = "ai_vol_follow"]
+    pub ai_volume_follow: FloatParam,
+    /// Silence coughs, burps, sneezes, throat clearing and hiccups.
+    #[id = "ai_block"]
+    pub ai_block_noises: BoolParam,
     /// Path of the voice model (`.onnx`); empty = none. Not a host
     /// parameter, but saved with the plugin state.
     #[persist = "ai_voice"]
@@ -191,6 +201,9 @@ pub struct VcParams {
     /// a count the worker clamps to the hardware threads present.
     #[persist = "ai_threads"]
     pub ai_threads: std::sync::RwLock<u32>,
+    /// The user's own typical speaking pitch in Hz (0 = not measured yet).
+    /// Learned by the AI worker while they talk, remembered by the host.
+    pub my_pitch: std::sync::RwLock<f32>,
 }
 
 impl Default for VcParams {
@@ -268,9 +281,13 @@ impl Default for VcParams {
             ai_index_enabled: BoolParam::new("Use Voice Index", true),
             ai_index_rate: percent_param("Index Strength", 0.75),
             ai_speaker: IntParam::new("AI Speaker", 0, IntRange::Linear { min: 0, max: 15 }),
+            ai_protect: percent_param("Protect Consonants", 0.67),
+            ai_volume_follow: percent_param("Follow My Loudness", 0.75),
+            ai_block_noises: BoolParam::new("Block Coughs and Burps", true),
             ai_voice: std::sync::RwLock::new(String::new()),
             ai_device: std::sync::RwLock::new("auto".into()),
             ai_threads: std::sync::RwLock::new(0),
+            my_pitch: std::sync::RwLock::new(0.0),
         }
     }
 }
@@ -329,6 +346,17 @@ impl VcParams {
     pub fn set_ai_voice(&self, path: &str) {
         if let Ok(mut v) = self.ai_voice.write() {
             *v = path.to_string();
+        }
+    }
+
+    /// The user's typical speaking pitch in Hz, 0 when unknown.
+    pub fn my_pitch_hz(&self) -> f32 {
+        self.my_pitch.read().map(|v| *v).unwrap_or(0.0)
+    }
+
+    pub fn set_my_pitch_hz(&self, hz: f32) {
+        if let Ok(mut v) = self.my_pitch.write() {
+            *v = if hz.is_finite() { hz.max(0.0) } else { 0.0 };
         }
     }
 

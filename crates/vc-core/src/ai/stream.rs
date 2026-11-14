@@ -72,6 +72,12 @@ pub struct AiStatus {
     pub model_rate: AtomicU64,
     /// Inference threads the loaded voice runs with (0 until loaded).
     pub threads: AtomicUsize,
+    /// Coughs, burps and the like silenced since the voice was loaded.
+    pub blocked: AtomicU64,
+    /// The sound-event model is loaded and the blocker is working.
+    pub blocker_ready: AtomicBool,
+    /// The speaker's typical pitch in Hz as learned so far (0 = not yet).
+    pub speaker_f0_hz: AtomicF32,
 }
 
 impl AiStatus {
@@ -313,6 +319,66 @@ impl AiWorker {
     }
 }
 
+/// Remembers the pitch of the last stretches of speech to know what is
+/// normal for this speaker.
+struct PitchMemory {
+    /// Median pitch of recent voiced blocks, newest last.
+    recent: std::collections::VecDeque<f32>,
+    typical: f32,
+    since_update: usize,
+}
+
+impl PitchMemory {
+    /// Voiced blocks kept (about a minute of talking).
+    const KEEP: usize = 240;
+    /// Blocks needed before the typical pitch is trusted.
+    const ENOUGH: usize = 25;
+
+    fn new(known: f32) -> Self {
+        Self {
+            recent: std::collections::VecDeque::with_capacity(Self::KEEP + 1),
+            typical: if known > 40.0 { known } else { 0.0 },
+            since_update: 0,
+        }
+    }
+
+    /// Note one block's median pitch (0 = unvoiced, ignored). Returns true
+    /// when the typical pitch was updated.
+    fn add(&mut self, hz: f32) -> bool {
+        if !(40.0..=800.0).contains(&hz) {
+            return false;
+        }
+        self.recent.push_back(hz);
+        if self.recent.len() > Self::KEEP {
+            self.recent.pop_front();
+        }
+        self.since_update += 1;
+        if self.recent.len() < Self::ENOUGH || self.since_update < Self::ENOUGH {
+            return false;
+        }
+        self.since_update = 0;
+        let mut sorted: Vec<f32> = self.recent.iter().copied().collect();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        self.typical = sorted[sorted.len() / 2];
+        true
+    }
+
+    fn typical(&self) -> f32 {
+        self.typical
+    }
+
+    /// The range this speaker can plausibly produce: an octave below the
+    /// typical pitch to an octave and a half above (excited speech and
+    /// laughter go high). The wide default until the pitch is known.
+    fn range(&self) -> (f32, f32) {
+        if self.typical > 0.0 {
+            (self.typical * 0.5, self.typical * 2.8)
+        } else {
+            super::rvc::DEFAULT_F0_RANGE
+        }
+    }
+}
+
 fn ms_to_samples(ms: f32, sr: usize) -> usize {
     (ms * 0.001 * sr as f32).round() as usize
 }
@@ -413,6 +479,18 @@ fn worker_loop(
     let mut prev_tail: Vec<f32> = vec![0.0; crossfade];
     let mut block_buf = vec![0.0f32; block];
     let mut have_tail = false;
+    // Loudness follow, cough blocker, the speaker's own pitch.
+    let mut gains: Vec<f32> = Vec::new();
+    let mut detector: Option<super::events::EventDetector> = None;
+    let mut detector_failed = false;
+    let mut blocker = super::events::Blocker::default();
+    let mut was_muting = false;
+    let mut mute_gain = 1.0f32;
+    let mute_step = 1.0 / ms_to_samples(10.0, sr) as f32;
+    let mut pitch_memory = PitchMemory::new(params.my_pitch_hz());
+    status
+        .speaker_f0_hz
+        .store(pitch_memory.typical(), Ordering::Relaxed);
     let mut hpf = vc_dsp::biquad::Biquad::new(
         vc_dsp::biquad::FilterKind::HighPass,
         70.0,
@@ -610,6 +688,51 @@ fn worker_loop(
             dither ^= dither << 17;
             *v += ((dither >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2e-5;
         }
+        // ---- is this a cough, a burp, a sneeze? -----------------------------------
+        let block_noises = params.ai_block_noises.value();
+        if block_noises && detector.is_none() && !detector_failed {
+            match super::events::model_path() {
+                Some(path) => match super::events::EventDetector::load(&path) {
+                    Ok(d) => {
+                        log::info!("cough and burp blocker ready");
+                        detector = Some(d);
+                    }
+                    Err(e) => {
+                        log::warn!("the cough and burp blocker could not start: {e:#}");
+                        detector_failed = true;
+                    }
+                },
+                // Not downloaded: look again now and then, it may arrive.
+                None => detector_failed = false,
+            }
+        }
+        status
+            .blocker_ready
+            .store(block_noises && detector.is_some(), Ordering::Relaxed);
+        let mute = match detector.as_mut().filter(|_| block_noises) {
+            Some(d) => match d.listen(&audio16) {
+                Ok(heard) => {
+                    let mute = blocker.decide(&heard);
+                    if mute && !was_muting {
+                        status.blocked.fetch_add(1, Ordering::Relaxed);
+                        log::debug!("blocked a {} ({:.2})", heard.class_name(), heard.blocked);
+                    }
+                    mute
+                }
+                Err(e) => {
+                    log::warn!("sound classifier failed, blocker off: {e:#}");
+                    detector = None;
+                    detector_failed = true;
+                    false
+                }
+            },
+            None => {
+                blocker.reset();
+                false
+            }
+        };
+        was_muting = mute;
+
         let semitones = params.ai_pitch.value();
         // Synthesize the new block (+crossfade and margin) plus a little
         // context; the content encoder still sees the whole window.
@@ -622,6 +745,9 @@ fn worker_loop(
         } else {
             0.0
         };
+        // 0% keeps the index everywhere; 100% leaves unvoiced frames alone.
+        l.rvc.protect = 1.0 - params.ai_protect.value().clamp(0.0, 1.0);
+        l.rvc.f0_range = pitch_memory.range();
         let speaker = (params.ai_speaker.value() as i64).clamp(0, l.speakers - 1);
         let result = l.rvc.infer_tail_with(
             &audio16,
@@ -674,13 +800,19 @@ fn worker_loop(
         if l.from_model.is_none() && model_rate != sr {
             l.from_model = Some(Resampler::new(model_rate, sr));
         }
-        let out: &Vec<f32> = match &l.from_model {
+        let out: &mut Vec<f32> = match &l.from_model {
             Some(r) => {
                 r.process(&synth, &mut out48);
-                &out48
+                &mut out48
             }
-            None => &synth,
+            None => &mut synth,
         };
+        // Learn the speaker's own pitch from what was just said.
+        if pitch_memory.add(l.rvc.last_input_f0_hz) {
+            let typical = pitch_memory.typical();
+            status.speaker_f0_hz.store(typical, Ordering::Relaxed);
+            params.set_my_pitch_hz(typical);
+        }
         typical_infer = started.elapsed();
         let infer_ms = typical_infer.as_secs_f32() * 1000.0;
         status.infer_ms.store(infer_ms, Ordering::Relaxed);
@@ -701,6 +833,18 @@ fn worker_loop(
         if out.len() < need {
             log::warn!("AI produced {} samples, need {need}", out.len());
             continue;
+        }
+        // The newest `need` samples of the output and of the input window
+        // are the same stretch of time: make the one as loud as the other.
+        let follow = params.ai_volume_follow.value();
+        if follow > 0.0 {
+            let produced = out.len();
+            super::envelope::follow(
+                &history[window_len - need..],
+                &mut out[produced - need..],
+                follow,
+                &mut gains,
+            );
         }
         let seg_all = &out[out.len() - need..out.len() - tail_margin + sola_search];
         // SOLA: pick the offset whose first `crossfade` samples correlate best
@@ -742,9 +886,12 @@ fn worker_loop(
             } else {
                 seg[i]
             };
+            // A blocked sound fades to silence over 10 ms and back.
+            let target = if mute { 0.0 } else { 1.0 };
+            mute_gain += (target - mute_gain).clamp(-mute_step, mute_step);
             // 2nd-order high-pass at 70 Hz on the contiguous output stream
             // (vocoders emit sub-bass thumps on consonants).
-            let _ = output.push(hpf.tick(s));
+            let _ = output.push(hpf.tick(s) * mute_gain);
         }
         prev_tail.copy_from_slice(&seg[block..block + crossfade]);
         have_tail = true;

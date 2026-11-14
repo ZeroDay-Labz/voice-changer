@@ -5,7 +5,10 @@
 //! realtime side only touches lock-free ring buffers; all inference runs on
 //! a worker thread.
 
+pub mod check;
 pub mod compute;
+pub mod envelope;
+pub mod events;
 pub mod f0;
 pub mod hardware;
 pub mod index;
@@ -15,6 +18,7 @@ pub mod onnx_meta;
 pub mod resample;
 pub mod rvc;
 pub mod stream;
+pub use crate::wav;
 
 use std::path::{Path, PathBuf};
 

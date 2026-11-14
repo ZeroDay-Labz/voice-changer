@@ -66,6 +66,15 @@ pub fn param(name: &str) -> &'static str {
         "AI Speaker" => {
             "Which of the model's speakers to use. Some voices were trained with two or more (for example a male and a female take)."
         }
+        "Protect Consonants" => {
+            "Keeps breaths and consonants (s, t, sh) closer to what you actually said instead of pulling them toward the voice's index. Higher is cleaner; 0% is off."
+        }
+        "Follow My Loudness" => {
+            "Makes the converted voice as loud, moment by moment, as what you put in. Quiet breaths and mouth noises stay quiet instead of coming out at full speech level."
+        }
+        "Block Coughs and Burps" => {
+            "Silences coughs, burps, sneezes, throat clearing and hiccups instead of converting them. Laughter is left to the voice. Needs a small extra model (15 MB)."
+        }
         "Index Strength" => {
             "How strongly to follow the retrieval index. Around 75% keeps the model's timbre; lower if words become unclear."
         }
@@ -112,6 +121,8 @@ pub const STARTS_AS: &str = "The speaker this voice starts with whenever you sel
 pub const SPEAKER_NAME: &str =
     "Name this speaker (for example Male or Female). Press Enter to save.";
 pub const RESET_PANEL: &str = "Reset every control in this panel to its default.";
+pub const CHECK_VOICE: &str = "Convert a short test phrase with this voice and report clipping, silence, poor pitch tracking or a missing index. Takes a few seconds.";
+pub const VOICE_SETTINGS: &str = "Pitch, index, breathiness, protection and loudness were set for this voice and come back when you select it.";
 pub const STATUS_PILL: &str = "Added delay from mic to virtual mic, dropouts since start, and how hard the AI is working. Click for Settings.";
 pub const RUNTIME: &str =
     "The AI engine library in use. The ROCm or CUDA one lets the AI run on your graphics card.";

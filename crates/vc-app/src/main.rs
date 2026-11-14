@@ -85,6 +85,14 @@ struct Cli {
     #[arg(long)]
     monitor: bool,
 
+    /// Replay this WAV through the chain to "Hear myself" only (test bench).
+    #[arg(long, hide = true)]
+    bench_play: Option<std::path::PathBuf>,
+
+    /// Record a bench clip with this name right after start.
+    #[arg(long, hide = true)]
+    bench_record: Option<String>,
+
     /// Play "Hear myself" to this sink (node.name) instead of the default output.
     #[arg(long, hide = true)]
     monitor_target: Option<String>,
@@ -230,6 +238,7 @@ fn main() -> Result<()> {
         state.apply_direct(&params, cli.rate as f32);
     }
     params.set_ai_threads(cfg.ai_threads);
+    params.set_my_pitch_hz(cfg.my_pitch_hz);
     let audio_config = pw::AudioConfig {
         rate: cli.rate,
         quantum: cli.quantum,
@@ -239,7 +248,7 @@ fn main() -> Result<()> {
             Some(p) if p.as_os_str() == "synth" => Some(std::sync::Arc::new(
                 selftest::synth_voice(cli.rate as usize, 4.0),
             )),
-            Some(p) => Some(std::sync::Arc::new(read_wav_mono(p)?)),
+            Some(p) => Some(std::sync::Arc::new(vc_core::wav::read_mono(p)?.0)),
             None => None,
         },
         monitor_target: cli.monitor_target.clone(),
@@ -301,6 +310,14 @@ fn main() -> Result<()> {
     shared.set_enabled(cli.on || !(cli.bypass || cfg.start_bypassed));
     if cli.monitor {
         shared.set_monitor(true);
+    }
+    if let Some(path) = &cli.bench_play
+        && !shared.bench_play_file(path)
+    {
+        log::warn!("could not play the bench clip {}", path.display());
+    }
+    if let Some(name) = &cli.bench_record {
+        shared.bench_record(name);
     }
     if cfg.set_as_default {
         // Applied by the audio thread once the session manager is known.
@@ -395,6 +412,9 @@ fn main() -> Result<()> {
         .or(cfg.mic);
     cfg.start_bypassed = !shared.is_enabled();
     cfg.ai_threads = shared.params.ai_threads();
+    cfg.my_pitch_hz = shared.params.my_pitch_hz();
+    // A bench recording still in flight is written out by this call.
+    let _ = shared.bench_state();
     if let Err(e) = cfg.save() {
         log::warn!("could not save config: {e}");
     }
@@ -520,6 +540,11 @@ fn manage_voices(action: Option<&VoicesAction>) -> Result<()> {
                         "setting up converter (one-time)".into()
                     }
                     vc_core::ai::Stage::Converting => "converting to ONNX".into(),
+                    vc_core::ai::Stage::Checking => "checking quality".into(),
+                    vc_core::ai::Stage::Checked(result) => {
+                        println!("\n{result}");
+                        return Ok(());
+                    }
                     vc_core::ai::Stage::Done(n) => {
                         println!("\ninstalled \"{n}\"");
                         return Ok(());
@@ -692,49 +717,4 @@ fn remote(cmd: Command) -> Result<()> {
         }
         Ok(())
     })
-}
-
-/// Minimal WAV reader (PCM16 / float32, any channel count → mono).
-fn read_wav_mono(path: &std::path::Path) -> Result<Vec<f32>> {
-    let b = std::fs::read(path)?;
-    let fmt = b
-        .windows(4)
-        .position(|w| w == b"fmt ")
-        .context("wav: no fmt chunk")?;
-    let format = u16::from_le_bytes([b[fmt + 8], b[fmt + 9]]);
-    let channels = u16::from_le_bytes([b[fmt + 10], b[fmt + 11]]) as usize;
-    let bits = u16::from_le_bytes([b[fmt + 22], b[fmt + 23]]);
-    let data = b
-        .windows(4)
-        .position(|w| w == b"data")
-        .context("wav: no data chunk")?;
-    let size = u32::from_le_bytes([b[data + 4], b[data + 5], b[data + 6], b[data + 7]]) as usize;
-    let pcm = &b[data + 8..(data + 8 + size).min(b.len())];
-    let mut mono = Vec::new();
-    match (format, bits) {
-        (1, 16) => {
-            for frame in pcm.chunks_exact(2 * channels) {
-                let s: f32 = frame
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| i16::from_le_bytes(*c) as f32 / 32768.0)
-                    .sum();
-                mono.push(s / channels as f32);
-            }
-        }
-        (3, 32) => {
-            for frame in pcm.chunks_exact(4 * channels) {
-                let s: f32 = frame
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|c| f32::from_le_bytes(*c))
-                    .sum();
-                mono.push(s / channels as f32);
-            }
-        }
-        _ => anyhow::bail!("unsupported wav format {format}/{bits}"),
-    }
-    Ok(mono)
 }

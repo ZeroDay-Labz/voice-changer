@@ -542,6 +542,7 @@ fn ai_card<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> 
         left = left.push(param_toggle(&p.ai_index_enabled, mode));
         if p.ai_index_enabled.value() {
             left = left.push(param_slider(&p.ai_index_rate, mode, 150.0));
+            left = left.push(param_slider(&p.ai_protect, mode, 150.0));
         }
     }
 
@@ -581,6 +582,58 @@ fn ai_card<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> 
     .width(Length::Fixed(400.0));
     if let Some(n) = &model.cache.gpu_note {
         right = right.push(dim(n.clone(), 11, mode));
+    }
+    right = right.push(param_slider(&p.ai_volume_follow, mode, 150.0));
+    right = right.push(param_toggle(&p.ai_block_noises, mode));
+    if p.ai_block_noises.value() {
+        let ready = host
+            .ai_status()
+            .is_some_and(|s| s.blocker_ready.load(std::sync::atomic::Ordering::Relaxed));
+        if ready {
+            let n = host
+                .ai_status()
+                .map(|s| s.blocked.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(0);
+            if n > 0 {
+                right = right.push(dim(format!("{n} blocked so far"), 11, mode));
+            }
+        } else if !model.cache.blocker_model_present {
+            right = right.push(
+                row![
+                    dim("Needs a small extra model (15 MB).", 11, mode),
+                    button(text("Download").size(11))
+                        .style(theme::button_soft)
+                        .padding([2, 8])
+                        .on_press_maybe(
+                            model
+                                .import
+                                .is_none()
+                                .then_some(Message::DownloadBaseModels)
+                        ),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
+    }
+    // Room noise goes through the model like speech does.
+    if p.ai_enabled.value() && !p.denoise.value() {
+        let ptr = p.denoise.as_ptr();
+        right = right.push(
+            row![
+                dim(
+                    "Noise removal is off: keyboard and fan noise will be converted too.",
+                    11,
+                    mode
+                ),
+                button(text("Turn on").size(11))
+                    .style(theme::button_soft)
+                    .padding([2, 8])
+                    .on_press(Message::ParamBool(ptr, true)),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
     }
 
     // Status line.
@@ -627,6 +680,10 @@ fn ai_card<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> 
                 };
                 if f0 > 0.0 && p.ai_enabled.value() {
                     s.push_str(&format!(" · voice ≈ {f0:.0} Hz"));
+                }
+                let me = st.speaker_f0_hz.load(std::sync::atomic::Ordering::Relaxed);
+                if me > 0.0 && p.ai_enabled.value() {
+                    s.push_str(&format!(" · you ≈ {me:.0} Hz"));
                 }
                 if drops > 0 {
                     s.push_str(&format!(" · {drops} dropouts"));

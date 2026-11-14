@@ -6,6 +6,7 @@ pub mod meters;
 pub mod params;
 pub mod pipeline;
 pub mod presets;
+pub mod wav;
 
 pub use meters::Meters;
 pub use params::{AiSpeed, PitchEngine, VcParams};

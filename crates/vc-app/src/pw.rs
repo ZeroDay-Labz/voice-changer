@@ -195,6 +195,90 @@ pub struct DeviceInfo {
     pub description: String,
 }
 
+/// The test bench: record a few seconds of the raw microphone, or replay a
+/// clip in place of the microphone. A replayed clip goes through the whole
+/// chain to "Hear myself" only; the virtual microphone carries silence
+/// meanwhile, so nobody in a call ever hears a recording.
+pub struct Bench {
+    /// The clip replayed instead of the microphone, looped.
+    play: arc_swap::ArcSwapOption<Vec<f32>>,
+    /// Samples still to record; the capture callback counts it down.
+    record_left: AtomicUsize,
+    record_total: AtomicUsize,
+    /// Pre-sized, so the realtime side never allocates. Only the capture
+    /// callback touches it while `record_left` is above zero.
+    recording: Mutex<Vec<f32>>,
+}
+
+impl Bench {
+    /// Longest recording, in seconds.
+    pub const MAX_SECONDS: usize = 20;
+
+    fn new(rate: u32) -> Self {
+        Self {
+            play: arc_swap::ArcSwapOption::empty(),
+            record_left: AtomicUsize::new(0),
+            record_total: AtomicUsize::new(0),
+            recording: Mutex::new(Vec::with_capacity(rate as usize * Self::MAX_SECONDS)),
+        }
+    }
+
+    /// Start recording `samples` of the raw microphone.
+    pub fn record(&self, samples: usize) {
+        self.record_left.store(0, Ordering::SeqCst);
+        if let Ok(mut buf) = self.recording.lock() {
+            buf.clear();
+            let samples = samples.min(buf.capacity());
+            self.record_total.store(samples, Ordering::SeqCst);
+            self.record_left.store(samples, Ordering::SeqCst);
+        }
+    }
+
+    /// 0..1 while recording, `None` when idle.
+    pub fn record_progress(&self) -> Option<f32> {
+        let total = self.record_total.load(Ordering::Relaxed);
+        let left = self.record_left.load(Ordering::Relaxed);
+        (total > 0).then(|| 1.0 - left as f32 / total as f32)
+    }
+
+    /// The finished recording, once; `None` while recording or when idle.
+    pub fn take_recording(&self) -> Option<Vec<f32>> {
+        if self.record_total.load(Ordering::SeqCst) == 0
+            || self.record_left.load(Ordering::SeqCst) > 0
+        {
+            return None;
+        }
+        let mut buf = self.recording.lock().ok()?;
+        self.record_total.store(0, Ordering::SeqCst);
+        let capacity = buf.capacity();
+        Some(std::mem::replace(&mut *buf, Vec::with_capacity(capacity)))
+    }
+
+    /// Replay `clip` in place of the microphone (`None` = back to live).
+    pub fn play(&self, clip: Option<Arc<Vec<f32>>>) {
+        self.play.store(clip.filter(|c| !c.is_empty()));
+    }
+
+    pub fn playing(&self) -> bool {
+        self.play.load().is_some()
+    }
+
+    /// Realtime: keep what the microphone delivered, if a recording runs.
+    fn capture(&self, block: &[f32]) {
+        let left = self.record_left.load(Ordering::Relaxed);
+        if left == 0 {
+            return;
+        }
+        // Uncontended: the other side only locks once `record_left` is zero.
+        if let Ok(mut buf) = self.recording.try_lock() {
+            let take = left.min(block.len()).min(buf.capacity() - buf.len());
+            buf.extend_from_slice(&block[..take]);
+            let rest = if take < block.len() { 0 } else { left - take };
+            self.record_left.store(rest, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Counters the realtime callbacks bump; read from anywhere.
 #[derive(Default)]
 pub struct Stats {
@@ -235,6 +319,7 @@ pub struct AudioThread {
     listeners: Arc<AtomicUsize>,
     quit: Arc<AtomicBool>,
     source_name: String,
+    pub bench: Arc<Bench>,
 }
 
 impl AudioThread {
@@ -256,6 +341,7 @@ impl AudioThread {
         let listeners = Arc::new(AtomicUsize::new(0));
         let quit = Arc::new(AtomicBool::new(false));
         let source_name = config.source_name.clone();
+        let bench = Arc::new(Bench::new(config.rate));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
 
         let pipeline = Pipeline::new(config.rate as f32, MAX_BLOCK, params);
@@ -275,6 +361,7 @@ impl AudioThread {
             health: health.clone(),
             listeners: listeners.clone(),
             quit: quit.clone(),
+            bench: bench.clone(),
         };
         let thread = std::thread::Builder::new()
             .name("pipewire-main".into())
@@ -301,6 +388,7 @@ impl AudioThread {
             listeners,
             quit,
             source_name,
+            bench,
         })
     }
 
@@ -418,6 +506,8 @@ struct CaptureData {
     scratch: Vec<f32>,
     input_wav: Option<Arc<Vec<f32>>>,
     wav_pos: usize,
+    bench: Arc<Bench>,
+    bench_pos: usize,
     stats: Arc<Stats>,
     meters: Arc<Meters>,
 }
@@ -649,6 +739,7 @@ struct LoopContext {
     health: Arc<Mutex<AudioHealth>>,
     listeners: Arc<AtomicUsize>,
     quit: Arc<AtomicBool>,
+    bench: Arc<Bench>,
 }
 
 fn set_health(health: &Mutex<AudioHealth>, f: impl FnOnce(&mut AudioHealth)) {
@@ -988,6 +1079,8 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
             scratch: vec![0.0; MAX_BLOCK],
             input_wav: config.input_wav.clone(),
             wav_pos: 0,
+            bench: ctx.bench.clone(),
+            bench_pos: 0,
             stats: stats.clone(),
             meters: ctx.meters.clone(),
         })
@@ -1068,6 +1161,20 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
                 }
             }
 
+            // Test bench: keep the raw microphone if a recording runs, and
+            // replay a clip in its place if one is playing.
+            data.bench.capture(scratch);
+            let bench_clip = data.bench.play.load();
+            let benching = bench_clip.is_some();
+            if let Some(clip) = bench_clip.as_ref() {
+                for out in scratch.iter_mut() {
+                    data.bench_pos %= clip.len();
+                    *out = clip[data.bench_pos];
+                    data.bench_pos += 1;
+                }
+            }
+            drop(bench_clip);
+
             // Uncontended except for the instant a session is torn down.
             let Ok(mut pipeline) = data.pipeline.try_lock() else {
                 data.stats.skipped_callbacks.fetch_add(1, Ordering::Relaxed);
@@ -1086,11 +1193,16 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
             data.meters.publish_auto_gain(pipeline.auto_gain_db());
             drop(pipeline);
 
-            push_all(&mut data.to_source, scratch, Some(&data.stats));
             // The monitor stream only exists while "Hear myself" is on.
             if data.monitor_on.load(Ordering::Relaxed) {
                 push_all(&mut data.to_monitor, scratch, None);
             }
+            // A bench clip is for the user's ears only: the virtual
+            // microphone carries silence while one plays.
+            if benching {
+                scratch.fill(0.0);
+            }
+            push_all(&mut data.to_source, scratch, Some(&data.stats));
         })
         .register()
         .context("register capture listener")?;

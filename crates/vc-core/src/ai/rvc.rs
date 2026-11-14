@@ -87,6 +87,20 @@ pub struct Rvc {
     pub index: Option<super::index::RetrievalIndex>,
     /// 0..1 blend toward the index (RVC `index_rate`); 0 disables.
     pub index_rate: f32,
+    /// How much of the index's effect is kept on frames without pitch
+    /// (breaths, consonants): 1 = all of it, 0 = those frames keep the
+    /// speaker's own features (RVC's `protect`, where 0.5 means off).
+    pub protect: f32,
+    /// Pitch the speaker can plausibly produce, in Hz; what falls outside is
+    /// folded back by octaves or treated as unvoiced.
+    pub f0_range: (f32, f32),
+    /// Median pitch of the last inference before shifting (0 = unvoiced).
+    pub last_input_f0_hz: f32,
+    /// Off only for measuring (`VC_AI_RAW_PITCH=1`): the pitch model's
+    /// output goes to the synthesizer untouched.
+    clean_pitch: bool,
+    feats_orig: Vec<f32>,
+    f0_scratch: Vec<f32>,
     // scratch
     mel_buf: Vec<f32>,
     feats: Vec<f32>,
@@ -303,6 +317,11 @@ fn append_rocm(builder: &ort::session::builder::SessionBuilder, device: i32) -> 
     }
 }
 
+/// Pitch range used until the speaker's own is known.
+pub const DEFAULT_F0_RANGE: (f32, f32) = (55.0, 600.0);
+/// Voiced runs shorter than this many 10 ms frames are not speech.
+const MIN_VOICED_FRAMES: usize = 3;
+
 /// The useful end of an ONNX Runtime error: what follows the last
 /// "with error:" (the loader's own message), cut to one short line.
 #[cfg(feature = "gpu")]
@@ -314,6 +333,13 @@ fn short_reason(error: &str) -> String {
         short.push('…');
     }
     short
+}
+
+/// Make sure ONNX Runtime is loaded (dynamic builds); a no-op otherwise.
+pub(crate) fn ensure_runtime() -> Result<()> {
+    #[cfg(feature = "gpu")]
+    init_runtime()?;
+    Ok(())
 }
 
 impl Rvc {
@@ -428,6 +454,12 @@ impl Rvc {
             model_rate: None,
             index: None,
             index_rate: 0.0,
+            protect: 1.0,
+            f0_range: DEFAULT_F0_RANGE,
+            last_input_f0_hz: 0.0,
+            clean_pitch: std::env::var_os("VC_AI_RAW_PITCH").is_none(),
+            feats_orig: Vec::new(),
+            f0_scratch: Vec::new(),
             mel_buf: Vec::new(),
             feats: Vec::new(),
             salience: Vec::new(),
@@ -460,6 +492,48 @@ impl Rvc {
                 t0.elapsed().as_secs_f32() * 1000.0
             ),
         }
+    }
+
+    /// Run the pitch model on 16 kHz audio; `self.f0` receives one value per
+    /// 10 ms frame in Hz (0 = unvoiced), with no clean-up applied.
+    fn raw_f0(&mut self, audio16k: &[f32]) -> Result<()> {
+        let mel_frames = self.mel.compute(audio16k, &mut self.mel_buf);
+        let padded = mel_frames.div_ceil(32) * 32;
+        if padded != mel_frames {
+            // [128][frames] → [128][padded] with zeros on the right.
+            let mut p = vec![0.0f32; N_MELS * padded];
+            for m in 0..N_MELS {
+                p[m * padded..m * padded + mel_frames]
+                    .copy_from_slice(&self.mel_buf[m * mel_frames..(m + 1) * mel_frames]);
+            }
+            self.mel_buf = p;
+        }
+        {
+            let mel = Tensor::from_array((
+                vec![1i64, N_MELS as i64, padded as i64],
+                std::mem::take(&mut self.mel_buf),
+            ))?;
+            let mut session = lock(&self.rmvpe);
+            let outputs = session.run(ort::inputs!["input" => mel])?;
+            let (shape, data) = outputs["output"].try_extract_tensor::<f32>()?;
+            let classes = shape[2] as usize;
+            if classes != f0::N_CLASSES {
+                bail!("pitch model produced {classes} classes, expected 360");
+            }
+            self.salience.clear();
+            self.salience
+                .extend_from_slice(&data[..mel_frames * classes]);
+        }
+        f0::decode(&self.salience, mel_frames, 0.03, &mut self.f0);
+        Ok(())
+    }
+
+    /// Pitch track of 16 kHz audio (Hz per 10 ms frame, 0 = unvoiced), with
+    /// stray blips removed. For measuring voices, not for conversion.
+    pub fn pitch_of(&mut self, audio16k: &[f32]) -> Result<Vec<f32>> {
+        self.raw_f0(audio16k)?;
+        f0::despeckle(&mut self.f0, MIN_VOICED_FRAMES);
+        Ok(self.f0.clone())
     }
 
     pub fn model_rate(&self) -> Option<usize> {
@@ -539,35 +613,15 @@ impl Rvc {
 
         // ---- pitch (tail only) ------------------------------------------------
         let t0 = Instant::now();
-        let mel_frames = self.mel.compute(tail, &mut self.mel_buf);
-        let padded = mel_frames.div_ceil(32) * 32;
-        if padded != mel_frames {
-            // [128][frames] → [128][padded] with zeros on the right.
-            let mut p = vec![0.0f32; N_MELS * padded];
-            for m in 0..N_MELS {
-                p[m * padded..m * padded + mel_frames]
-                    .copy_from_slice(&self.mel_buf[m * mel_frames..(m + 1) * mel_frames]);
-            }
-            self.mel_buf = p;
+        self.raw_f0(tail)?;
+        // A cough or a click gives the pitch model a frame or two of wild
+        // values; fed to the synthesizer they come out as robotic chirps.
+        if self.clean_pitch {
+            f0::despeckle(&mut self.f0, MIN_VOICED_FRAMES);
+            f0::fold_into(&mut self.f0, self.f0_range.0, self.f0_range.1);
+            f0::median5(&mut self.f0, &mut self.f0_scratch);
         }
-        {
-            let mel = Tensor::from_array((
-                vec![1i64, N_MELS as i64, padded as i64],
-                std::mem::take(&mut self.mel_buf),
-            ))?;
-            let mut session = lock(&self.rmvpe);
-            let outputs = session.run(ort::inputs!["input" => mel])?;
-            let (shape, data) = outputs["output"].try_extract_tensor::<f32>()?;
-            let classes = shape[2] as usize;
-            if classes != f0::N_CLASSES {
-                bail!("pitch model produced {classes} classes, expected 360");
-            }
-            self.salience.clear();
-            self.salience
-                .extend_from_slice(&data[..mel_frames * classes]);
-        }
-        f0::decode(&self.salience, mel_frames, 0.03, &mut self.f0);
-        f0::median3(&mut self.f0);
+        self.last_input_f0_hz = f0::voiced_median(&self.f0, &mut self.f0_scratch);
         f0::shift(&mut self.f0, semitones);
         self.last_f0_hz = {
             let voiced: Vec<f32> = self.f0.iter().copied().filter(|v| *v > 0.0).collect();
@@ -590,7 +644,32 @@ impl Rvc {
         {
             let t_idx = Instant::now();
             let slice = &mut self.feats[first_frame * 768..n_frames * 768];
+            let protect = self.protect.clamp(0.0, 1.0);
+            if protect < 1.0 {
+                self.feats_orig.clear();
+                self.feats_orig.extend_from_slice(slice);
+            }
             index.blend(slice, self.index_rate, 1, 8);
+            if protect < 1.0 {
+                // Frames without pitch are breaths and consonants. Pulling
+                // them toward the target's (mostly voiced) training frames
+                // smears them; give them back part of what was said.
+                for (j, (frame, orig)) in slice
+                    .as_chunks_mut::<768>()
+                    .0
+                    .iter_mut()
+                    .zip(self.feats_orig.as_chunks::<768>().0)
+                    .enumerate()
+                {
+                    let voiced = self.f0.get(2 * j).is_some_and(|v| *v > 0.0)
+                        || self.f0.get(2 * j + 1).is_some_and(|v| *v > 0.0);
+                    if !voiced {
+                        for (f, o) in frame.iter_mut().zip(orig) {
+                            *f = *f * protect + *o * (1.0 - protect);
+                        }
+                    }
+                }
+            }
             timings.pitch_ms += t_idx.elapsed().as_secs_f32() * 1000.0;
         }
 

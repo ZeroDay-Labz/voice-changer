@@ -26,6 +26,8 @@ pub struct AppConfig {
     pub ai_threads: u32,
     /// Show the welcome card until the user dismisses it.
     pub first_run: bool,
+    /// Your typical speaking pitch in Hz as the AI has learned it (0 = not yet).
+    pub my_pitch_hz: f32,
 }
 
 impl Default for AppConfig {
@@ -42,6 +44,7 @@ impl Default for AppConfig {
             window: None,
             ai_threads: 0,
             first_run: true,
+            my_pitch_hz: 0.0,
         }
     }
 }

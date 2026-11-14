@@ -96,6 +96,26 @@ pub struct AppStream {
     pub routed: bool,
 }
 
+/// The test bench as the window sees it (standalone only).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BenchState {
+    /// Names of the clips that have been recorded.
+    pub clips: Vec<String>,
+    /// The clip being recorded and how far along it is (0..1).
+    pub recording: Option<(String, f32)>,
+    /// The clip being replayed in place of the microphone.
+    pub playing: Option<String>,
+}
+
+/// The clips the bench offers, in the order shown.
+pub const BENCH_CLIPS: [(&str, &str); 5] = [
+    ("speech", "A sentence or two in your normal voice"),
+    ("cough", "A cough or two, with a word before and after"),
+    ("burp", "A burp, a sneeze or throat clearing"),
+    ("laugh", "A laugh"),
+    ("breath", "Breathing and mouth noises, no words"),
+];
+
 pub trait Host {
     fn params(&self) -> &VcParams;
     fn gui(&self) -> &GuiContext;
@@ -155,6 +175,15 @@ pub trait Host {
     }
     /// Try to start audio again after a failed start.
     fn retry_audio(&self) {}
+    /// The test bench, when this host has one.
+    fn bench(&self) -> Option<BenchState> {
+        None
+    }
+    /// Record a few seconds of the microphone as the clip `name`.
+    fn bench_record(&self, _name: &str) {}
+    /// Replay a clip in place of the microphone (to "Hear myself" only), or
+    /// go back to the live microphone with `None`.
+    fn bench_play(&self, _name: Option<&str>) {}
     /// Cores, threads and the Auto thread count (AI builds only).
     fn hardware(&self) -> Option<HardwareSummary> {
         None

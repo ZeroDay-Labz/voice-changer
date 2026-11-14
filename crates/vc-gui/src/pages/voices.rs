@@ -18,6 +18,9 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
         }
         col = col.push(importer(model, mode));
         col = col.push(installed(model, host, mode));
+        if let Some(bench) = &model.bench {
+            col = col.push(test_bench(bench, host, mode));
+        }
         col.into()
     }
     #[cfg(not(feature = "ai"))]
@@ -30,6 +33,71 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
             dim("This build has no AI support.", 13, mode),
         )
     }
+}
+
+/// Record a phrase once, then replay it through any voice while moving the
+/// sliders, instead of talking to yourself.
+#[cfg(feature = "ai")]
+fn test_bench<'a>(bench: &'a crate::BenchState, host: &'a dyn Host, mode: Mode) -> Element<'a> {
+    let t = theme::tokens(mode);
+    let busy = bench.recording.is_some();
+    let mut rows = column![dim(
+        "Record yourself once, then replay a clip through any voice while you tune it. A clip is only played to Hear myself; your microphone output is silent while it plays, so nobody in a call hears it. Clips stay on this computer.",
+        12,
+        mode
+    )]
+    .spacing(8);
+    for (name, what) in crate::host::BENCH_CLIPS {
+        let have = bench.clips.iter().any(|c| c == name);
+        let playing = bench.playing.as_deref() == Some(name);
+        let recording = bench
+            .recording
+            .as_ref()
+            .filter(|(n, _)| n == name)
+            .map(|(_, progress)| *progress);
+        let record: Element<'a> = match recording {
+            Some(progress) => text(format!("Recording… {:.0}%", progress * 100.0))
+                .size(13)
+                .color(theme::CORAL)
+                .into(),
+            None => button(text(if have { "Record again" } else { "Record 8 s" }).size(13))
+                .style(theme::button_soft)
+                .padding([6, 10])
+                .on_press_maybe((!busy && !playing).then(|| Message::BenchRecord(name.to_string())))
+                .into(),
+        };
+        let play: Element<'a> = if playing {
+            button(text("Stop").size(13))
+                .style(theme::button_indigo)
+                .padding([6, 10])
+                .on_press(Message::BenchPlay(None))
+                .into()
+        } else {
+            button(text("Play in a loop").size(13))
+                .style(theme::button_soft)
+                .padding([6, 10])
+                .on_press_maybe((have && !busy).then(|| Message::BenchPlay(Some(name.to_string()))))
+                .into()
+        };
+        rows = rows.push(
+            row![
+                container(text(name).size(14).color(t.text)).width(Length::Fixed(70.0)),
+                container(dim(what, 12, mode)).width(Length::Fill),
+                record,
+                play,
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        );
+    }
+    if bench.playing.is_some() && host.monitor() == Some(false) {
+        rows = rows.push(
+            text("Hear myself is off, so you cannot hear the clip. Turn it on in the top bar.")
+                .size(12)
+                .color(theme::AMBER),
+        );
+    }
+    super::section("Test bench", mode, rows)
 }
 
 #[cfg(feature = "ai")]
@@ -102,7 +170,7 @@ fn importer<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
     .align_y(Alignment::Center);
 
     let mut body = column![
-        dim("Paste a Hugging Face model page or a direct link. RVC v2 models work; .pth files are converted to ONNX automatically and a matching .index is picked up when present.", 12, mode),
+        dim("Paste a voice-models.com voice page, a Hugging Face model page or a direct link. RVC v2 models work; .pth files are converted to ONNX automatically and a matching .index is picked up when present. Each new voice is tried out once so you know what to expect.", 12, mode),
         inputs,
     ]
     .spacing(10);
@@ -129,6 +197,8 @@ fn importer<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
                 "Converting the model to ONNX (about a minute)…".into(),
                 None,
             ),
+            Stage::Checking => ("Trying the voice out (a few seconds)…".into(), None),
+            Stage::Checked(result) => (format!("Checked {result}"), Some(1.0)),
             Stage::Done(n) => (format!("Installed “{n}”"), Some(1.0)),
             Stage::Failed(e) => (format!("Failed: {e}"), None),
             Stage::Idle => (String::new(), None),
@@ -213,6 +283,41 @@ fn installed<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a
                     "multi-speaker"
                 },
                 theme::VIOLET,
+            ));
+        }
+        match v.quality.as_deref() {
+            Some(grade) => {
+                let colour = match grade {
+                    "good" => theme::ACCENT,
+                    "fair" => theme::AMBER,
+                    _ => theme::DANGER,
+                };
+                let label = match grade {
+                    "good" => "checked: good",
+                    "fair" => "checked: fair",
+                    _ => "checked: poor",
+                };
+                meta = meta.push(tip(badge(label, colour), v.quality_summary.as_str()));
+            }
+            None => {
+                meta = meta.push(tip(
+                    button(text("Check").size(11))
+                        .style(theme::button_ghost)
+                        .padding([2, 8])
+                        .on_press_maybe(
+                            model
+                                .import
+                                .is_none()
+                                .then(|| Message::CheckVoice(path.clone())),
+                        ),
+                    crate::help::CHECK_VOICE,
+                ));
+            }
+        }
+        if v.has_settings {
+            meta = meta.push(tip(
+                badge("own settings", theme::SKY),
+                crate::help::VOICE_SETTINGS,
             ));
         }
         if let Some(src) = &v.source {

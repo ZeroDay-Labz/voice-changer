@@ -254,6 +254,15 @@ impl Host for AppHost {
     fn retry_audio(&self) {
         self.shared.retry_audio();
     }
+    fn bench(&self) -> Option<vc_gui::BenchState> {
+        Some(self.shared.bench_state())
+    }
+    fn bench_record(&self, name: &str) {
+        self.shared.bench_record(name);
+    }
+    fn bench_play(&self, name: Option<&str>) {
+        self.shared.bench_play(name);
+    }
     #[cfg(feature = "ai")]
     fn hardware(&self) -> Option<HardwareSummary> {
         use vc_core::ai::{compute, hardware};

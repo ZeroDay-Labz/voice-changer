@@ -17,8 +17,8 @@ use std::time::Instant;
 use vc_core::{Preset, PresetEntry};
 
 pub use host::{
-    AppStream, AudioState, AudioStatus, Capabilities, Device, HardwareSummary, Host, HostSetting,
-    HostSettings, HostStats,
+    AppStream, AudioState, AudioStatus, BenchState, Capabilities, Device, HardwareSummary, Host,
+    HostSetting, HostSettings, HostStats,
 };
 pub use iced_runtime::Task;
 pub use theme::Mode;
@@ -113,6 +113,11 @@ pub enum Message {
     SelectVoice(String),
     SelectDevice(String),
     DownloadBaseModels,
+    /// Test bench: record the named clip / replay it (or stop with `None`).
+    BenchRecord(String),
+    BenchPlay(Option<String>),
+    /// Run the quality check on an installed voice (by path).
+    CheckVoice(String),
     RouteApp(u32, bool),
     SetDefaultSource(bool),
     RefreshApps,
@@ -144,6 +149,8 @@ pub struct Model {
     pub saving: bool,
     pub toast: Option<(String, bool, Instant)>,
     pub meters: widgets::meter::Levels,
+    /// The test bench, refreshed every tick (`None` = this host has none).
+    pub bench: Option<host::BenchState>,
     #[cfg(feature = "ai")]
     pub voices: Vec<vc_core::ai::VoiceInfo>,
     #[cfg(feature = "ai")]
@@ -169,6 +176,8 @@ pub struct Cache {
     pub app_streams: Vec<AppStream>,
     pub default_source: Option<bool>,
     pub base_models_present: bool,
+    /// The cough and burp blocker's classifier is downloaded.
+    pub blocker_model_present: bool,
     pub voices_dir: String,
     /// (setting key, label) for the compute picker.
     pub compute_options: Vec<(String, String)>,
@@ -197,6 +206,7 @@ impl Model {
             saving: false,
             toast: None,
             meters: widgets::meter::Levels::default(),
+            bench: None,
             #[cfg(feature = "ai")]
             voices: vc_core::ai::library::voices(),
             #[cfg(feature = "ai")]
@@ -243,6 +253,7 @@ impl Model {
         {
             use vc_core::ai::compute;
             self.cache.base_models_present = vc_core::ai::library::base_models_present();
+            self.cache.blocker_model_present = vc_core::ai::events::model_path().is_some();
             self.cache.voices_dir = vc_core::ai::voices_dir()
                 .map(|d| d.display().to_string())
                 .unwrap_or_default();
@@ -292,11 +303,43 @@ impl Model {
 fn select_voice(host: &dyn Host, path: &str) {
     host.params().set_ai_voice(path);
     if !path.is_empty() {
-        let idx = vc_core::ai::library::default_speaker_for(std::path::Path::new(path));
+        let voice = std::path::Path::new(path);
+        let idx = vc_core::ai::library::default_speaker_for(voice);
         let p = &host.params().ai_speaker;
         gesture(host, p.as_ptr(), p.preview_normalized(idx));
+        // Pitch, index and loudness settings last used with this voice.
+        vc_core::ai::library::apply_voice_settings(voice, host.params(), |ptr, n| {
+            gesture(host, ptr, n)
+        });
     }
 }
+
+/// A per-voice setting was just changed by the user: remember it with the
+/// voice, so switching away and back restores it.
+#[cfg(feature = "ai")]
+fn remember_voice_setting(host: &dyn Host, ptr: ParamPtr) {
+    let p = host.params();
+    let voice = p.ai_voice();
+    if voice.is_empty() {
+        return;
+    }
+    let per_voice = [
+        p.ai_pitch.as_ptr(),
+        p.ai_index_enabled.as_ptr(),
+        p.ai_index_rate.as_ptr(),
+        p.ai_breath.as_ptr(),
+        p.ai_protect.as_ptr(),
+        p.ai_volume_follow.as_ptr(),
+    ];
+    if per_voice.contains(&ptr)
+        && let Err(e) = vc_core::ai::library::save_voice_settings(std::path::Path::new(&voice), p)
+    {
+        log::warn!("could not save the voice's settings: {e:#}");
+    }
+}
+
+#[cfg(not(feature = "ai"))]
+fn remember_voice_setting(_host: &dyn Host, _ptr: ParamPtr) {}
 
 // --------------------------------------------------------------- favorites
 
@@ -370,6 +413,7 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
             let now = Instant::now();
             let dt = now.duration_since(model.last_tick).as_secs_f32().min(0.2);
             model.last_tick = now;
+            model.bench = host.bench();
             if now.duration_since(model.last_refresh).as_secs_f32() > 2.0 {
                 model.refresh_cache(host);
             } else if now.duration_since(model.last_status).as_secs_f32() > 0.5 {
@@ -397,8 +441,13 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
                         model.toast(format!("Installed “{}”", name.replace('_', " ")), false);
                         model.import = None;
                     }
+                    vc_core::ai::Stage::Checked(result) => {
+                        model.refresh();
+                        model.toast(format!("Checked {}", result.replace('_', " ")), false);
+                        model.import = None;
+                    }
                     vc_core::ai::Stage::Failed(e) => {
-                        model.toast(format!("Import failed: {e}"), true);
+                        model.toast(format!("Failed: {e}"), true);
                         model.import = None;
                     }
                     vc_core::ai::Stage::Idle => model.import = None,
@@ -416,13 +465,23 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
             set_normalized(host, ptr, v);
         }
         Message::ParamSet(ptr, v) => set_normalized(host, ptr, v),
-        Message::ParamEnd(ptr) => unsafe { host.gui().raw_end_set_parameter(ptr) },
+        Message::ParamEnd(ptr) => {
+            unsafe { host.gui().raw_end_set_parameter(ptr) };
+            remember_voice_setting(host, ptr);
+        }
         Message::ParamReset(ptr) => {
             let d = unsafe { ptr.default_normalized_value() };
             gesture(host, ptr, d);
+            remember_voice_setting(host, ptr);
         }
-        Message::ParamBool(ptr, b) => gesture(host, ptr, if b { 1.0 } else { 0.0 }),
-        Message::ParamJump(ptr, v) => gesture(host, ptr, v),
+        Message::ParamBool(ptr, b) => {
+            gesture(host, ptr, if b { 1.0 } else { 0.0 });
+            remember_voice_setting(host, ptr);
+        }
+        Message::ParamJump(ptr, v) => {
+            gesture(host, ptr, v);
+            remember_voice_setting(host, ptr);
+        }
         Message::ToggleFavorite(name) => {
             if let Some(i) = model.favorites.iter().position(|f| *f == name) {
                 model.favorites.remove(i);
@@ -629,6 +688,16 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
                 model.import = Some(vc_core::ai::library::start_base_models_download());
             }
         }
+        Message::BenchRecord(name) => host.bench_record(&name),
+        Message::BenchPlay(name) => host.bench_play(name.as_deref()),
+        #[cfg(feature = "ai")]
+        Message::CheckVoice(path) => {
+            if model.import.is_none() {
+                model.import = Some(vc_core::ai::library::start_voice_check(path.into()));
+            }
+        }
+        #[cfg(not(feature = "ai"))]
+        Message::CheckVoice(_) => {}
         #[cfg(not(feature = "ai"))]
         Message::StartImport
         | Message::CancelImport

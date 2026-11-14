@@ -158,8 +158,8 @@ Any **RVC v2** model works, which is the format almost every community voice com
 
 1. **Base models.** The Voices page offers a one-click download of ContentVec and RMVPE
    (MIT licensed, about 740 MB), or run `scripts/get-models.sh`.
-2. **Add a voice.** Paste a Hugging Face model page or a direct `.pth` / `.onnx` / `.zip`
-   link into **Voices → Add a voice**. `.pth` files are converted to ONNX automatically
+2. **Add a voice.** Paste a voice-models.com voice page, a Hugging Face model page or a
+   direct `.pth` / `.onnx` / `.zip` link into **Voices → Add a voice**. `.pth` files are converted to ONNX automatically
    (the first conversion sets up a small Python environment, about 300 MB). A matching
    `.index` file is picked up when the repository or zip has one.
 3. **Use it.** Press **Use** on the voice, or pick it on the Home page's AI card.
@@ -187,8 +187,24 @@ Tips for the most natural result:
 - **AI only** (on by default) bypasses the DSP voice and effects while AI runs. Turn it off
   to layer Robot, reverb or extra pitch on top.
 - Prefer models trained for 300+ epochs on an hour or more of clean speech, at 40k or 48k.
-- **AI speed** (Auto) backs off to longer blocks automatically if your CPU falls behind.
-  Expect 0.5–1 s of delay in AI mode; it needs a block of speech before it can convert it.
+- **Protect consonants** (with an index) keeps breaths and consonants closer to what you
+  said instead of pulling them toward the index. Raise it if s, t and sh sound smeared.
+- **Follow my loudness** makes the converted voice as loud, moment by moment, as what you
+  put in, so quiet breaths and mouth noises stay quiet and the noise gate works on the
+  AI voice too.
+- **Block coughs and burps** silences coughs, burps, sneezes, throat clearing and hiccups
+  instead of converting them (laughter is left to the voice). It uses a small sound
+  classifier, YAMNet (15 MB, Apache-2.0), fetched with the base models.
+- **Settings belong to the voice.** Pitch, index, breathiness, protection and loudness
+  are remembered per voice and come back when you select it.
+- **Test bench** (Voices page): record a phrase once and replay it through any voice
+  while you move the sliders. A replayed clip is heard through Hear myself only; the
+  virtual microphone is silent while it plays.
+- **Check** on a voice converts a test phrase and reports clipping, silence, poor pitch
+  tracking or a missing index. New imports are checked automatically.
+- **AI speed** (Auto) starts at the fastest setting and backs off to longer blocks if
+  your machine falls behind. Expect about 0.5 s of delay on a GPU and 0.65 s on the
+  processor; it needs a block of speech before it can convert it.
 
 ### Compute: CPU or GPU
 

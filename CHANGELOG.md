@@ -3,9 +3,50 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.5.0] - 2026-11-14
+
+Measured on a Ryzen 9 5950X with a Radeon RX 6900 XT, on public test recordings (a
+LibriSpeech sentence and ESC-50 coughs), not yet on the author's own voice.
+
+### Added
+- **Cough and burp blocker.** Coughs, burps, sneezes, throat clearing and hiccups are
+  silenced instead of being converted into loud speech-like noise. Laughter is left to
+  the voice. A small sound classifier (YAMNet, 15 MB, Apache-2.0, downloaded with the
+  base models) listens to the last second before each block; it costs about 2 ms per
+  look on the processor and adds no delay. On a sentence with a cough in it, between
+  0 and 40 ms of the cough was audible over several runs (160 ms without the blocker);
+  the same classifier never fired on the speech or the laughter clips, and did fire on
+  some loud breathing.
+- **Follow my loudness.** The converted voice now tracks the loudness of what goes in, so
+  quiet breaths and mouth noises stay quiet and the noise gate works on the AI voice.
+  The match between input and output loudness on a spoken sentence rose from 0.71 to
+  0.88 (correlation of the 10 ms level envelopes) at the default 75%.
+- **Protect consonants.** With an index, frames without pitch (breaths, s, t, sh) keep
+  part of what was actually said instead of being pulled toward the index, as RVC's
+  "protect" does. Default 67%.
+- **Per-voice settings.** Pitch, index on/off and strength, breathiness, protection and
+  loudness follow are remembered per voice and restored when it is selected.
+- **Test bench** on the Voices page: record a phrase once (speech, cough, burp, laugh,
+  breath) and replay it in a loop through any voice while tuning. A replayed clip goes
+  to Hear myself only; the virtual microphone is silent meanwhile. `ai_score` (an
+  example in `vc-core`) runs a recording through the real stage and prints delay,
+  loudness tracking, pitch steadiness and how much of a marked sound got through.
+- **Quality check for voices.** New imports are tried out once, and any installed voice
+  can be checked: clipping, near-silent output, poor pitch tracking, a missing index and
+  a low epoch count in the name are reported as a badge with the reasons.
+- **voice-models.com links.** A voice page from that site can be pasted directly; the
+  importer follows it to the Hugging Face download. Google Drive and MEGA links are
+  refused with a plain explanation.
+- The app learns your own typical speaking pitch while you talk and uses it to tell
+  real pitch from the pitch model's mistakes.
+- A hint on the AI card when noise removal is off while the AI voice is on.
 
 ### Changed
+- **Pitch clean-up before the voice model.** Voiced blips shorter than 30 ms are dropped,
+  pitch outside the speaker's plausible range is folded back by octaves or dropped, and
+  the smoothing window is five frames instead of three. Counting pitch jumps in the
+  output did not show a consistent gain on the test clips (the count varies more from
+  run to run than between the two settings), so this is unproven by measurement.
 - **The AI voice is about 0.3 s closer to real time.** The converted voice used to wait
   until two whole blocks were ready and then kept a block of audio in hand that was
   never needed: about 0.9 s from mouth to output where the app reported 0.5 s. It now
@@ -25,6 +66,12 @@ All notable changes to Voice Changer are listed here. The format follows
   playing, a call included. It is back on the output device's own clock; the slow drift
   between the two devices is absorbed by stretching a block by one sample now and then
   instead of dropping or repeating audio.
+
+### Not included
+- **Automatic pitch per voice.** Estimating the pitch a voice was trained at by scoring
+  how well it tracks pitch at different shifts was tried and does not work (it put a
+  male voice above a female one), so nothing sets pitch by itself. Per-voice settings
+  cover the need: tune a voice once and it is remembered.
 
 ## [0.4.0] - 2026-11-13
 

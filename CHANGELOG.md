@@ -11,6 +11,10 @@ All notable changes to Voice Changer are listed here. The format follows
   ... Assertion '!this->empty()' failed`, [#1](https://github.com/ZeroDay-Labz/voice-changer/issues/1)).
   The app asked ONNX Runtime 1.22 to choose a device by itself, which that version cannot
   do without a GPU provider. It no longer asks.
+- **The launcher icon did nothing after installing a package** if the app had once been
+  started from a build folder or an unpacked tarball: that run wrote a per-user launcher
+  pointing at its own binary, which kept overriding the packaged one after the binary was
+  gone. The leftover entry is now removed when a package provides the launcher.
 - **The NVIDIA set-up could never work.** `scripts/get-onnxruntime.sh --cuda` copied the
   runtime but not the CUDA provider library next to it, and used the wrong folder when
   `XDG_DATA_HOME` was set. An install without the provider is no longer treated as a

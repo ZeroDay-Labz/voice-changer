@@ -53,23 +53,62 @@ fn exec_line() -> String {
     }
 }
 
+/// The program an entry starts when its `Exec=` line is an absolute path
+/// (the form this module writes for binaries that are not on `PATH`).
+fn absolute_exec(desktop: &str) -> Option<&str> {
+    desktop
+        .lines()
+        .find_map(|l| l.strip_prefix("Exec="))
+        .and_then(|exec| exec.split_whitespace().next())
+        .filter(|program| program.starts_with('/'))
+}
+
+/// Delete the per-user launcher if it is one of ours pointing at a specific
+/// binary. An entry that uses the bare `voice-changer` command (possibly
+/// with the user's own arguments) is left alone.
+fn remove_stale_user_entry(path: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Some(program) = absolute_exec(&text) else {
+        return;
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            log::info!(
+                "removed the old per-user launcher (it started {program}); the packaged one is used now"
+            );
+            if let Some(dir) = path.parent() {
+                let _ = std::process::Command::new("update-desktop-database")
+                    .arg(dir)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+        Err(e) => log::warn!("could not remove the old launcher {}: {e}", path.display()),
+    }
+}
+
 /// Install the launcher and icons for the current user if no package did.
 /// Quiet and idempotent; failures are logged, never fatal.
 pub fn ensure_installed() {
+    let Some(data) = data_home() else { return };
+    let user_entry = data.join("applications").join(format!("{APP_ID}.desktop"));
     if Path::new("/usr/share/applications")
         .join(format!("{APP_ID}.desktop"))
         .is_file()
     {
+        // A package provides the launcher. A per-user copy written by an
+        // earlier run from a build folder or an unpacked tarball would
+        // shadow it and start (or fail to find) that old binary instead.
+        remove_stale_user_entry(&user_entry);
         return;
     }
-    let Some(data) = data_home() else { return };
     let mut changed = false;
     let desktop = String::from_utf8_lossy(DESKTOP)
         .replace("Exec=voice-changer", &format!("Exec={}", exec_line()));
-    match write_if_different(
-        &data.join("applications").join(format!("{APP_ID}.desktop")),
-        desktop.as_bytes(),
-    ) {
+    match write_if_different(&user_entry, desktop.as_bytes()) {
         Ok(c) => changed |= c,
         Err(e) => log::warn!("could not write launcher: {e}"),
     }
@@ -98,5 +137,23 @@ pub fn ensure_installed() {
                 .stderr(std::process::Stdio::null())
                 .status();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::absolute_exec;
+
+    #[test]
+    fn only_absolute_exec_lines_count_as_ours() {
+        let dev =
+            "[Desktop Entry]\nName=Voice Changer\nExec=/home/u/proj/target/debug/voice-changer\n";
+        assert_eq!(
+            absolute_exec(dev),
+            Some("/home/u/proj/target/debug/voice-changer")
+        );
+        assert_eq!(absolute_exec("Exec=voice-changer\n"), None);
+        assert_eq!(absolute_exec("Exec=voice-changer --minimized\n"), None);
+        assert_eq!(absolute_exec("Name=x\n"), None);
     }
 }

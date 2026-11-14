@@ -224,10 +224,7 @@ impl Psola {
         let tau_max = self.diff.len() - 1;
         let w = YIN_WINDOW_DEC;
         // Difference function.
-        let mut energy = 0.0f32;
-        for j in 0..w {
-            energy += self.dec[j] * self.dec[j];
-        }
+        let energy: f32 = self.dec[..w].iter().map(|s| s * s).sum();
         if energy < 1e-7 {
             self.push_estimate(center, self.last_period, false);
             return;

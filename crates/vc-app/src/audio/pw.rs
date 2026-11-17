@@ -37,16 +37,20 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ffi::CStr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use vc_core::{Meters, Pipeline, VcParams};
 
-use crate::fold::StereoFold;
-use crate::slip::Slip;
+use super::block::Processor;
+use super::fold::StereoFold;
+use super::sink::SinkData;
+use super::{
+    AppStream, AudioConfig, AudioHealth, AudioState, Bench, DeviceInfo, MAX_BLOCK, Stats,
+    no_denormals,
+};
 
-pub const SOURCE_NODE_NAME: &str = "voice_changer.source";
 pub const SOURCE_DESCRIPTION: &str = "Voice Changer Mic";
 /// Internal stream that feeds the virtual microphone node.
 const OUTPUT_NODE_NAME: &str = "voice_changer.output";
@@ -54,8 +58,6 @@ pub const CAPTURE_NODE_NAME: &str = "voice_changer.capture";
 pub const MONITOR_NODE_NAME: &str = "voice_changer.monitor";
 
 const SAMPLE_BYTES: usize = std::mem::size_of::<f32>();
-/// Largest block we'll ever be asked for in one callback.
-const MAX_BLOCK: usize = 8192;
 /// Wait between reconnection attempts, doubling up to the maximum.
 const RECONNECT_MIN: Duration = Duration::from_millis(500);
 const RECONNECT_MAX: Duration = Duration::from_secs(5);
@@ -74,20 +76,6 @@ pub fn library_version() -> String {
         .into_owned()
 }
 
-#[derive(Debug, Clone)]
-pub struct AudioConfig {
-    pub rate: u32,
-    pub quantum: u32,
-    pub capture_target: Option<String>,
-    /// PipeWire `node.name` for the published microphone.
-    pub source_name: String,
-    /// Test input: loop this mono 48 kHz buffer instead of the microphone.
-    pub input_wav: Option<Arc<Vec<f32>>>,
-    /// Play "Hear myself" to this sink (`node.name`) instead of the default
-    /// output. Used by tests.
-    pub monitor_target: Option<String>,
-}
-
 enum Command {
     Quit,
     /// Move the capture stream to another microphone (`node.name`), or back
@@ -95,6 +83,9 @@ enum Command {
     SetCaptureTarget(Option<String>),
     /// Start/stop the headphone monitor stream.
     SetMonitor(bool),
+    /// Play "Hear myself" on another output (`node.name`), or the system
+    /// default with `None`.
+    OutputTargetChanged,
     /// Point an application's capture stream at our virtual mic (or release it).
     RouteApp {
         stream_id: u32,
@@ -102,57 +93,6 @@ enum Command {
     },
     /// Make the virtual mic the session's default source (or restore the previous one).
     SetDefaultSource(bool),
-}
-
-/// Where the audio side stands, for the window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioState {
-    Starting,
-    Running,
-    /// The daemon went away; a new session is being attempted.
-    Reconnecting,
-    /// Could not start at all (no PipeWire, refused connection).
-    Failed,
-}
-
-#[derive(Debug, Clone)]
-pub struct AudioHealth {
-    pub state: AudioState,
-    /// One plain sentence about the current problem, empty when fine.
-    pub message: String,
-    /// The virtual microphone node exists and is fed.
-    pub virtual_mic: bool,
-    /// The capture stream has delivered audio recently.
-    pub mic_alive: bool,
-    /// How many sessions have been (re)started.
-    pub sessions: u32,
-}
-
-impl Default for AudioHealth {
-    fn default() -> Self {
-        Self {
-            state: AudioState::Starting,
-            message: String::new(),
-            virtual_mic: false,
-            // Optimistic until the one-second check has seen two quiet
-            // seconds; otherwise every start would flash "no sound".
-            mic_alive: true,
-            sessions: 0,
-        }
-    }
-}
-
-/// An application that is currently recording (a `Stream/Input/Audio` node).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppStream {
-    pub id: u32,
-    pub serial: Option<String>,
-    /// `application.name`, falling back to `node.name`.
-    pub app: String,
-    /// `media.name` (what the app calls the stream), may be empty.
-    pub media: String,
-    /// Whether the stream's `target.object` currently points at us.
-    pub routed: bool,
 }
 
 /// Session-manager state we read back from the `default` metadata object.
@@ -186,119 +126,6 @@ impl Routing {
     }
 }
 
-/// A selectable microphone (any `Audio/Source` node that isn't ours).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceInfo {
-    pub id: u32,
-    pub serial: Option<String>,
-    pub name: String,
-    pub description: String,
-}
-
-/// The test bench: record a few seconds of the raw microphone, or replay a
-/// clip in place of the microphone. A replayed clip goes through the whole
-/// chain to "Hear myself" only; the virtual microphone carries silence
-/// meanwhile, so nobody in a call ever hears a recording.
-pub struct Bench {
-    /// The clip replayed instead of the microphone, looped.
-    play: arc_swap::ArcSwapOption<Vec<f32>>,
-    /// Samples still to record; the capture callback counts it down.
-    record_left: AtomicUsize,
-    record_total: AtomicUsize,
-    /// Pre-sized, so the realtime side never allocates. Only the capture
-    /// callback touches it while `record_left` is above zero.
-    recording: Mutex<Vec<f32>>,
-}
-
-impl Bench {
-    /// Longest recording, in seconds.
-    pub const MAX_SECONDS: usize = 20;
-
-    fn new(rate: u32) -> Self {
-        Self {
-            play: arc_swap::ArcSwapOption::empty(),
-            record_left: AtomicUsize::new(0),
-            record_total: AtomicUsize::new(0),
-            recording: Mutex::new(Vec::with_capacity(rate as usize * Self::MAX_SECONDS)),
-        }
-    }
-
-    /// Start recording `samples` of the raw microphone.
-    pub fn record(&self, samples: usize) {
-        self.record_left.store(0, Ordering::SeqCst);
-        if let Ok(mut buf) = self.recording.lock() {
-            buf.clear();
-            let samples = samples.min(buf.capacity());
-            self.record_total.store(samples, Ordering::SeqCst);
-            self.record_left.store(samples, Ordering::SeqCst);
-        }
-    }
-
-    /// 0..1 while recording, `None` when idle.
-    pub fn record_progress(&self) -> Option<f32> {
-        let total = self.record_total.load(Ordering::Relaxed);
-        let left = self.record_left.load(Ordering::Relaxed);
-        (total > 0).then(|| 1.0 - left as f32 / total as f32)
-    }
-
-    /// The finished recording, once; `None` while recording or when idle.
-    pub fn take_recording(&self) -> Option<Vec<f32>> {
-        if self.record_total.load(Ordering::SeqCst) == 0
-            || self.record_left.load(Ordering::SeqCst) > 0
-        {
-            return None;
-        }
-        let mut buf = self.recording.lock().ok()?;
-        self.record_total.store(0, Ordering::SeqCst);
-        let capacity = buf.capacity();
-        Some(std::mem::replace(&mut *buf, Vec::with_capacity(capacity)))
-    }
-
-    /// Replay `clip` in place of the microphone (`None` = back to live).
-    pub fn play(&self, clip: Option<Arc<Vec<f32>>>) {
-        self.play.store(clip.filter(|c| !c.is_empty()));
-    }
-
-    pub fn playing(&self) -> bool {
-        self.play.load().is_some()
-    }
-
-    /// Realtime: keep what the microphone delivered, if a recording runs.
-    fn capture(&self, block: &[f32]) {
-        let left = self.record_left.load(Ordering::Relaxed);
-        if left == 0 {
-            return;
-        }
-        // Uncontended: the other side only locks once `record_left` is zero.
-        if let Ok(mut buf) = self.recording.try_lock() {
-            let take = left.min(block.len()).min(buf.capacity() - buf.len());
-            buf.extend_from_slice(&block[..take]);
-            let rest = if take < block.len() { 0 } else { left - take };
-            self.record_left.store(rest, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Counters the realtime callbacks bump; read from anywhere.
-#[derive(Default)]
-pub struct Stats {
-    pub capture_callbacks: AtomicU64,
-    pub output_callbacks: AtomicU64,
-    /// Output callbacks that found too little captured audio and emitted silence.
-    pub underruns: AtomicU64,
-    /// Captured frames dropped to keep latency bounded. Grows while nobody is
-    /// listening to the virtual mic (the source node is suspended), so it is
-    /// informational rather than an error.
-    pub trimmed_frames: AtomicU64,
-    /// Longest and (exponentially averaged) typical time spent processing one
-    /// capture callback, in microseconds. Compare with the quantum period.
-    pub process_max_us: AtomicU64,
-    pub process_avg_us: AtomicU64,
-    /// Capture callbacks skipped because the pipeline was busy elsewhere
-    /// (only while a session is being torn down).
-    pub skipped_callbacks: AtomicU64,
-}
-
 pub struct AudioThread {
     sender: pw::channel::Sender<Command>,
     thread: Option<JoinHandle<Result<()>>>,
@@ -306,6 +133,9 @@ pub struct AudioThread {
     #[cfg(feature = "ai")]
     pub ai_status: Arc<vc_core::ai::AiStatus>,
     devices: Arc<Mutex<Vec<DeviceInfo>>>,
+    outputs: Arc<Mutex<Vec<DeviceInfo>>>,
+    /// The output "Hear myself" plays on (`None` = system default).
+    output_target: Arc<Mutex<Option<String>>>,
     /// The microphone the user asked for (`None` = system default).
     capture_target: Arc<Mutex<Option<String>>>,
     /// The microphone actually in use right now: differs from the preferred
@@ -332,6 +162,8 @@ impl AudioThread {
         ensure_init();
         let (sender, receiver) = pw::channel::channel::<Command>();
         let devices = Arc::new(Mutex::new(Vec::new()));
+        let outputs = Arc::new(Mutex::new(Vec::new()));
+        let output_target = Arc::new(Mutex::new(config.output_target.clone()));
         let capture_target = Arc::new(Mutex::new(config.capture_target.clone()));
         let active_target = Arc::new(Mutex::new(config.capture_target.clone()));
         let monitor_on = Arc::new(AtomicBool::new(false));
@@ -353,6 +185,8 @@ impl AudioThread {
             stats: stats.clone(),
             meters: meters.clone(),
             devices: devices.clone(),
+            outputs: outputs.clone(),
+            output_target: output_target.clone(),
             capture_target: capture_target.clone(),
             active_target: active_target.clone(),
             monitor_on: monitor_on.clone(),
@@ -379,6 +213,8 @@ impl AudioThread {
             #[cfg(feature = "ai")]
             ai_status,
             devices,
+            outputs,
+            output_target,
             capture_target,
             active_target,
             monitor_on,
@@ -449,6 +285,23 @@ impl AudioThread {
         self.devices.lock().map(|d| d.clone()).unwrap_or_default()
     }
 
+    /// Output devices currently present in the graph.
+    pub fn output_devices(&self) -> Vec<DeviceInfo> {
+        self.outputs.lock().map(|d| d.clone()).unwrap_or_default()
+    }
+
+    /// `node.name` of the output "Hear myself" plays on; `None` = system default.
+    pub fn output_target(&self) -> Option<String> {
+        self.output_target.lock().ok().and_then(|t| t.clone())
+    }
+
+    pub fn set_output_target(&self, target: Option<String>) {
+        if let Ok(mut t) = self.output_target.lock() {
+            *t = target;
+        }
+        let _ = self.sender.send(Command::OutputTargetChanged);
+    }
+
     /// `node.name` of the microphone the user chose; `None` = system default.
     pub fn capture_target(&self) -> Option<String> {
         self.capture_target.lock().ok().and_then(|t| t.clone())
@@ -491,115 +344,16 @@ impl AudioThread {
 /// the virtual-mic ring (and the monitor ring when enabled). Processing
 /// lives here so it keeps running even when nobody is listening to the mic.
 struct CaptureData {
-    to_source: rtrb::Producer<f32>,
-    to_monitor: rtrb::Producer<f32>,
-    monitor_on: Arc<AtomicBool>,
     format: spa::param::audio::AudioInfoRaw,
     /// Picks the live channel(s) of a stereo input (see `fold.rs`).
     fold: StereoFold,
     left: Vec<f32>,
     right: Vec<f32>,
-    /// Shared with the thread so it survives a reconnect. Only this callback
-    /// ever locks it while a session runs; `try_lock` keeps the RT path free
-    /// of blocking.
-    pipeline: Arc<Mutex<Pipeline>>,
     scratch: Vec<f32>,
-    input_wav: Option<Arc<Vec<f32>>>,
-    wav_pos: usize,
-    bench: Arc<Bench>,
-    bench_pos: usize,
-    stats: Arc<Stats>,
-    meters: Arc<Meters>,
-}
-
-/// A playback-side callback that drains a ring: used for both the virtual
-/// mic and the monitor.
-struct SinkData {
-    consumer: rtrb::Consumer<f32>,
-    /// Interleaved channels of the stream; the mono voice goes to all of them.
-    channels: usize,
-    /// Keep roughly this many frames queued so a late producer doesn't
-    /// starve us; trim anything beyond 2x it. Grows by one quantum on every
-    /// underrun (up to `max_slack`), trading a little latency for
-    /// silence-free output, and shrinks back after a calm stretch.
-    target_slack: usize,
-    min_slack: usize,
-    quantum: usize,
-    max_slack: usize,
-    /// Frames delivered since the last underrun; `relax_after` of them
-    /// without one take a quantum of slack back.
-    calm_frames: usize,
-    relax_after: usize,
-    /// Output silence until the queue holds a block plus the slack, so the
-    /// capture/output callback order within a cycle can't starve us.
-    primed: bool,
-    /// Frames of fade-in still to apply after a gap or a trim, so the voice
-    /// comes back without a click.
-    fade_left: usize,
-    /// Set from the main thread to throw away whatever is queued (the monitor
-    /// was just switched on: what the ring holds is stale).
-    flush: Arc<AtomicBool>,
-    stats: Arc<Stats>,
-    count_callbacks: bool,
-    /// Set for a stream that plays on another device's clock (the monitor):
-    /// the fill level is steered by stretching blocks by one sample.
-    drift: Option<Slip>,
-    /// Samples popped from the ring for this block (one more than a block
-    /// when catching up), and the block as it will be played.
-    staging: Vec<f32>,
-    block: Vec<f32>,
-}
-
-/// Length of the fade-in after a discontinuity (about 2.7 ms at 48 kHz).
-const FADE_FRAMES: usize = 128;
-
-impl SinkData {
-    fn new(
-        consumer: rtrb::Consumer<f32>,
-        channels: usize,
-        config: &AudioConfig,
-        stats: Arc<Stats>,
-        count_callbacks: bool,
-        own_clock: bool,
-    ) -> Self {
-        let quantum = (config.quantum as usize).max(64);
-        // In our own scheduling group the producer and this reader run once
-        // each per cycle, so nothing needs to be held back (an unlucky
-        // callback order shows up as one underrun and adds a quantum). On
-        // another clock a quantum of cushion absorbs the two devices' jitter.
-        let slack = if own_clock { quantum } else { 0 };
-        Self {
-            consumer,
-            channels: channels.max(1),
-            target_slack: slack,
-            min_slack: slack,
-            quantum,
-            max_slack: quantum * 4,
-            calm_frames: 0,
-            relax_after: config.rate as usize * 30,
-            primed: false,
-            fade_left: 0,
-            flush: Arc::new(AtomicBool::new(false)),
-            stats,
-            count_callbacks,
-            drift: own_clock.then(Slip::default),
-            staging: vec![0.0; MAX_BLOCK + 1],
-            block: vec![0.0; MAX_BLOCK],
-        }
-    }
-
-    /// Drop `frames` queued frames.
-    fn discard(&mut self, frames: usize) {
-        if let Ok(chunk) = self.consumer.read_chunk(frames.min(self.consumer.slots())) {
-            chunk.commit_all();
-        }
-    }
+    proc: Processor,
 }
 
 fn drain_into(stream: &pw::stream::Stream, data: &mut SinkData) {
-    if data.count_callbacks {
-        data.stats.output_callbacks.fetch_add(1, Ordering::Relaxed);
-    }
     let Some(mut buffer) = stream.dequeue_buffer() else {
         return;
     };
@@ -613,82 +367,12 @@ fn drain_into(stream: &pw::stream::Stream, data: &mut SinkData) {
         requested.min(max_frames)
     } else {
         max_frames
-    };
-
-    if data.flush.swap(false, Ordering::Relaxed) {
-        data.discard(usize::MAX);
-        data.primed = false;
     }
-    let available = data.consumer.slots();
-    let max_queue = n + 2 * data.target_slack;
-    if available > max_queue {
-        // Too much queued (nobody was reading, or the slack just shrank):
-        // skip ahead to keep the delay bounded, and fade back in over the cut.
-        let excess = available - max_queue;
-        data.discard(excess);
-        data.fade_left = FADE_FRAMES;
-        data.stats
-            .trimmed_frames
-            .fetch_add(excess as u64, Ordering::Relaxed);
-    }
-    if !data.primed {
-        data.primed = data.consumer.slots() >= n + data.target_slack;
-        if data.primed {
-            data.fade_left = FADE_FRAMES;
-        }
-    }
-    let have = data.primed && data.consumer.slots() >= n;
-    if data.primed && !have {
-        data.primed = false;
-        data.calm_frames = 0;
-        if data.target_slack < data.max_slack {
-            data.target_slack += data.quantum;
-        }
-        if data.count_callbacks {
-            // Counted only: the window shows dropouts, and logging (which
-            // allocates and takes a lock) does not belong on the RT thread.
-            data.stats.underruns.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    if have {
-        data.calm_frames += n;
-        if data.calm_frames >= data.relax_after {
-            data.calm_frames = 0;
-            if data.target_slack > data.min_slack {
-                data.target_slack -= data.quantum.min(data.target_slack - data.min_slack);
-            }
-        }
-    }
-    // Fetch the block: straight from the ring, or one sample more or fewer
-    // stretched to fit when this stream follows another clock.
-    let n = n.min(MAX_BLOCK);
-    if have && n > 0 {
-        let available = data.consumer.slots();
-        let take = match &data.drift {
-            Some(_) => Slip::take(available, n, n + data.target_slack, data.quantum / 2),
-            None => n,
-        }
-        .min(available);
-        for staged in data.staging[..take].iter_mut() {
-            *staged = data.consumer.pop().unwrap_or(0.0);
-        }
-        match data.drift.as_mut() {
-            Some(slip) => slip.stretch(&data.staging[..take], &mut data.block[..n]),
-            None => data.block[..n].copy_from_slice(&data.staging[..n]),
-        }
-    }
+    .min(MAX_BLOCK);
+    data.render(n);
     let frames = bytes.as_chunks_mut::<SAMPLE_BYTES>().0;
-    for (frame, &sample) in frames
-        .chunks_exact_mut(data.channels)
-        .take(n)
-        .zip(&data.block)
-    {
-        let mut s = if have { sample } else { 0.0 };
-        if data.fade_left > 0 && have {
-            s *= 1.0 - data.fade_left as f32 / FADE_FRAMES as f32;
-            data.fade_left -= 1;
-        }
-        let le = s.to_le_bytes();
+    for (frame, &sample) in frames.chunks_exact_mut(data.channels).zip(&data.block[..n]) {
+        let le = sample.to_le_bytes();
         for dst in frame {
             *dst = le;
         }
@@ -699,31 +383,6 @@ fn drain_into(stream: &pw::stream::Stream, data: &mut SinkData) {
     *chunk.size_mut() = (n * frame_bytes) as u32;
 }
 
-/// Flush denormal numbers to zero on this thread. Filters and reverb tails
-/// decaying into silence otherwise produce denormals, which are up to a
-/// hundred times slower to compute and show up as dropouts after you stop
-/// talking.
-#[inline]
-fn no_denormals() {
-    #[cfg(target_arch = "x86_64")]
-    #[allow(deprecated)]
-    // SAFETY: SSE is part of the x86_64 baseline; setting FTZ (bit 15) and
-    // DAZ (bit 6) only changes how this thread rounds denormal floats.
-    unsafe {
-        use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
-        _mm_setcsr(_mm_getcsr() | 0x8040);
-    }
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: sets the FZ bit (24) of this thread's floating-point control
-    // register; no memory is touched.
-    unsafe {
-        let mut fpcr: u64;
-        std::arch::asm!("mrs {}, fpcr", out(reg) fpcr);
-        fpcr |= 1 << 24;
-        std::arch::asm!("msr fpcr, {}", in(reg) fpcr);
-    }
-}
-
 /// Everything a session needs, owned by the thread for its whole life.
 struct LoopContext {
     config: AudioConfig,
@@ -731,6 +390,8 @@ struct LoopContext {
     stats: Arc<Stats>,
     meters: Arc<Meters>,
     devices: Arc<Mutex<Vec<DeviceInfo>>>,
+    outputs: Arc<Mutex<Vec<DeviceInfo>>>,
+    output_target: Arc<Mutex<Option<String>>>,
     capture_target: Arc<Mutex<Option<String>>>,
     active_target: Arc<Mutex<Option<String>>>,
     monitor_on: Arc<AtomicBool>,
@@ -843,6 +504,9 @@ fn run_session(
     if let Ok(mut d) = ctx.devices.lock() {
         d.clear();
     }
+    if let Ok(mut d) = ctx.outputs.lock() {
+        d.clear();
+    }
     if let Ok(mut a) = ctx.app_streams.lock() {
         a.clear();
     }
@@ -943,6 +607,11 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
     let config = &ctx.config;
     let stats = ctx.stats.clone();
     let devices = ctx.devices.clone();
+    let outputs = ctx.outputs.clone();
+    let output_target = ctx.output_target.clone();
+    // The monitor node (a new one each time the stream connects) that has
+    // been pointed at the chosen output.
+    let monitor_placed: Rc<Cell<u32>> = Rc::new(Cell::new(u32::MAX));
     let capture_target = ctx.capture_target.clone();
     let active_target = ctx.active_target.clone();
     let app_streams = ctx.app_streams.clone();
@@ -1068,21 +737,23 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
         .context("create capture stream")?;
     let capture_listener = capture
         .add_local_listener_with_user_data(CaptureData {
-            to_source,
-            to_monitor,
-            monitor_on: ctx.monitor_on.clone(),
             format: Default::default(),
             fold: StereoFold::new(config.rate as f32),
             left: vec![0.0; MAX_BLOCK],
             right: vec![0.0; MAX_BLOCK],
-            pipeline: ctx.pipeline.clone(),
             scratch: vec![0.0; MAX_BLOCK],
-            input_wav: config.input_wav.clone(),
-            wav_pos: 0,
-            bench: ctx.bench.clone(),
-            bench_pos: 0,
-            stats: stats.clone(),
-            meters: ctx.meters.clone(),
+            proc: Processor {
+                to_source: Some(to_source),
+                to_monitor,
+                monitor_on: ctx.monitor_on.clone(),
+                pipeline: ctx.pipeline.clone(),
+                input_wav: config.input_wav.clone(),
+                wav_pos: 0,
+                bench: ctx.bench.clone(),
+                bench_pos: 0,
+                stats: stats.clone(),
+                meters: ctx.meters.clone(),
+            },
         })
         .state_changed({
             let lose = lose.clone();
@@ -1117,7 +788,10 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
         })
         .process(|stream, data| {
             no_denormals();
-            data.stats.capture_callbacks.fetch_add(1, Ordering::Relaxed);
+            data.proc
+                .stats
+                .capture_callbacks
+                .fetch_add(1, Ordering::Relaxed);
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -1152,57 +826,7 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
                     *out = acc / channels as f32;
                 }
             }
-            if let Some(wav) = &data.input_wav
-                && !wav.is_empty()
-            {
-                for out in scratch.iter_mut() {
-                    *out = wav[data.wav_pos];
-                    data.wav_pos = (data.wav_pos + 1) % wav.len();
-                }
-            }
-
-            // Test bench: keep the raw microphone if a recording runs, and
-            // replay a clip in its place if one is playing.
-            data.bench.capture(scratch);
-            let bench_clip = data.bench.play.load();
-            let benching = bench_clip.is_some();
-            if let Some(clip) = bench_clip.as_ref() {
-                for out in scratch.iter_mut() {
-                    data.bench_pos %= clip.len();
-                    *out = clip[data.bench_pos];
-                    data.bench_pos += 1;
-                }
-            }
-            drop(bench_clip);
-
-            // Uncontended except for the instant a session is torn down.
-            let Ok(mut pipeline) = data.pipeline.try_lock() else {
-                data.stats.skipped_callbacks.fetch_add(1, Ordering::Relaxed);
-                return;
-            };
-            let started = std::time::Instant::now();
-            pipeline.process(scratch);
-            let us = started.elapsed().as_micros() as u64;
-            data.stats.process_max_us.fetch_max(us, Ordering::Relaxed);
-            let avg = data.stats.process_avg_us.load(Ordering::Relaxed);
-            data.stats
-                .process_avg_us
-                .store((avg * 15 + us) / 16, Ordering::Relaxed);
-            let (i, o) = pipeline.peaks();
-            data.meters.publish(i, o, pipeline.engine.vad() > 0.5);
-            data.meters.publish_auto_gain(pipeline.auto_gain_db());
-            drop(pipeline);
-
-            // The monitor stream only exists while "Hear myself" is on.
-            if data.monitor_on.load(Ordering::Relaxed) {
-                push_all(&mut data.to_monitor, scratch, None);
-            }
-            // A bench clip is for the user's ears only: the virtual
-            // microphone carries silence while one plays.
-            if benching {
-                scratch.fill(0.0);
-            }
-            push_all(&mut data.to_source, scratch, Some(&data.stats));
+            data.proc.process(scratch);
         })
         .register()
         .context("register capture listener")?;
@@ -1251,7 +875,7 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
     // Stereo with the voice on both channels, so it is in both ears and in
     // the front pair of a surround output whatever the graph's up-mix
     // settings are.
-    let mut mon_props = properties! {
+    let mon_props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Playback",
         *pw::keys::MEDIA_ROLE => "Music",
@@ -1267,9 +891,6 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
         // absorbs the drift between the two itself (see `slip.rs`).
         "node.link-group" => group.as_str(),
     };
-    if let Some(target) = &config.monitor_target {
-        mon_props.insert(*pw::keys::TARGET_OBJECT, target.as_str());
-    }
     let monitor = pw::stream::StreamRc::new(core.clone(), "Voice Changer monitor", mon_props)
         .context("create monitor stream")?;
     let monitor_data = SinkData::new(from_capture_mon, 2, config, stats.clone(), false, true);
@@ -1327,6 +948,8 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
         .add_listener_local()
         .global({
             let devices = devices.clone();
+            let outputs = outputs.clone();
+            let monitor_placed = monitor_placed.clone();
             let app_streams = app_streams.clone();
             let routing = routing.clone();
             let metadata = metadata.clone();
@@ -1345,7 +968,17 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
             let take_over_pending = take_over_pending.clone();
             move |global| match global.type_ {
                 ObjectType::Node => {
-                    if let Some(dev) = device_from_global(global) {
+                    if let Some(dev) = device_from_global(global)
+                        && dev.output
+                    {
+                        if let Ok(mut list) = outputs.lock() {
+                            list.retain(|d| d.id != dev.id);
+                            list.push(dev);
+                            list.sort_by(|a, b| a.description.cmp(&b.description));
+                        }
+                        // The chosen output (re)appeared: send the monitor there.
+                        monitor_placed.set(u32::MAX);
+                    } else if let Some(dev) = device_from_global(global) {
                         let name = dev.name.clone();
                         if let Ok(mut list) = devices.lock() {
                             list.retain(|d| d.id != dev.id);
@@ -1499,6 +1132,7 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
         })
         .global_remove({
             let devices = devices.clone();
+            let outputs = outputs.clone();
             let app_streams = app_streams.clone();
             let routing = routing.clone();
             let listener_links = listener_links.clone();
@@ -1513,6 +1147,9 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
                     && let Some(pos) = list.iter().position(|d| d.id == id)
                 {
                     unplugged = Some(list.remove(pos));
+                }
+                if let Ok(mut list) = outputs.lock() {
+                    list.retain(|d| d.id != id);
                 }
                 if let Ok(mut list) = app_streams.lock() {
                     list.retain(|a| a.id != id);
@@ -1563,6 +1200,8 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
         let metadata = metadata.clone();
         let capture = capture.clone();
         let monitor = monitor.clone();
+        let monitor_placed = monitor_placed.clone();
+        let monitor_flush = monitor_flush.clone();
         let routing = routing.clone();
         let source_name = source_name.clone();
         let capture_target = capture_target.clone();
@@ -1650,6 +1289,14 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
             }
             Command::SetMonitor(on) => {
                 set_monitor_stream(&monitor, on, rate, &monitor_flush);
+                // A reconnected stream is a new node (often with the old
+                // id): it has to be placed again.
+                monitor_placed.set(u32::MAX);
+            }
+            Command::OutputTargetChanged => {
+                // The shared value is already updated; the half-second
+                // timer moves the stream.
+                monitor_placed.set(u32::MAX);
             }
         });
         *receiver_slot.borrow_mut() = Some(handler);
@@ -1722,7 +1369,24 @@ fn build_session(ctx: &LoopContext) -> Result<Session> {
         let quit_loop = mainloop.clone();
         let quit_ticks = Cell::new(0u32);
         let metadata_ticks = Cell::new(0u32);
+        let monitor = monitor.clone();
+        let monitor_flush = monitor_flush.clone();
+        let outputs = outputs.clone();
         let timer = mainloop.loop_().add_timer(move |_| {
+            // "Hear myself" goes to the chosen output. Its node is new on
+            // every connect, so it is placed here once the node exists.
+            let node = monitor.node_id();
+            if node != u32::MAX
+                && monitor_placed.get() != node
+                && let Some(md) = metadata.borrow().as_ref()
+            {
+                let want = output_target.lock().ok().and_then(|t| t.clone());
+                if place_monitor(md, node, &outputs, want.as_deref()) {
+                    monitor_placed.set(node);
+                    // What was queued while it sat on the default output.
+                    monitor_flush.store(true, Ordering::Relaxed);
+                }
+            }
             // A quit whose round trip never came back.
             if matches!(*end.borrow(), Some(SessionEnd::Quit)) {
                 quit_ticks.set(quit_ticks.get() + 1);
@@ -1949,23 +1613,6 @@ fn set_unity_volume(node: &pw::node::Node) {
             }
         }
         Err(e) => log::debug!("could not build the volume pod: {e:?}"),
-    }
-}
-
-/// Queue a block for one of the sink callbacks. A full ring (nobody has been
-/// reading for a second) drops the block; the reader trims anyway.
-fn push_all(ring: &mut rtrb::Producer<f32>, block: &[f32], stats: Option<&Stats>) {
-    match ring.write_chunk_uninit(block.len()) {
-        Ok(chunk) => {
-            chunk.fill_from_iter(block.iter().copied());
-        }
-        Err(_) => {
-            if let Some(stats) = stats {
-                stats
-                    .trimmed_frames
-                    .fetch_add(block.len() as u64, Ordering::Relaxed);
-            }
-        }
     }
 }
 
@@ -2329,9 +1976,11 @@ mod saved_default {
 fn device_from_global(global: &GlobalObject<&spa::utils::dict::DictRef>) -> Option<DeviceInfo> {
     let props = global.props.as_ref()?;
     let class = props.get("media.class")?;
-    if class != "Audio/Source" && class != "Audio/Source/Virtual" {
-        return None;
-    }
+    let output = match class {
+        "Audio/Source" | "Audio/Source/Virtual" => false,
+        "Audio/Sink" => true,
+        _ => return None,
+    };
     let name = props.get("node.name")?.to_string();
     if name.starts_with("voice_changer") || name.starts_with("vc_") {
         return None;
@@ -2342,6 +1991,7 @@ fn device_from_global(global: &GlobalObject<&spa::utils::dict::DictRef>) -> Opti
         .unwrap_or(&name)
         .to_string();
     Some(DeviceInfo {
+        output,
         id: global.id,
         serial: props.get("object.serial").map(str::to_string),
         name,
@@ -2397,6 +2047,35 @@ fn retarget_capture(
                 }
                 None => log::warn!("unknown microphone {name:?}; keeping current target"),
             }
+        }
+    }
+}
+
+/// Point the "Hear myself" stream at an output by name (so it finds the
+/// device again after a replug), or back at the system default. Returns
+/// false while a chosen output is not present; the session manager plays on
+/// the default meanwhile.
+fn place_monitor(
+    metadata: &pw::metadata::Metadata,
+    node: u32,
+    outputs: &Mutex<Vec<DeviceInfo>>,
+    target: Option<&str>,
+) -> bool {
+    match target {
+        None => {
+            metadata.set_property(node, "target.object", None, None);
+            true
+        }
+        Some(name) => {
+            let present = outputs
+                .lock()
+                .map(|l| l.iter().any(|d| d.name == name))
+                .unwrap_or(false);
+            if present {
+                metadata.set_property(node, "target.object", Some("Spa:String"), Some(name));
+                log::info!("hear myself plays on {name}");
+            }
+            present
         }
     }
 }

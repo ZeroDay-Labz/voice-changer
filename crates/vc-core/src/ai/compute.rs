@@ -33,26 +33,35 @@ pub fn gpus_if_probed() -> Option<Vec<GpuInfo>> {
 pub struct GpuInfo {
     pub index: i32,
     pub name: String,
-    /// "ROCm" or "CUDA".
+    /// "ROCm", "CUDA" or "DirectML".
     pub api: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Cpu,
-    Rocm { device: i32 },
-    Cuda { device: i32 },
+    Rocm {
+        device: i32,
+    },
+    Cuda {
+        device: i32,
+    },
+    /// Windows: any graphics card through DirectML.
+    DirectMl {
+        device: i32,
+    },
 }
 
 impl Backend {
     pub fn label(self, gpus: &[GpuInfo]) -> String {
         match self {
             Backend::Cpu => "CPU".into(),
-            Backend::Rocm { device } | Backend::Cuda { device } => gpus
-                .iter()
-                .find(|g| g.index == device)
-                .map(|g| format!("GPU {} ({})", g.index, g.name))
-                .unwrap_or_else(|| format!("GPU {device} ({})", self.api())),
+            Backend::Rocm { device } | Backend::Cuda { device } | Backend::DirectMl { device } => {
+                gpus.iter()
+                    .find(|g| g.index == device)
+                    .map(|g| format!("GPU {} ({})", g.index, g.name))
+                    .unwrap_or_else(|| format!("GPU {device} ({})", self.api()))
+            }
         }
     }
 
@@ -61,13 +70,16 @@ impl Backend {
             Backend::Cpu => "CPU",
             Backend::Rocm { .. } => "ROCm",
             Backend::Cuda { .. } => "CUDA",
+            Backend::DirectMl { .. } => "DirectML",
         }
     }
 
     pub fn device(self) -> Option<i32> {
         match self {
             Backend::Cpu => None,
-            Backend::Rocm { device } | Backend::Cuda { device } => Some(device),
+            Backend::Rocm { device } | Backend::Cuda { device } | Backend::DirectMl { device } => {
+                Some(device)
+            }
         }
     }
 }
@@ -78,9 +90,12 @@ pub enum RuntimeKind {
     Cpu,
     Rocm,
     Cuda,
+    /// Microsoft's DirectML build (Windows); also runs on the processor.
+    DirectMl,
 }
 
-/// The setting string stored in the parameters: "auto", "cpu", "rocm:N", "cuda:N".
+/// The setting string stored in the parameters: "auto", "cpu", "rocm:N",
+/// "cuda:N", "dml:N".
 pub fn parse_setting(s: &str) -> Option<Backend> {
     match s.trim() {
         "" | "auto" => None,
@@ -90,6 +105,8 @@ pub fn parse_setting(s: &str) -> Option<Backend> {
                 n.parse().ok().map(|device| Backend::Rocm { device })
             } else if let Some(n) = other.strip_prefix("cuda:") {
                 n.parse().ok().map(|device| Backend::Cuda { device })
+            } else if let Some(n) = other.strip_prefix("dml:") {
+                n.parse().ok().map(|device| Backend::DirectMl { device })
             } else {
                 None
             }
@@ -103,6 +120,7 @@ pub fn setting_string(b: Option<Backend>) -> String {
         Some(Backend::Cpu) => "cpu".into(),
         Some(Backend::Rocm { device }) => format!("rocm:{device}"),
         Some(Backend::Cuda { device }) => format!("cuda:{device}"),
+        Some(Backend::DirectMl { device }) => format!("dml:{device}"),
     }
 }
 
@@ -293,6 +311,14 @@ pub fn gpu_runtime_available() -> bool {
 /// The highest-versioned `libonnxruntime.so*` in `dir`, comparing version
 /// numbers numerically (a plain string sort puts `so.1.9` after `so.1.22`).
 /// Libraries older than the API this build was compiled against are skipped.
+/// The runtime library in `dir`, if there is one.
+#[cfg(windows)]
+fn newest_lib(dir: &std::path::Path) -> Option<PathBuf> {
+    let p = dir.join("onnxruntime.dll");
+    p.is_file().then_some(p)
+}
+
+#[cfg(not(windows))]
 fn newest_lib(dir: &std::path::Path) -> Option<PathBuf> {
     let mut libs: Vec<(Vec<u32>, PathBuf)> = std::fs::read_dir(dir)
         .ok()?
@@ -337,14 +363,21 @@ pub fn cpu_runtime_lib() -> Option<PathBuf> {
     {
         dirs.push(exe_dir);
     }
-    dirs.push("/usr/lib64/voice-changer".into());
-    dirs.push("/usr/lib/voice-changer".into());
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(PathBuf::from(home).join(".local/lib/voice-changer"));
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        dirs.push(PathBuf::from(local).join("voice-changer"));
     }
-    dirs.push("/usr/lib64".into());
-    dirs.push("/usr/lib/x86_64-linux-gnu".into());
-    dirs.push("/usr/lib".into());
+    #[cfg(not(windows))]
+    {
+        dirs.push("/usr/lib64/voice-changer".into());
+        dirs.push("/usr/lib/voice-changer".into());
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(PathBuf::from(home).join(".local/lib/voice-changer"));
+        }
+        dirs.push("/usr/lib64".into());
+        dirs.push("/usr/lib/x86_64-linux-gnu".into());
+        dirs.push("/usr/lib".into());
+    }
     dirs.iter().find_map(|d| newest_lib(d))
 }
 
@@ -370,7 +403,17 @@ pub fn runtime_lib() -> Option<(PathBuf, RuntimeKind)> {
                 return Some((p, RuntimeKind::Rocm));
             }
             if let Some(p) = cpu_runtime_lib() {
-                return Some((p, RuntimeKind::Cpu));
+                // Windows: the DirectML build has its helper library beside it.
+                let directml =
+                    cfg!(windows) && p.parent().is_some_and(|d| d.join("DirectML.dll").is_file());
+                return Some((
+                    p,
+                    if directml {
+                        RuntimeKind::DirectMl
+                    } else {
+                        RuntimeKind::Cpu
+                    },
+                ));
             }
             // No CPU library anywhere: the ROCm one is the only option left.
             rocm.map(|p| (p, RuntimeKind::Rocm))
@@ -404,7 +447,13 @@ pub fn runtime_description() -> String {
     match runtime_lib() {
         Some((p, RuntimeKind::Cuda)) => format!("ONNX Runtime with CUDA: {}", p.display()),
         Some((p, RuntimeKind::Rocm)) => format!("ONNX Runtime with ROCm: {}", p.display()),
+        Some((p, RuntimeKind::DirectMl)) => {
+            format!("ONNX Runtime with DirectML: {}", p.display())
+        }
         Some((p, RuntimeKind::Cpu)) => format!("ONNX Runtime (CPU): {}", p.display()),
+        None if cfg!(windows) => {
+            "ONNX Runtime not found: onnxruntime.dll must sit next to voice-changer.exe".to_string()
+        }
         None => "ONNX Runtime not found: install onnxruntime or onnxruntime-rocm".to_string(),
     }
 }
@@ -422,8 +471,14 @@ pub fn gpu_note() -> Option<String> {
     if let Some(why) = gpu_failure() {
         return Some(why);
     }
+    if runtime_kind() == RuntimeKind::DirectMl {
+        return Some("The graphics card (DirectML) is experimental on Windows: Auto uses the processor. Pick the graphics card to try it; if it cannot run the voice, the processor takes over.".into());
+    }
     if !gpus().is_empty() {
         return None;
+    }
+    if cfg!(windows) {
+        return Some("The AI runs on the processor.".into());
     }
     if !cfg!(feature = "gpu") {
         return Some("GPU support needs the gpu build.".into());
@@ -444,6 +499,11 @@ pub fn gpus() -> Vec<GpuInfo> {
         RuntimeKind::Cuda => nvidia_gpus(),
         RuntimeKind::Cpu => Vec::new(),
         RuntimeKind::Rocm => rocm_gpus(),
+        RuntimeKind::DirectMl => vec![GpuInfo {
+            index: 0,
+            name: "Graphics card".into(),
+            api: "DirectML",
+        }],
     })
     .clone()
 }
@@ -522,6 +582,10 @@ pub fn resolve(setting: &str) -> Backend {
     if gpu_failure().is_some() {
         return Backend::Cpu;
     }
+    // DirectML is opt-in: Auto never picks it (see `gpu_note`).
+    if runtime_kind() == RuntimeKind::DirectMl && parse_setting(setting).is_none() {
+        return Backend::Cpu;
+    }
     match parse_setting(setting) {
         Some(b) => b,
         None => match (runtime_kind(), gpus().first()) {
@@ -529,5 +593,63 @@ pub fn resolve(setting: &str) -> Backend {
             (RuntimeKind::Rocm, Some(g)) => Backend::Rocm { device: g.index },
             _ => Backend::Cpu,
         },
+    }
+}
+
+/// DirectML runs inside the graphics driver, where a failure can take the
+/// whole program down instead of returning an error. A marker file is
+/// written before the first voice is loaded on it and removed once that
+/// worked; finding the marker at the next start means the last attempt
+/// crashed, and the graphics card is left alone from then on.
+fn directml_marker() -> Option<PathBuf> {
+    crate::presets::config_dir().map(|d| d.join("directml-trying"))
+}
+
+/// Call before loading models on DirectML. Returns false when the last
+/// attempt never finished (it crashed): the caller must use the processor.
+pub fn directml_begin() -> bool {
+    let Some(marker) = directml_marker() else {
+        return true;
+    };
+    if marker.exists() {
+        mark_gpu_failed("the graphics card crashed the AI last time");
+        return false;
+    }
+    if let Some(dir) = marker.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&marker, b"");
+    true
+}
+
+/// The models loaded and ran: the graphics card is fine.
+pub fn directml_ok() {
+    if let Some(marker) = directml_marker() {
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
+/// Let the user try the graphics card again after a crash (picking it in
+/// the Compute list calls this).
+pub fn directml_forget_crash() {
+    directml_ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setting_strings_round_trip() {
+        for b in [
+            None,
+            Some(Backend::Cpu),
+            Some(Backend::Rocm { device: 1 }),
+            Some(Backend::Cuda { device: 0 }),
+            Some(Backend::DirectMl { device: 0 }),
+        ] {
+            assert_eq!(parse_setting(&setting_string(b)), b);
+        }
+        assert_eq!(parse_setting("nonsense"), None);
     }
 }

@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use vc_core::{Meters, Preset, VcParams};
 
+use crate::audio::{
+    AppStream, AudioConfig, AudioHealth, AudioState, AudioThread, DeviceInfo, Stats,
+};
 use crate::config::AppConfig;
-use crate::pw::{AppStream, AudioConfig, AudioHealth, AudioState, AudioThread, DeviceInfo, Stats};
 
 pub struct Shared {
     pub params: Arc<VcParams>,
@@ -29,6 +31,8 @@ pub struct Shared {
     pub configure_hotkey: AtomicBool,
     /// Hotkey task → window: human-readable current trigger ("" = unset, None = portal unavailable).
     pub hotkey_trigger: Mutex<Option<String>>,
+    /// The mute shortcut as text, when one is bound.
+    pub mute_hotkey_trigger: Mutex<Option<String>>,
     /// Name of the last preset applied (for the window and the saved state).
     pub current_preset: Mutex<Option<String>>,
     /// Test bench: the clip being recorded, the clip being replayed, and
@@ -95,6 +99,7 @@ impl Shared {
             show_window: AtomicBool::new(false),
             configure_hotkey: AtomicBool::new(false),
             hotkey_trigger: Mutex::new(None),
+            mute_hotkey_trigger: Mutex::new(None),
             current_preset: Mutex::new(None),
             bench_recording: Mutex::new(None),
             bench_playing: Mutex::new(None),
@@ -337,6 +342,15 @@ impl Shared {
     }
 
     /// Flip bypass; returns the new enabled state.
+    /// Whether the output is silenced.
+    pub fn muted(&self) -> bool {
+        self.params.mute.value()
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.set_param(&self.params.mute, muted);
+    }
+
     pub fn toggle(&self) -> bool {
         let enabled = !self.is_enabled();
         self.set_enabled(enabled);
@@ -388,6 +402,37 @@ impl Shared {
             .ok()
             .and_then(|a| a.as_ref().map(|a| a.devices()))
             .unwrap_or_default()
+    }
+
+    pub fn output_devices(&self) -> Vec<DeviceInfo> {
+        self.audio
+            .lock()
+            .ok()
+            .and_then(|a| a.as_ref().map(|a| a.output_devices()))
+            .unwrap_or_default()
+    }
+
+    /// The output the voice plays on (None = system default).
+    pub fn output_target(&self) -> Option<String> {
+        self.audio
+            .lock()
+            .ok()
+            .and_then(|a| a.as_ref().and_then(|a| a.output_target()))
+    }
+
+    /// Saved at once, so it survives a crash as well as a quit.
+    pub fn set_output_target(&self, target: Option<String>) {
+        if let Ok(a) = self.audio.lock()
+            && let Some(a) = a.as_ref()
+        {
+            a.set_output_target(target.clone());
+        }
+        if let Ok(mut c) = self.config.lock() {
+            c.output = target;
+            if let Err(e) = c.save() {
+                log::warn!("could not save config: {e}");
+            }
+        }
     }
 
     pub fn monitor(&self) -> bool {

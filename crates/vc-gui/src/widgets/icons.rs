@@ -37,6 +37,13 @@ icon_fn!(star, "star.svg");
 icon_fn!(search, "search.svg");
 icon_fn!(folder, "folder.svg");
 icon_fn!(download, "download.svg");
+icon_fn!(speaker, "speaker.svg");
+icon_fn!(mic_off, "mic-off.svg");
+icon_fn!(alert, "alert.svg");
+icon_fn!(info, "info.svg");
+icon_fn!(keyboard, "keyboard.svg");
+icon_fn!(pencil, "pencil.svg");
+icon_fn!(upload, "upload.svg");
 
 /// The app logo (full-colour).
 pub fn logo<'a>(size: f32) -> Element<'a> {

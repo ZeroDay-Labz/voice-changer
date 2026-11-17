@@ -6,10 +6,15 @@ use vc_core::{Meters, VcParams};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Capabilities {
     pub standalone: bool,
-    pub monitor: bool,
+    /// The host lets the user pick the microphone.
     pub microphone: bool,
-    pub hotkey: bool,
-    pub settings: bool,
+    /// The host lets the user pick the output device.
+    pub output: bool,
+    /// The voice can be sent to other applications as a virtual microphone.
+    pub routing: bool,
+    /// "Hear myself" can be switched on and off. False where the output
+    /// device always plays the voice.
+    pub monitor_toggle: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -137,6 +142,15 @@ pub trait Host {
         None
     }
     fn set_capture_target(&self, _target: Option<String>) {}
+    /// Output devices the voice can play on.
+    fn output_devices(&self) -> Vec<Device> {
+        Vec::new()
+    }
+    /// The chosen output; `None` = system default.
+    fn output_target(&self) -> Option<String> {
+        None
+    }
+    fn set_output_target(&self, _target: Option<String>) {}
     fn monitor(&self) -> Option<bool> {
         None
     }

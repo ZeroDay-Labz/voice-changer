@@ -14,6 +14,8 @@ default = ["gpu"]
 ai = ["vc-core/ai", "vc-gui/ai"]
 gpu = ["ai", "vc-core/gpu", "vc-gui/gpu"]
 gpu-rocm = ["gpu"]
+# Use the portable device backend (the one Windows uses) on Linux, for testing.
+backend-cpal = ["dep:cpal"]
 
 [dependencies]
 arc-swap = { workspace = true }
@@ -21,15 +23,10 @@ vc-dsp = { path = "../vc-dsp" }
 vc-core = { path = "../vc-core" }
 vc-gui = { path = "../vc-gui" }
 nice-plug = { workspace = true }
-pipewire = { workspace = true }
-libspa = { workspace = true }
 iced = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 directories = { workspace = true }
 rtrb = { workspace = true }
-ksni = { workspace = true }
-ashpd = { workspace = true }
-zbus = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
@@ -39,6 +36,31 @@ ctrlc = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 ron = { workspace = true }
+# Remote control over a local socket (Windows; Linux uses D-Bus).
+interprocess = "2.4.8"
+
+# Linux: native PipeWire (virtual microphone, routing), tray, portal hotkey,
+# D-Bus remote control.
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = { workspace = true }
+libspa = { workspace = true }
+ksni = { workspace = true }
+ashpd = { workspace = true }
+zbus = { workspace = true }
+cpal = { version = "0.18", optional = true }
+
+# Everywhere else: pick an input and an output device.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+cpal = "0.18"
+
+# Windows: tray icon, global shortcuts, start with Windows.
+[target."cfg(windows)".dependencies]
+global-hotkey = "0.10.0"
+tray-icon = "0.26.1"
+winreg = "0.56.0"
+
+[build-dependencies]
+winresource = "0.1.34"
 
 # `cargo generate-rpm -p crates/vc-app` (run from the repo root after
 # `cargo build --release -p vc-app` and `cargo xtask bundle vc-plugin --release`).

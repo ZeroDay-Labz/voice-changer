@@ -1,25 +1,42 @@
-//! Voice Changer standalone: captures your microphone through PipeWire,
-//! runs the engine, and publishes the result as a virtual microphone named
-//! "Voice Changer Mic" that Discord, SIP clients and OBS can select directly.
+//! Voice Changer standalone.
+//!
+//! Linux: captures your microphone through PipeWire, runs the engine, and
+//! publishes the result as a virtual microphone named "Voice Changer Mic"
+//! that Discord, SIP clients and OBS can select directly.
+//!
+//! Windows: you pick an input and an output device; the changed voice plays
+//! on the output. No virtual device is created.
 //!
 //! Run with no arguments to start the app (window + tray). Subcommands talk
-//! to the running instance over D-Bus, e.g. bind `voice-changer toggle` to a
-//! key in KDE System Settings → Shortcuts.
+//! to the running instance (D-Bus on Linux, a local socket on Windows), e.g.
+//! bind `voice-changer toggle` to a key.
 
+// A window program on Windows: no console pops up. Output of the command
+// line still reaches a terminal it was started from (see `attach_console`).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod audio;
 mod config;
 mod control;
+#[cfg(target_os = "linux")]
 mod dbus;
+#[cfg(windows)]
+mod desktop;
 mod doctor;
-mod fold;
 mod gui_ctx;
+#[cfg(target_os = "linux")]
 mod hotkey;
+mod ipc;
+#[cfg(target_os = "linux")]
 mod launcher;
 mod logger;
-mod pw;
 mod selftest;
-mod slip;
+#[cfg(target_os = "linux")]
 mod tray;
 mod window;
+
+#[cfg(not(any(target_os = "linux", windows)))]
+compile_error!("Voice Changer builds for Linux and Windows.");
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
@@ -35,16 +52,16 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Microphone to capture (PipeWire `node.name`). Overrides the saved choice.
+    /// Microphone to capture (a name from `voice-changer mics`). Overrides the saved choice.
     #[arg(long)]
     mic: Option<String>,
 
-    /// Sample rate to run the engine at. Match your PipeWire graph rate to avoid resampling.
+    /// Sample rate to run the engine at. 48000 is what the effects and the AI are tuned for.
     #[arg(long, default_value_t = 48_000)]
     rate: u32,
 
-    /// Requested block size in frames (PipeWire quantum). 256 is safe for USB
-    /// headsets; 128 shaves 2.7 ms if your interface copes.
+    /// Requested block size in frames. 256 is safe for USB headsets; 128
+    /// shaves 2.7 ms if your interface copes.
     #[arg(long, default_value_t = 256)]
     quantum: u32,
 
@@ -98,7 +115,7 @@ struct Cli {
     monitor_target: Option<String>,
 
     /// PipeWire node name of the published microphone.
-    #[arg(long, hide = true, default_value = pw::SOURCE_NODE_NAME)]
+    #[arg(long, hide = true, default_value = audio::SOURCE_NODE_NAME)]
     source_name: String,
 
     /// Render the window to this PNG and quit (for documentation).
@@ -136,6 +153,8 @@ enum Command {
     Off,
     /// Print whether processing is on.
     Status,
+    /// Silence the output: `mute on`, `mute off`, or `mute` alone to flip it.
+    Mute { state: Option<String> },
     /// Apply a preset in the running instance.
     Preset { name: String },
     /// List available presets.
@@ -150,6 +169,10 @@ enum Command {
     Mics,
     /// Switch microphone by node.name ("default" for the system default).
     Mic { name: String },
+    /// List output devices (name and description).
+    Outputs,
+    /// Switch the output device by name ("default" for the system default).
+    Output { name: String },
     /// Manage installed AI voices: `voices`, `voices add <url> [name]`, `voices remove <name>`.
     Voices {
         #[command(subcommand)]
@@ -175,7 +198,30 @@ enum Command {
     },
 }
 
+/// Whether the remote control uses the local socket rather than D-Bus:
+/// always off Linux, and on Linux when `VC_IPC=socket` asks for it (tests).
+fn use_socket() -> bool {
+    cfg!(not(target_os = "linux")) || std::env::var("VC_IPC").is_ok_and(|v| v == "socket")
+}
+
+/// A window program has no console on Windows. When it was started from a
+/// terminal, borrow that one so `voice-changer status`, `doctor` and
+/// `--help` print where the user typed them.
+#[cfg(windows)]
+fn attach_console() {
+    unsafe extern "system" {
+        fn AttachConsole(process: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    // SAFETY: a plain Win32 call; failing (no parent console) changes nothing.
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    attach_console();
     logger::init(
         "info,zbus=error,tracing=error,ksni=warn,ashpd=warn,ort=error,wgpu_core=warn,wgpu_hal=warn,naga=warn,iced_wgpu=warn,iced_winit=warn,winit=warn,cosmic_text=warn,sctk=warn",
     );
@@ -206,12 +252,8 @@ fn main() -> Result<()> {
 
     // A second launch brings the running window to the front instead of
     // creating a second virtual microphone.
-    if !cli.no_dbus
-        && cli.screenshot.is_none()
-        && let Ok(proxy) = runtime.block_on(dbus::client())
-    {
+    if !cli.no_dbus && cli.screenshot.is_none() && show_running_instance(&runtime) {
         log::info!("Voice Changer is already running; showing its window");
-        let _ = runtime.block_on(proxy.show_window());
         std::process::exit(0);
     }
 
@@ -230,7 +272,7 @@ fn main() -> Result<()> {
     #[cfg(feature = "ai")]
     vc_core::ai::compute::probe_in_background();
 
-    log::info!("PipeWire library {}", pw::library_version());
+    log::info!("audio library: {}", audio::library_version());
     let params = VcParams::new();
 
     // Restore last state, then preset / flags from the command line.
@@ -239,7 +281,7 @@ fn main() -> Result<()> {
     }
     params.set_ai_threads(cfg.ai_threads);
     params.set_my_pitch_hz(cfg.my_pitch_hz);
-    let audio_config = pw::AudioConfig {
+    let audio_config = audio::AudioConfig {
         rate: cli.rate,
         quantum: cli.quantum,
         capture_target: cfg.mic.clone(),
@@ -251,11 +293,11 @@ fn main() -> Result<()> {
             Some(p) => Some(std::sync::Arc::new(vc_core::wav::read_mono(p)?.0)),
             None => None,
         },
-        monitor_target: cli.monitor_target.clone(),
+        output_target: cli.monitor_target.clone().or_else(|| cfg.output.clone()),
     };
-    let stats = std::sync::Arc::new(pw::Stats::default());
+    let stats = std::sync::Arc::new(audio::Stats::default());
     let meters = std::sync::Arc::new(vc_core::Meters::default());
-    let audio = match pw::AudioThread::spawn(
+    let audio = match audio::AudioThread::spawn(
         audio_config.clone(),
         params.clone(),
         stats.clone(),
@@ -308,6 +350,9 @@ fn main() -> Result<()> {
         *cur = shown_preset;
     }
     shared.set_enabled(cli.on || !(cli.bypass || cfg.start_bypassed));
+    // Mute is for the moment: never start silent because the last session
+    // ended that way.
+    shared.set_muted(false);
     if cli.monitor {
         shared.set_monitor(true);
     }
@@ -333,22 +378,35 @@ fn main() -> Result<()> {
     let services = {
         let shared = shared.clone();
         let hotkey = cfg.hotkey.clone();
+        let mute_hotkey = cfg.mute_hotkey.clone();
         let headless = cli.headless;
         let no_dbus = cli.no_dbus;
         runtime.spawn(async move {
-            let _conn = match if no_dbus { Err(zbus::Error::Unsupported) } else { dbus::serve(shared.clone()).await } {
-                Ok(c) => Some(c),
-                Err(zbus::Error::Unsupported) => None,
-                Err(zbus::Error::NameTaken) => {
-                    log::error!("another Voice Changer instance is already running; use `voice-changer show`");
-                    shared.request_quit();
-                    return;
-                }
-                Err(e) => {
-                    log::warn!("D-Bus control unavailable: {e}");
-                    None
+            #[cfg(target_os = "linux")]
+            let _conn = if no_dbus || use_socket() {
+                None
+            } else {
+                match dbus::serve(shared.clone()).await {
+                    Ok(c) => Some(c),
+                    Err(zbus::Error::NameTaken) => {
+                        log::error!("another Voice Changer instance is already running; use `voice-changer show`");
+                        shared.request_quit();
+                        return;
+                    }
+                    Err(e) => {
+                        log::warn!("D-Bus control unavailable: {e}");
+                        None
+                    }
                 }
             };
+            if !no_dbus
+                && use_socket()
+                && let Err(e) = ipc::serve(shared.clone())
+            {
+                log::error!("{e:#}; use `voice-changer show`");
+                shared.request_quit();
+                return;
+            }
             if headless {
                 while !shared.quit.load(Ordering::SeqCst) {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -357,10 +415,22 @@ fn main() -> Result<()> {
             }
             // The tray and the hotkey are independent: a desktop without a
             // tray host must not lose the global shortcut.
-            let tray = tokio::spawn(tray::run(shared.clone(), start_hidden));
-            let keys = tokio::spawn(hotkey::run(shared.clone(), hotkey));
-            let _ = tray.await;
-            let _ = keys.await;
+            #[cfg(target_os = "linux")]
+            {
+                let tray = tokio::spawn(tray::run(shared.clone(), start_hidden));
+                let keys = tokio::spawn(hotkey::run(shared.clone(), hotkey, mute_hotkey));
+                let _ = tray.await;
+                let _ = keys.await;
+            }
+            // Elsewhere the tray and the shortcuts live with the window
+            // (see `desktop.rs`).
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (hotkey, mute_hotkey, start_hidden);
+                while !shared.quit.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
         })
     };
 
@@ -375,6 +445,7 @@ fn main() -> Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     } else {
+        #[cfg(target_os = "linux")]
         if !cli.no_dbus {
             launcher::ensure_installed();
         }
@@ -473,6 +544,16 @@ fn install_panic_hook(shared: &std::sync::Arc<Shared>) {
     }));
 }
 
+/// Windows downloads carry the AI engine with them.
+#[cfg(windows)]
+fn get_runtime(_cuda: bool) -> Result<()> {
+    println!(
+        "The AI engine (onnxruntime.dll) comes with the Windows download, next to voice-changer.exe. There is nothing to fetch."
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
 /// Run the bundled download script (the same one as `scripts/get-onnxruntime.sh`),
 /// so packaged installs have it too.
 fn get_runtime(cuda: bool) -> Result<()> {
@@ -578,8 +659,38 @@ fn manage_voices(_action: Option<&VoicesAction>) -> Result<()> {
     anyhow::bail!("this build has no AI support")
 }
 
+/// Bring the window of an instance that is already running to the front.
+/// Returns false when there is none.
+fn show_running_instance(runtime: &tokio::runtime::Runtime) -> bool {
+    if use_socket() {
+        let _ = runtime;
+        return ipc::running() && ipc::send(&["show".to_string()]).is_ok();
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(proxy) = runtime.block_on(dbus::client()) {
+        let _ = runtime.block_on(proxy.show_window());
+        return true;
+    }
+    false
+}
+
 /// Send one command to the running instance.
 fn remote(cmd: Command) -> Result<()> {
+    if use_socket() {
+        let _ = cmd;
+        // The running instance parses the same command line we were given.
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        print!("{}", ipc::send(&args)?);
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    return remote_dbus(cmd);
+    #[cfg(not(target_os = "linux"))]
+    unreachable!("the socket is the only remote control here")
+}
+
+#[cfg(target_os = "linux")]
+fn remote_dbus(cmd: Command) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -601,6 +712,17 @@ fn remote(cmd: Command) -> Result<()> {
                     println!("ai: {ai} ({voice})");
                 }
             }
+            Command::Mute { state } => match state.as_deref() {
+                None | Some("toggle") => {
+                    let on = !proxy.muted().await?;
+                    proxy.set_muted(on).await?;
+                    println!("{}", if on { "muted" } else { "unmuted" });
+                }
+                Some(s) => {
+                    let on = matches!(s.to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes");
+                    proxy.set_muted(on).await?;
+                }
+            },
             Command::Monitor { state } => {
                 let on = matches!(
                     state.to_ascii_lowercase().as_str(),
@@ -673,6 +795,24 @@ fn remote(cmd: Command) -> Result<()> {
                     name
                 };
                 proxy.set_microphone(&name).await?;
+            }
+            Command::Outputs => {
+                let current = proxy.output().await?;
+                println!(
+                    "{} default\tSystem default",
+                    if current.is_empty() { "*" } else { " " }
+                );
+                for (name, desc) in proxy.outputs().await? {
+                    println!("{} {name}\t{desc}", if name == current { "*" } else { " " });
+                }
+            }
+            Command::Output { name } => {
+                let name = if name == "default" {
+                    String::new()
+                } else {
+                    name
+                };
+                proxy.set_output_device(&name).await?;
             }
             Command::Voices { .. } => unreachable!("handled before connecting"),
             Command::Apps => {

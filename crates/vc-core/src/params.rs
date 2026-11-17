@@ -100,6 +100,9 @@ impl From<PitchEngine> for PitchMode {
 pub struct VcParams {
     #[id = "bypass"]
     pub bypass: BoolParam,
+    /// Silence the output (a cough button, or "not now"). Not part of presets.
+    #[id = "mute"]
+    pub mute: BoolParam,
     #[id = "in_gain"]
     pub input_gain: FloatParam,
     #[id = "out_gain"]
@@ -210,6 +213,7 @@ impl Default for VcParams {
     fn default() -> Self {
         Self {
             bypass: BoolParam::new("Bypass", false).make_bypass(),
+            mute: BoolParam::new("Mute", false),
             input_gain: db_param("Input Gain", 0.0, -24.0, 24.0),
             output_gain: db_param("Output Gain", 0.0, -24.0, 24.0),
             limiter: BoolParam::new("Limiter", true),
@@ -391,6 +395,7 @@ impl VcParams {
     pub fn snapshot(&self) -> EngineParams {
         EngineParams {
             bypass: self.bypass.value(),
+            mute: self.mute.value(),
             input_gain: db_to_gain(self.input_gain.value()),
             output_gain: db_to_gain(self.output_gain.value()),
             gate_enabled: self.gate_enabled.value(),

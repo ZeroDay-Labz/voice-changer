@@ -61,6 +61,9 @@ impl PitchMode {
 pub struct EngineParams {
     /// When true the engine crossfades to the (latency-compensated) dry signal.
     pub bypass: bool,
+    /// When true the output is silence, whatever else is set (fades in and
+    /// out over a few milliseconds).
+    pub mute: bool,
     pub input_gain: f32,
     pub output_gain: f32,
 
@@ -108,6 +111,7 @@ impl Default for EngineParams {
     fn default() -> Self {
         Self {
             bypass: false,
+            mute: false,
             input_gain: 1.0,
             output_gain: 1.0,
             gate_enabled: false,

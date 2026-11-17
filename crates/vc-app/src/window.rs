@@ -17,7 +17,11 @@ use crate::config::{self, AppConfig};
 use crate::control::Shared;
 use crate::gui_ctx::StandaloneGuiContext;
 
+#[cfg(target_os = "linux")]
 pub const APP_ID: &str = "io.github.zerodaylabz.VoiceChanger";
+/// The PipeWire backend: a virtual microphone, routing to applications and
+/// a "Hear myself" switch. Without it the voice plays on the chosen output.
+const PIPEWIRE: bool = cfg!(all(target_os = "linux", not(feature = "backend-cpal")));
 const ICON_PNG: &[u8] = include_bytes!("../../../packaging/icons/128.png");
 
 #[derive(Clone)]
@@ -85,10 +89,10 @@ impl Host for AppHost {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             standalone: true,
-            monitor: true,
             microphone: true,
-            hotkey: true,
-            settings: true,
+            output: true,
+            routing: PIPEWIRE,
+            monitor_toggle: PIPEWIRE,
         }
     }
     fn latency_ms(&self) -> f32 {
@@ -132,8 +136,26 @@ impl Host for AppHost {
     fn set_capture_target(&self, target: Option<String>) {
         self.shared.set_capture_target(target);
     }
+    fn output_devices(&self) -> Vec<Device> {
+        self.shared
+            .output_devices()
+            .into_iter()
+            .map(|d| Device {
+                name: d.name,
+                description: d.description,
+            })
+            .collect()
+    }
+    fn output_target(&self) -> Option<String> {
+        self.shared.output_target()
+    }
+    fn set_output_target(&self, target: Option<String>) {
+        self.shared.set_output_target(target);
+    }
     fn monitor(&self) -> Option<bool> {
-        Some(self.shared.monitor())
+        // Only a switch where the voice also goes somewhere else (the
+        // virtual microphone); otherwise the output always plays it.
+        PIPEWIRE.then(|| self.shared.monitor())
     }
     fn set_monitor(&self, on: bool) {
         self.shared.set_monitor(on);
@@ -234,10 +256,10 @@ impl Host for AppHost {
         let active = self.shared.active_target();
         Some(AudioStatus {
             state: match h.state {
-                crate::pw::AudioState::Starting => AudioState::Starting,
-                crate::pw::AudioState::Running => AudioState::Running,
-                crate::pw::AudioState::Reconnecting => AudioState::Reconnecting,
-                crate::pw::AudioState::Failed => AudioState::Failed,
+                crate::audio::AudioState::Starting => AudioState::Starting,
+                crate::audio::AudioState::Running => AudioState::Running,
+                crate::audio::AudioState::Reconnecting => AudioState::Reconnecting,
+                crate::audio::AudioState::Failed => AudioState::Failed,
             },
             message: h.message,
             virtual_mic: h.virtual_mic,
@@ -287,7 +309,12 @@ impl Host for AppHost {
             .map(|d| d.data_dir().to_path_buf())
         {
             let _ = std::fs::create_dir_all(&dir);
-            if let Err(e) = std::process::Command::new("xdg-open").arg(&dir).spawn() {
+            let opener = if cfg!(windows) {
+                "explorer"
+            } else {
+                "xdg-open"
+            };
+            if let Err(e) = std::process::Command::new(opener).arg(&dir).spawn() {
                 log::warn!("could not open {}: {e}", dir.display());
             }
         }
@@ -348,6 +375,7 @@ fn window_settings(screenshot: bool, remembered: Option<[f32; 4]>) -> window::Se
         position,
         min_size: Some(iced::Size::new(vc_gui::MIN_WIDTH, vc_gui::MIN_HEIGHT)),
         icon: window::icon::from_file_data(ICON_PNG, None).ok(),
+        #[cfg(target_os = "linux")]
         platform_specific: window::settings::PlatformSpecific {
             application_id: APP_ID.into(),
             ..Default::default()
@@ -403,6 +431,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     None => app.open_window(),
                 };
             }
+            #[cfg(windows)]
+            crate::desktop::poll(&app.shared);
             app.sync_from_shared();
             let t2 = app.ui(vc_gui::Message::Tick);
             if let (Some((_, _, frames)), Some(id)) = (app.screenshot.as_mut(), app.window) {
@@ -557,6 +587,10 @@ fn subscription(app: &App) -> Subscription<Message> {
 
 /// Run the window until quit. Returns when the daemon exits.
 pub fn run(shared: Arc<Shared>, options: Options) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    let tray_shared = shared.clone();
+    #[cfg(windows)]
+    let (start_hidden, with_tray) = (options.start_hidden, options.screenshot.is_none());
     let boot = move || {
         let mut model = Model::new();
         let screenshot = options.screenshot.clone().map(|(p, page)| {
@@ -578,11 +612,25 @@ pub fn run(shared: Arc<Shared>, options: Options) -> anyhow::Result<()> {
         };
         (app, task)
     };
-    iced::daemon(boot, update, view)
+    // The tray icon and the global shortcuts live on this thread, whose
+    // event loop the window is about to run.
+    #[cfg(windows)]
+    if with_tray {
+        let (toggle, mute) = tray_shared
+            .config
+            .lock()
+            .map(|c| (c.hotkey.clone(), c.mute_hotkey.clone()))
+            .unwrap_or_default();
+        crate::desktop::start(&tray_shared, start_hidden, &toggle, &mute);
+    }
+    let result = iced::daemon(boot, update, view)
         .title(|_app: &App, _id| "Voice Changer".to_string())
         .theme(|app: &App, _id| -> Theme { vc_gui::theme::theme(app.host.theme_mode()) })
         .subscription(subscription)
         .antialiasing(true)
         .run()
-        .map_err(|e| anyhow::anyhow!("window: {e}"))
+        .map_err(|e| anyhow::anyhow!("window: {e}"));
+    #[cfg(windows)]
+    crate::desktop::stop();
+    result
 }

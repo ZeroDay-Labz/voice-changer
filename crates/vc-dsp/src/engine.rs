@@ -13,6 +13,9 @@ use crate::util::{DelayLine, Drive, Smooth, soft_limit};
 const MAX_LATENCY_SAMPLES: usize = 1 << 15;
 /// Bypass crossfade: click-free yet instant-feeling on a hotkey.
 const BYPASS_FADE_MS: f32 = 15.0;
+/// Time constant of the fade when muting and unmuting (inaudible after
+/// about 15 ms): short enough to cut a cough off, long enough not to click.
+const MUTE_FADE_MS: f32 = 3.0;
 const GAIN_SMOOTH_MS: f32 = 8.0;
 const MAX_ECHO_MS: f32 = 1200.0;
 
@@ -38,6 +41,8 @@ pub struct Engine {
     eq_high: Biquad,
     /// 1.0 = fully wet (active), 0.0 = fully dry (bypassed).
     wet_mix: Smooth,
+    /// 1.0 = audible, 0.0 = muted.
+    mute_gain: Smooth,
     dry_delay: DelayLine,
     scratch: Vec<f32>,
     latency_changed: bool,
@@ -67,6 +72,7 @@ impl Engine {
             eq_mid: Biquad::new(FilterKind::Peaking, 1000.0, 0.8, 0.0, sample_rate),
             eq_high: Biquad::new(FilterKind::HighShelf, 4000.0, 0.7, 0.0, sample_rate),
             wet_mix: Smooth::new(1.0, BYPASS_FADE_MS, sample_rate),
+            mute_gain: Smooth::new(1.0, MUTE_FADE_MS, sample_rate),
             dry_delay: DelayLine::new(MAX_LATENCY_SAMPLES),
             scratch: vec![0.0; max_block],
             latency_changed: false,
@@ -143,6 +149,8 @@ impl Engine {
         self.out_gain.snap(self.params.output_gain);
         self.wet_mix
             .snap(if self.params.bypass { 0.0 } else { 1.0 });
+        self.mute_gain
+            .snap(if self.params.mute { 0.0 } else { 1.0 });
     }
 
     /// Hand the engine a new parameter snapshot. Realtime-safe.
@@ -157,6 +165,7 @@ impl Engine {
         self.in_gain.set_target(p.input_gain);
         self.out_gain.set_target(p.output_gain);
         self.wet_mix.set_target(if p.bypass { 0.0 } else { 1.0 });
+        self.mute_gain.set_target(if p.mute { 0.0 } else { 1.0 });
         self.gate.set_threshold_db(p.gate_threshold_db);
         self.denoise.set_floor_db(p.gate_floor_db);
         let mode_changed = self.pitch.set_mode(p.pitch_mode);
@@ -207,6 +216,16 @@ impl Engine {
             let end = (start + chunk).min(buf.len());
             self.process_chunk(&mut buf[start..end], &mut between);
             start = end;
+        }
+        // Mute comes last, so it silences the bypassed (raw) voice too.
+        if self.mute_gain.is_settled() {
+            if self.mute_gain.current() < 0.5 {
+                buf.fill(0.0);
+            }
+        } else {
+            for x in buf.iter_mut() {
+                *x *= self.mute_gain.next();
+            }
         }
         self.out_peak = buf.iter().fold(0.0f32, |m, x| m.max(x.abs()));
     }
@@ -291,6 +310,37 @@ mod tests {
             voice_only: false,
             auto_level: false,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mute_silences_everything_without_a_click() {
+        let mut e = Engine::new(48_000.0, 256);
+        for bypass in [false, true] {
+            let mut p = neutral();
+            p.bypass = bypass;
+            e.set_params(p);
+            e.reset();
+            let mut block = vec![0.5f32; 256];
+            e.process(&mut block);
+            assert!((block[255] - 0.5).abs() < 1e-3);
+            p.mute = true;
+            e.set_params(p);
+            let mut fading = vec![0.5f32; 4800];
+            e.process(&mut fading);
+            // No step larger than a smooth fade allows, and silence after it.
+            let step = fading
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0f32, f32::max);
+            assert!(step < 0.01, "step {step}");
+            // Down 40 dB within 15 ms, gone within 100 ms.
+            assert!(fading[720].abs() < 0.005);
+            assert!(fading[4799].abs() < 1e-5);
+            let mut silent = vec![0.5f32; 256];
+            e.process(&mut silent);
+            assert!(silent.iter().all(|s| *s == 0.0));
+            assert_eq!(e.peaks().1, 0.0);
         }
     }
 

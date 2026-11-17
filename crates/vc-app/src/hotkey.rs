@@ -10,9 +10,10 @@ use std::time::Duration;
 use crate::control::Shared;
 
 const TOGGLE_ID: &str = "toggle";
+const MUTE_ID: &str = "mute";
 
-pub async fn run(shared: Arc<Shared>, preferred_trigger: String) {
-    if let Err(e) = run_inner(shared, &preferred_trigger).await {
+pub async fn run(shared: Arc<Shared>, preferred_trigger: String, mute_trigger: String) {
+    if let Err(e) = run_inner(shared, &preferred_trigger, &mute_trigger).await {
         log::warn!(
             "global shortcut unavailable ({e}). Bind `voice-changer toggle` to a key in \
              System Settings → Shortcuts instead."
@@ -20,14 +21,21 @@ pub async fn run(shared: Arc<Shared>, preferred_trigger: String) {
     }
 }
 
-async fn run_inner(shared: Arc<Shared>, preferred_trigger: &str) -> ashpd::Result<()> {
+async fn run_inner(
+    shared: Arc<Shared>,
+    preferred_trigger: &str,
+    mute_trigger: &str,
+) -> ashpd::Result<()> {
     let portal = GlobalShortcuts::new().await?;
     let session = portal.create_session(Default::default()).await?;
 
     // KDE ≥ 6.7.4 leaves shortcuts inert unless they are (re)bound every
     // session, so always bind rather than only listing.
-    let shortcuts = [NewShortcut::new(TOGGLE_ID, "Toggle Voice Changer on/off")
-        .preferred_trigger(preferred_trigger)];
+    let shortcuts = [
+        NewShortcut::new(TOGGLE_ID, "Toggle Voice Changer on/off")
+            .preferred_trigger(preferred_trigger),
+        NewShortcut::new(MUTE_ID, "Mute or unmute Voice Changer").preferred_trigger(mute_trigger),
+    ];
     let bound = portal
         .bind_shortcuts(&session, &shortcuts, None, Default::default())
         .await?
@@ -45,8 +53,17 @@ async fn run_inner(shared: Arc<Shared>, preferred_trigger: &str) -> ashpd::Resul
             }
         );
     };
+    let publish_mute = |trigger: &str| {
+        if let Ok(mut t) = shared.mute_hotkey_trigger.lock() {
+            *t = (!trigger.is_empty()).then(|| trigger.to_string());
+        }
+    };
     for s in bound.shortcuts() {
-        publish(s.trigger_description());
+        if s.id() == MUTE_ID {
+            publish_mute(s.trigger_description());
+        } else {
+            publish(s.trigger_description());
+        }
     }
 
     let mut activated = portal.receive_activated().await?;
@@ -58,6 +75,8 @@ async fn run_inner(shared: Arc<Shared>, preferred_trigger: &str) -> ashpd::Resul
                 let Some(event) = event else { break };
                 if event.shortcut_id() == TOGGLE_ID {
                     shared.toggle();
+                } else if event.shortcut_id() == MUTE_ID {
+                    shared.set_muted(!shared.muted());
                 }
             }
             change = changed.next() => {
@@ -65,6 +84,8 @@ async fn run_inner(shared: Arc<Shared>, preferred_trigger: &str) -> ashpd::Resul
                 for s in change.shortcuts() {
                     if s.id() == TOGGLE_ID {
                         publish(s.trigger_description());
+                    } else if s.id() == MUTE_ID {
+                        publish_mute(s.trigger_description());
                     }
                 }
             }

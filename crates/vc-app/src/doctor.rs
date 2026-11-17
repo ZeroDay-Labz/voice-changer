@@ -2,10 +2,15 @@
 //! would, and says in one line per item what is wrong and how to fix it.
 //! The window shows the same findings as sentences when audio fails.
 
+#[cfg(target_os = "linux")]
 use pipewire as pw;
+#[cfg(target_os = "linux")]
 use pw::types::ObjectType;
+#[cfg(target_os = "linux")]
 use std::cell::RefCell;
+#[cfg(target_os = "linux")]
 use std::rc::Rc;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +57,7 @@ impl Finding {
 }
 
 /// What a short look at the PipeWire graph revealed.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Default, Clone)]
 pub struct GraphProbe {
     pub connected: bool,
@@ -65,8 +71,9 @@ pub struct GraphProbe {
 }
 
 /// Connect, enumerate the registry for a moment, disconnect.
+#[cfg(target_os = "linux")]
 pub fn probe_graph(wait: Duration) -> GraphProbe {
-    crate::pw::library_version();
+    crate::audio::pw::library_version();
     let probe = Rc::new(RefCell::new(GraphProbe::default()));
     let Ok(mainloop) = pw::main_loop::MainLoopRc::new(None) else {
         probe.borrow_mut().error = Some("could not create a PipeWire main loop".into());
@@ -167,6 +174,7 @@ pub fn probe_graph(wait: Duration) -> GraphProbe {
 
 /// `libspa-support.so` provides `support.null-audio-sink`. Minimal images
 /// sometimes ship PipeWire without the SPA support plugins.
+#[cfg(target_os = "linux")]
 fn spa_support_plugin_present() -> bool {
     let dirs = [
         "/usr/lib64/spa-0.2/support",
@@ -188,6 +196,7 @@ fn spa_support_plugin_present() -> bool {
 }
 
 /// "Server Name" from `pactl info`, if the PulseAudio API answers at all.
+#[cfg(target_os = "linux")]
 pub fn pulse_server_name() -> Option<String> {
     let out = std::process::Command::new("pactl")
         .arg("info")
@@ -202,6 +211,15 @@ pub fn pulse_server_name() -> Option<String> {
 }
 
 /// One sentence for the window when the audio side cannot start.
+#[cfg(not(target_os = "linux"))]
+pub fn audio_hint(error: &str) -> String {
+    format!(
+        "Audio could not start ({error}). Check that a microphone and an output device are connected and enabled in the sound settings."
+    )
+}
+
+/// One sentence for the window when the audio side cannot start.
+#[cfg(target_os = "linux")]
 pub fn audio_hint(error: &str) -> String {
     let graph = probe_graph(Duration::from_millis(600));
     if !graph.connected {
@@ -223,7 +241,66 @@ pub fn audio_hint(error: &str) -> String {
 /// Run every check.
 pub fn run_checks() -> Vec<Finding> {
     let mut out = Vec::new();
+    #[cfg(target_os = "linux")]
+    linux_checks(&mut out);
+    #[cfg(not(target_os = "linux"))]
+    device_checks(&mut out);
+    common_checks(&mut out);
+    #[cfg(target_os = "linux")]
+    linux_desktop_checks(&mut out);
+    settings_folder_check(&mut out);
+    out
+}
 
+/// Microphones and outputs as the portable backend sees them.
+#[cfg(not(target_os = "linux"))]
+fn device_checks(out: &mut Vec<Finding>) {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    out.push(Finding::ok("Audio system", host.id().name()));
+    let names = |devices: Vec<cpal::Device>| -> Vec<String> {
+        devices
+            .iter()
+            .filter_map(|d| d.description().ok().map(|x| x.name().to_string()))
+            .collect()
+    };
+    let default_name = |d: Option<cpal::Device>| {
+        d.and_then(|d| d.description().ok().map(|x| x.name().to_string()))
+    };
+    let inputs = host
+        .input_devices()
+        .map(|d| names(d.collect()))
+        .unwrap_or_default();
+    match default_name(host.default_input_device()) {
+        Some(default) => out.push(Finding::ok(
+            "Microphones",
+            format!("{} found, default: {default}", inputs.len()),
+        )),
+        None => out.push(Finding::fail(
+            "Microphones",
+            "no microphone found",
+            "Plug one in, and allow desktop apps to use the microphone in Settings → Privacy & security → Microphone.",
+        )),
+    }
+    let outputs = host
+        .output_devices()
+        .map(|d| names(d.collect()))
+        .unwrap_or_default();
+    match default_name(host.default_output_device()) {
+        Some(default) => out.push(Finding::ok(
+            "Outputs",
+            format!("{} found, default: {default}", outputs.len()),
+        )),
+        None => out.push(Finding::fail(
+            "Outputs",
+            "no output device found",
+            "Connect headphones, speakers or an audio interface: the changed voice plays there.",
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_checks(out: &mut Vec<Finding>) {
     // ---- display / desktop ----
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
     let x11 = std::env::var_os("DISPLAY").is_some();
@@ -266,7 +343,7 @@ pub fn run_checks() -> Vec<Finding> {
         )),
         (true, _) => {
             let ver = graph.server_version.clone().unwrap_or_else(|| "?".into());
-            let lib = crate::pw::library_version();
+            let lib = crate::audio::pw::library_version();
             out.push(Finding::ok(
                 "Audio system",
                 format!("PipeWire {ver} (client library {lib})"),
@@ -326,7 +403,12 @@ pub fn run_checks() -> Vec<Finding> {
             }
         }
     }
+}
 
+/// Checks that are the same everywhere: the AI.
+fn common_checks(out: &mut Vec<Finding>) {
+    #[cfg(not(feature = "ai"))]
+    let _ = &out;
     // ---- AI ----
     #[cfg(feature = "ai")]
     {
@@ -441,7 +523,10 @@ pub fn run_checks() -> Vec<Finding> {
             },
         ));
     }
+}
 
+#[cfg(target_os = "linux")]
+fn linux_desktop_checks(out: &mut Vec<Finding>) {
     // ---- desktop integration (D-Bus) ----
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -487,8 +572,9 @@ pub fn run_checks() -> Vec<Finding> {
             None => Finding::warn("Global shortcut", "no session D-Bus", ""),
         });
     }
+}
 
-    // ---- config dir ----
+fn settings_folder_check(out: &mut Vec<Finding>) {
     match vc_core::presets::config_dir() {
         Some(d) => out.push(Finding::ok("Settings folder", d.display().to_string())),
         None => out.push(Finding::warn(
@@ -497,7 +583,6 @@ pub fn run_checks() -> Vec<Finding> {
             "Settings will not be saved.",
         )),
     }
-    out
 }
 
 /// Print the findings; returns the exit code (1 when anything failed).

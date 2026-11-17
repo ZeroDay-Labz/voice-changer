@@ -597,10 +597,19 @@ fn worker_loop(
                         w.voice.file_name().unwrap_or_default().to_string_lossy()
                     ),
                 );
+                // DirectML can crash instead of failing: leave a marker
+                // until the voice has loaded and run once (see `compute`).
+                let directml = matches!(
+                    super::compute::resolve(&w.device),
+                    super::compute::Backend::DirectMl { .. }
+                ) && super::compute::directml_begin();
                 match load(&w.voice, w.threads, &w.device, sr) {
                     Ok(mut l) => {
                         let tail16 = (block + crossfade + tail_margin) / 3 + synth_context;
                         l.rvc.warm_up(l.to16k.output_len(window_len), tail16);
+                        if directml {
+                            super::compute::directml_ok();
+                        }
                         let backend =
                             super::compute::resolve(&w.device).label(&super::compute::gpus());
                         status
@@ -614,6 +623,9 @@ fn worker_loop(
                         status.set(AiState::Ready, backend);
                     }
                     Err(e) => {
+                        if directml {
+                            super::compute::directml_ok();
+                        }
                         log::error!("AI voice load failed: {e:#}");
                         status.set(AiState::Error, format!("{e:#}"));
                         parked = Some(Parked {

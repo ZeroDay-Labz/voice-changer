@@ -103,8 +103,16 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
         .style(theme::pill),
         "",
     ));
-    if host.capabilities().microphone {
-        right = right.push(mic_picker(model, host, 200.0, false));
+    let caps = host.capabilities();
+    if caps.microphone || caps.output {
+        let mut pickers = column![].spacing(6);
+        if caps.microphone {
+            pickers = pickers.push(mic_picker(model, host, 200.0, true));
+        }
+        if caps.output {
+            pickers = pickers.push(output_picker(model, host, 200.0, true));
+        }
+        right = right.push(pickers);
     }
 
     container(
@@ -164,6 +172,50 @@ fn peak_db(level: f32) -> String {
     }
 }
 
+/// One entry of a device picker: the device's stable name (`None` = the
+/// system default) and the text shown for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceChoice {
+    pub name: Option<String>,
+    label: String,
+}
+
+impl std::fmt::Display for DeviceChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+fn device_choices(
+    devices: &[crate::host::Device],
+    current: &Option<String>,
+    max_chars: usize,
+) -> (Vec<DeviceChoice>, DeviceChoice) {
+    let default = DeviceChoice {
+        name: None,
+        label: "System default".into(),
+    };
+    let mut options = vec![default.clone()];
+    options.extend(devices.iter().map(|d| DeviceChoice {
+        name: Some(d.name.clone()),
+        label: ellipsize(&d.description, max_chars),
+    }));
+    let selected = match current {
+        None => default,
+        Some(name) => options
+            .iter()
+            .find(|o| o.name.as_ref() == Some(name))
+            .cloned()
+            // Chosen but unplugged: keep showing it, so the choice is not
+            // silently replaced by "System default".
+            .unwrap_or_else(|| DeviceChoice {
+                name: Some(name.clone()),
+                label: "Not connected".into(),
+            }),
+    };
+    (options, selected)
+}
+
 pub fn mic_picker<'a>(
     model: &'a Model,
     host: &'a dyn Host,
@@ -171,28 +223,10 @@ pub fn mic_picker<'a>(
     with_help: bool,
 ) -> Element<'a> {
     let max_chars = ((width - 40.0) / 7.0) as usize;
-    let devices: Vec<(String, String)> = model
-        .cache
-        .devices
-        .iter()
-        .map(|d| (d.name.clone(), ellipsize(&d.description, max_chars)))
-        .collect();
-    let current = model.cache.capture_target.clone();
-    let mut options: Vec<String> = vec!["System default".to_string()];
-    options.extend(devices.iter().map(|(_, label)| label.clone()));
-    let selected = current
-        .as_ref()
-        .and_then(|name| devices.iter().find(|(n, _)| n == name))
-        .map(|(_, label)| label.clone())
-        .unwrap_or_else(|| "System default".to_string());
-    let lookup = devices.clone();
-    let picker = pick_list(options, Some(selected), move |label: String| {
-        Message::SelectMic(
-            lookup
-                .iter()
-                .find(|(_, l)| *l == label)
-                .map(|(n, _)| n.clone()),
-        )
+    let (options, selected) =
+        device_choices(&model.cache.devices, &model.cache.capture_target, max_chars);
+    let picker = pick_list(options, Some(selected), |c: DeviceChoice| {
+        Message::SelectMic(c.name)
     })
     .style(theme::pick_list_style)
     .text_size(13)
@@ -206,6 +240,41 @@ pub fn mic_picker<'a>(
         .align_y(Alignment::Center),
         if with_help {
             crate::help::MIC_PICKER
+        } else {
+            ""
+        },
+    )
+}
+
+/// Where the voice plays: the output device.
+pub fn output_picker<'a>(
+    model: &'a Model,
+    host: &'a dyn Host,
+    width: f32,
+    with_help: bool,
+) -> Element<'a> {
+    let max_chars = ((width - 40.0) / 7.0) as usize;
+    let (options, selected) =
+        device_choices(&model.cache.outputs, &model.cache.output_target, max_chars);
+    let picker = pick_list(options, Some(selected), |c: DeviceChoice| {
+        Message::SelectOutput(c.name)
+    })
+    .style(theme::pick_list_style)
+    .text_size(13)
+    .width(Length::Fixed(width));
+    tip(
+        row![
+            icons::speaker(16.0, theme::tokens(host.theme_mode()).text_dim),
+            picker
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+        if with_help {
+            if host.capabilities().monitor_toggle {
+                crate::help::OUTPUT_PICKER_MONITOR
+            } else {
+                crate::help::OUTPUT_PICKER
+            }
         } else {
             ""
         },

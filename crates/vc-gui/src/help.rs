@@ -88,6 +88,8 @@ pub const POWER_OFF: &str =
     "Voice changer is off: your mic passes through untouched. Click to turn it on.";
 pub const HEAR_MYSELF: &str = "Play the processed voice through your default output so you hear what others hear. Use headphones.";
 pub const MIC_PICKER: &str = "Microphone to process. System default follows your desktop's choice.";
+pub const OUTPUT_PICKER: &str = "Where your changed voice plays: headphones, speakers, a mixer or an audio interface. System default follows your computer's choice.";
+pub const OUTPUT_PICKER_MONITOR: &str = "Where Hear myself plays. System default follows your desktop's choice. Applications get the voice through Voice Changer Mic, whatever you pick here.";
 pub const PRESET_PILL: &str =
     "Current preset. Pick another on the Home page; Custom means you changed something since.";
 pub const SEARCH: &str = "Filter presets by name or description.";

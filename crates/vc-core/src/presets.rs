@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 /// Parameters that are global toggles rather than part of a "voice".
 const EXCLUDED_IDS: &[&str] = &[
     "bypass",
+    "mute",
     "denoise",
     "voice_only",
     "gate_floor",

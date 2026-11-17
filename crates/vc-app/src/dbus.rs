@@ -28,6 +28,17 @@ impl Control {
         self.shared.is_enabled()
     }
 
+    /// Whether the output is silenced.
+    #[zbus(property)]
+    fn muted(&self) -> bool {
+        self.shared.muted()
+    }
+
+    #[zbus(property)]
+    fn set_muted(&self, muted: bool) {
+        self.shared.set_muted(muted);
+    }
+
     /// Apply a factory or user preset by name. Returns false if unknown.
     fn load_preset(&self, name: &str) -> bool {
         self.shared.apply_preset_named(name)
@@ -68,6 +79,31 @@ impl Control {
             Some(name.to_string())
         };
         self.shared.set_capture_target(target);
+    }
+
+    /// Output devices as (name, description) pairs.
+    fn outputs(&self) -> Vec<(String, String)> {
+        self.shared
+            .output_devices()
+            .into_iter()
+            .map(|d| (d.name, d.description))
+            .collect()
+    }
+
+    /// Current output device name, or "" for the system default.
+    #[zbus(property)]
+    fn output(&self) -> String {
+        self.shared.output_target().unwrap_or_default()
+    }
+
+    /// Switch the output device by name ("" = system default).
+    fn set_output_device(&self, name: &str) {
+        let target = if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        };
+        self.shared.set_output_target(target);
     }
 
     /// Play the processed voice to the default output so you can hear yourself.
@@ -154,6 +190,10 @@ pub trait ControlApi {
     fn set_enabled(&self, enabled: bool) -> zbus::Result<()>;
     #[zbus(property)]
     fn enabled(&self) -> zbus::Result<bool>;
+    #[zbus(property)]
+    fn muted(&self) -> zbus::Result<bool>;
+    #[zbus(property)]
+    fn set_muted(&self, muted: bool) -> zbus::Result<()>;
     fn load_preset(&self, name: &str) -> zbus::Result<bool>;
     fn presets(&self) -> zbus::Result<Vec<String>>;
     fn microphones(&self) -> zbus::Result<Vec<(String, String)>>;
@@ -177,6 +217,10 @@ pub trait ControlApi {
     #[zbus(property)]
     fn set_default_source(&self, on: bool) -> zbus::Result<()>;
     fn set_microphone(&self, name: &str) -> zbus::Result<()>;
+    fn outputs(&self) -> zbus::Result<Vec<(String, String)>>;
+    #[zbus(property)]
+    fn output(&self) -> zbus::Result<String>;
+    fn set_output_device(&self, name: &str) -> zbus::Result<()>;
     fn show_window(&self) -> zbus::Result<()>;
     fn quit(&self) -> zbus::Result<()>;
 }

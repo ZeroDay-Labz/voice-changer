@@ -95,6 +95,7 @@ pub enum Message {
     DeletePreset(String),
     RefreshLibrary,
     SelectMic(Option<String>),
+    SelectOutput(Option<String>),
     ConfigureHotkey,
     Setting(HostSetting),
     OpenDataFolder,
@@ -173,6 +174,8 @@ pub struct Model {
 pub struct Cache {
     pub devices: Vec<Device>,
     pub capture_target: Option<String>,
+    pub outputs: Vec<Device>,
+    pub output_target: Option<String>,
     pub app_streams: Vec<AppStream>,
     pub default_source: Option<bool>,
     pub base_models_present: bool,
@@ -243,6 +246,8 @@ impl Model {
         self.last_refresh = Instant::now();
         self.cache.devices = host.devices();
         self.cache.capture_target = host.capture_target();
+        self.cache.outputs = host.output_devices();
+        self.cache.output_target = host.output_target();
         self.cache.app_streams = host.app_streams();
         self.cache.default_source = host.default_source();
         self.cache.runtime = host.runtime_description();
@@ -270,7 +275,9 @@ impl Model {
                     "auto".to_string(),
                     match compute::resolve("auto") {
                         compute::Backend::Cpu => "Auto (CPU)".to_string(),
-                        compute::Backend::Rocm { device } | compute::Backend::Cuda { device } => {
+                        compute::Backend::Rocm { device }
+                        | compute::Backend::Cuda { device }
+                        | compute::Backend::DirectMl { device } => {
                             format!("Auto (GPU {device})")
                         }
                     },
@@ -278,14 +285,18 @@ impl Model {
                 ("cpu".to_string(), "CPU".to_string()),
             ];
             for g in &gpus {
-                let backend = if g.api == "CUDA" {
-                    compute::Backend::Cuda { device: g.index }
-                } else {
-                    compute::Backend::Rocm { device: g.index }
+                let backend = match g.api {
+                    "CUDA" => compute::Backend::Cuda { device: g.index },
+                    "DirectML" => compute::Backend::DirectMl { device: g.index },
+                    _ => compute::Backend::Rocm { device: g.index },
                 };
                 opts.push((
                     compute::setting_string(Some(backend)),
-                    format!("GPU {} · {} ({})", g.index, g.name, g.api),
+                    if g.api == "DirectML" {
+                        "Graphics card (experimental)".to_string()
+                    } else {
+                        format!("GPU {} · {} ({})", g.index, g.name, g.api)
+                    },
                 ));
             }
             self.cache.compute_options = opts;
@@ -565,6 +576,10 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
             host.set_capture_target(t.clone());
             model.cache.capture_target = t;
         }
+        Message::SelectOutput(t) => {
+            host.set_output_target(t.clone());
+            model.cache.output_target = t;
+        }
         Message::ConfigureHotkey => host.configure_hotkey(),
         Message::Setting(s) => {
             host.apply_setting(s);
@@ -681,7 +696,14 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
             }
         }
         #[cfg(feature = "ai")]
-        Message::SelectDevice(d) => host.params().set_ai_device(&d),
+        Message::SelectDevice(d) => {
+            // Picking the graphics card again is the way to retry after it
+            // was set aside.
+            if d.starts_with("dml:") {
+                vc_core::ai::compute::directml_forget_crash();
+            }
+            host.params().set_ai_device(&d);
+        }
         #[cfg(feature = "ai")]
         Message::DownloadBaseModels => {
             if model.import.is_none() {

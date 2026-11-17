@@ -49,6 +49,17 @@ fn audio<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> {
             super::topbar::mic_picker(model, host, 320.0, true),
         ));
     }
+    if host.capabilities().output {
+        col = col.push(labelled(
+            if host.capabilities().monitor_toggle {
+                "Hear myself on"
+            } else {
+                "Output"
+            },
+            mode,
+            super::topbar::output_picker(model, host, 320.0, true),
+        ));
+    }
     if let Some(on) = host.monitor() {
         col = col.push(labelled(
             "Hear myself",
@@ -57,7 +68,7 @@ fn audio<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> {
                 .on_toggle(|_| Message::ToggleMonitor)
                 .style(theme::toggler_style),
         ));
-        col = col.push(dim("Plays the processed voice to your default output so you can hear what others hear. Use headphones.", 12, mode));
+        col = col.push(dim("Plays the changed voice on the output above so you can hear what others hear. Use headphones.", 12, mode));
     }
     if let Some(a) = &model.cache.audio {
         let (line, color) = match a.state {

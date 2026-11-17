@@ -116,6 +116,7 @@ pub fn backend_name() -> &'static str {
     match super::compute::runtime_kind() {
         super::compute::RuntimeKind::Cuda => "CUDA GPU",
         super::compute::RuntimeKind::Rocm => "ROCm GPU",
+        super::compute::RuntimeKind::DirectMl => "DirectML",
         super::compute::RuntimeKind::Cpu => "CPU",
     }
 }
@@ -132,8 +133,19 @@ fn runtime_path() -> Option<std::path::PathBuf> {
     // their provider libraries; only Fedora's ROCm layout needs the symlinks.
     let rocm_lib = match kind {
         RuntimeKind::Rocm => lib,
-        RuntimeKind::Cuda | RuntimeKind::Cpu => return Some(lib),
+        RuntimeKind::Cuda | RuntimeKind::Cpu | RuntimeKind::DirectMl => return Some(lib),
     };
+    #[cfg(not(unix))]
+    {
+        Some(rocm_lib)
+    }
+    #[cfg(unix)]
+    rocm_symlinks(rocm_lib)
+}
+
+/// See `runtime_path`.
+#[cfg(all(feature = "gpu", unix))]
+fn rocm_symlinks(rocm_lib: std::path::PathBuf) -> Option<std::path::PathBuf> {
     let system = rocm_lib
         .parent()
         .unwrap_or(std::path::Path::new("/usr/lib64/rocm/lib"));
@@ -166,7 +178,7 @@ fn init_runtime() -> Result<()> {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(path) = runtime_path() else {
-            log::error!("no ONNX Runtime library found (install onnxruntime or onnxruntime-rocm, or set ORT_DYLIB_PATH)");
+            log::error!("no ONNX Runtime library found ({NO_RUNTIME_HINT})");
             return;
         };
         // MIOpen prints kernel-search chatter straight to stderr; keep errors only.
@@ -179,6 +191,8 @@ fn init_runtime() -> Result<()> {
         // The ROCm provider library resolves abseil & co. from the global
         // symbol scope, but ort opens the runtime RTLD_LOCAL. Open it
         // RTLD_GLOBAL first (and keep it open) so the provider can link.
+        #[cfg(unix)]
+        // SAFETY: loading the runtime runs its initialisers, as `ort` would.
         unsafe {
             use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
             match Library::open(Some(&path), RTLD_NOW | RTLD_GLOBAL) {
@@ -192,16 +206,69 @@ fn init_runtime() -> Result<()> {
                 RUNTIME_OK.store(true, std::sync::atomic::Ordering::Relaxed);
                 log::info!("ONNX Runtime loaded from {path}");
             }
-            Err(e) => log::error!("could not load ONNX Runtime from {path}: {e} (install onnxruntime-rocm or set ORT_DYLIB_PATH)"),
+            Err(e) => {
+                log::error!("could not load ONNX Runtime from {path}: {e} ({NO_RUNTIME_HINT})")
+            }
         }
     });
     if RUNTIME_OK.load(std::sync::atomic::Ordering::Relaxed) {
         Ok(())
     } else {
         Err(anyhow!(
-            "ONNX Runtime not found. Install the onnxruntime (CPU) or onnxruntime-rocm (AMD GPU) package, or set ORT_DYLIB_PATH."
+            "The AI engine (ONNX Runtime) was not found: {NO_RUNTIME_HINT}."
         ))
     }
+}
+
+/// What to do about a missing runtime, per platform.
+#[cfg(all(feature = "gpu", windows))]
+const NO_RUNTIME_HINT: &str =
+    "onnxruntime.dll must sit next to voice-changer.exe; unpack the whole download again";
+#[cfg(all(feature = "gpu", not(windows)))]
+const NO_RUNTIME_HINT: &str = "install the onnxruntime (CPU) or onnxruntime-rocm (AMD GPU) package, run `voice-changer get-runtime`, or set ORT_DYLIB_PATH";
+
+/// Register DirectML (Windows) through the entry point the DirectML build
+/// of ONNX Runtime exports for it.
+#[cfg(feature = "gpu")]
+fn append_directml(builder: &ort::session::builder::SessionBuilder, device: i32) -> Result<()> {
+    use ort::AsPointer;
+    use ort::sys;
+    type AppendDml = unsafe extern "system" fn(
+        *mut sys::OrtSessionOptions,
+        std::ffi::c_int,
+    ) -> sys::OrtStatusPtr;
+    let (lib, _) = super::compute::runtime_lib().ok_or_else(|| anyhow!("no runtime library"))?;
+    let api = ort::api();
+    // SAFETY: the library is the runtime `ort` already loaded (this only
+    // adds a reference, which is kept); the symbol has the documented
+    // signature and is called on a live session-options object.
+    unsafe {
+        let library = libloading::Library::new(&lib)
+            .map_err(|e| anyhow!("DirectML execution provider: {e}"))?;
+        let result =
+            match library.get::<AppendDml>(b"OrtSessionOptionsAppendExecutionProvider_DML\0") {
+                Ok(append) => {
+                    let status = append(builder.ptr().cast_mut(), device as std::ffi::c_int);
+                    let raw = status.0;
+                    if raw.is_null() {
+                        Ok(())
+                    } else {
+                        let msg = std::ffi::CStr::from_ptr((api.GetErrorMessage)(raw))
+                            .to_string_lossy()
+                            .into_owned();
+                        (api.ReleaseStatus)(raw);
+                        Err(anyhow!("DirectML execution provider: {msg}"))
+                    }
+                }
+                Err(e) => Err(anyhow!(
+                    "DirectML execution provider: this ONNX Runtime has no DirectML ({e})"
+                )),
+            };
+        std::mem::forget(library);
+        result?;
+    }
+    log::info!("DirectML execution provider registered for device {device}");
+    Ok(())
 }
 
 /// Register the CUDA execution provider (Microsoft's GPU build of ONNX
@@ -377,6 +444,15 @@ impl Rvc {
                     }
                     (Backend::Cuda { device }, RuntimeKind::Cuda) => {
                         Some(append_cuda(&builder, device))
+                    }
+                    (Backend::DirectMl { device }, RuntimeKind::DirectMl) => {
+                        // DirectML needs both of these off.
+                        builder = builder
+                            .with_memory_pattern(false)
+                            .map_err(|e| anyhow!("{e}"))?
+                            .with_parallel_execution(false)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        Some(append_directml(&builder, device))
                     }
                     (Backend::Cpu, _) => None,
                     (b, k) => Some(Err(anyhow!(

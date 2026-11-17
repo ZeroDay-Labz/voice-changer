@@ -9,8 +9,13 @@ use vc_core::Preset;
 pub struct AppConfig {
     /// PipeWire `node.name` of the microphone to capture; `None` = system default.
     pub mic: Option<String>,
+    /// The output device the voice plays on (Linux: where "Hear myself"
+    /// goes); `None` = system default.
+    pub output: Option<String>,
     /// Preferred global shortcut in XDG shortcut syntax.
     pub hotkey: String,
+    /// Preferred global shortcut for mute.
+    pub mute_hotkey: String,
     pub start_bypassed: bool,
     pub start_minimized: bool,
     /// Closing the window hides to the tray instead of quitting.
@@ -34,7 +39,9 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             mic: None,
+            output: None,
             hotkey: "CTRL+SHIFT+M".into(),
+            mute_hotkey: "CTRL+SHIFT+U".into(),
             start_bypassed: false,
             start_minimized: false,
             close_to_tray: false,
@@ -98,18 +105,25 @@ pub fn save_state(preset: &Preset) -> anyhow::Result<()> {
 
 // ---------------------------------------------------------------- autostart
 
+#[cfg(windows)]
+pub use crate::desktop::{autostart_enabled, set_autostart};
+
+#[cfg(target_os = "linux")]
 const AUTOSTART_FILE: &str = "io.github.zerodaylabz.VoiceChanger.desktop";
 
+#[cfg(target_os = "linux")]
 fn autostart_path() -> Option<PathBuf> {
     let cfg = vc_core::presets::config_dir()?;
     Some(cfg.parent()?.join("autostart").join(AUTOSTART_FILE))
 }
 
+#[cfg(target_os = "linux")]
 pub fn autostart_enabled() -> bool {
     autostart_path().is_some_and(|p| p.is_file())
 }
 
 /// Write or remove the XDG autostart entry (starts minimized to the tray).
+#[cfg(target_os = "linux")]
 pub fn set_autostart(enabled: bool) -> anyhow::Result<()> {
     let path = autostart_path().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
     if !enabled {

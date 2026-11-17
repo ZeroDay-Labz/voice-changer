@@ -73,11 +73,12 @@ build machines; see "Not tested" at the end.
 ### Not tested
 - **Windows on real sound hardware.** The Windows build compiles, passes its unit tests
   and the engine self-test on a GitHub Windows machine, and loads and runs the AI engine
-  there. Its audio path is the same code that is tested end to end on Linux (through ALSA
+  there on the processor. Its audio path is the same code that is tested end to end on Linux (through ALSA
   into PipeWire, at 44.1, 48 and 96 kHz). But nobody has listened to it on Windows:
   latency, crackle, device hot-plug, the tray and the shortcuts are unverified.
-- **DirectML with a real voice** (only a tiny test model, on the build machine's
-  software adapter).
+- **DirectML (the graphics card on Windows) has never run.** The build machine has no
+  usable graphics adapter: there the AI engine ran its test model on the processor, and
+  asking for DirectML failed and fell back to the processor as designed.
 - **A conversion on an NVIDIA GPU** (the download, the checksums and the loading of the
   libraries are verified, without an NVIDIA card).
 

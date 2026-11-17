@@ -21,8 +21,10 @@ pub struct Knob {
 
 #[derive(Default)]
 pub struct KnobState {
-    dragging: Option<(f32, f32)>, // (start y, start value)
+    /// While dragging: the pointer's last height and the value so far.
+    dragging: Option<(f32, f32)>,
     last_click: Option<Instant>,
+    wheel: super::Wheel,
 }
 
 impl canvas::Program<Message, Theme, iced_renderer::Renderer> for Knob {
@@ -35,7 +37,8 @@ impl canvas::Program<Message, Theme, iced_renderer::Renderer> for Knob {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<Action<Message>> {
-        use iced_core::mouse::{Button, Event as M, ScrollDelta};
+        use iced_core::mouse::{Button, Event as M};
+        state.wheel.observe(event);
         match event {
             iced_core::Event::Mouse(M::ButtonPressed(Button::Left)) => {
                 let pos = cursor.position_over(bounds)?;
@@ -56,9 +59,12 @@ impl canvas::Program<Message, Theme, iced_renderer::Renderer> for Knob {
                 Some(Action::publish(Message::ParamReset(self.ptr)).and_capture())
             }
             iced_core::Event::Mouse(M::CursorMoved { .. }) => {
-                let (start_y, start_v) = state.dragging?;
+                let (last_y, value) = state.dragging?;
                 let y = cursor.position()?.y;
-                let v = (start_v + (start_y - y) / 120.0).clamp(0.0, 1.0);
+                // 120 px for the whole range; five times as far with Shift.
+                let travel = if state.wheel.fine { 600.0 } else { 120.0 };
+                let v = (value + (last_y - y) / travel).clamp(0.0, 1.0);
+                state.dragging = Some((y, v));
                 Some(Action::publish(Message::ParamSet(self.ptr, v)).and_capture())
             }
             iced_core::Event::Mouse(M::ButtonReleased(Button::Left))
@@ -67,12 +73,8 @@ impl canvas::Program<Message, Theme, iced_renderer::Renderer> for Knob {
                 Some(Action::publish(Message::ParamEnd(self.ptr)).and_capture())
             }
             iced_core::Event::Mouse(M::WheelScrolled { delta }) => {
-                cursor.position_in(bounds)?;
-                let step = match delta {
-                    ScrollDelta::Lines { y, .. } => *y,
-                    ScrollDelta::Pixels { y, .. } => *y / 40.0,
-                };
-                let v = (self.value + step * 0.02).clamp(0.0, 1.0);
+                let step = state.wheel.step(delta, cursor.is_over(bounds))?;
+                let v = (self.value + step).clamp(0.0, 1.0);
                 Some(Action::publish(Message::ParamJump(self.ptr, v)).and_capture())
             }
             _ => None,
@@ -147,7 +149,7 @@ impl canvas::Program<Message, Theme, iced_renderer::Renderer> for Knob {
         frame.stroke(
             &Path::line(p1, p2),
             Stroke {
-                style: stroke::Style::Solid(Color::WHITE),
+                style: stroke::Style::Solid(t.text),
                 width: 3.0,
                 line_cap: stroke::LineCap::Round,
                 ..Stroke::default()
@@ -211,13 +213,26 @@ fn slider_core<'a>(ptr: ParamPtr, value: f32, width: f32, mode: theme::Mode) -> 
     super::slider::slider(ptr, value, mode, theme::ACCENT, width)
 }
 
+/// Width of the label column in rows of controls.
+pub const LABEL_WIDTH: f32 = 180.0;
+
 /// Horizontal slider row for a parameter: label, slider, value.
 pub fn param_slider<'a, P: Param>(param: &'a P, mode: theme::Mode, width: f32) -> Element<'a> {
+    param_slider_as(param, param.name(), mode, width)
+}
+
+/// Like [`param_slider`], with the label in the words of the page it is on.
+pub fn param_slider_as<'a, P: Param>(
+    param: &'a P,
+    label: &'a str,
+    mode: theme::Mode,
+    width: f32,
+) -> Element<'a> {
     let t = theme::tokens(mode);
     let value = param.unmodulated_normalized_value();
     let readout = param.normalized_value_to_string(value, true);
     let row = iced_widget::row![
-        container(text(param.name()).size(14).color(t.text_dim)).width(Length::Fixed(130.0)),
+        container(text(label).size(14).color(t.text_dim)).width(Length::Fixed(LABEL_WIDTH)),
         slider_core(param.as_ptr(), value, width, mode),
         container(text(readout).size(13)).width(Length::Fixed(80.0)),
     ]
@@ -228,10 +243,15 @@ pub fn param_slider<'a, P: Param>(param: &'a P, mode: theme::Mode, width: f32) -
 
 /// A labelled toggle for a bool parameter.
 pub fn param_toggle<'a>(param: &'a BoolParam, mode: theme::Mode) -> Element<'a> {
+    param_toggle_as(param, param.name(), mode)
+}
+
+/// Like [`param_toggle`], with the label in the words of the page it is on.
+pub fn param_toggle_as<'a>(param: &'a BoolParam, label: &'a str, mode: theme::Mode) -> Element<'a> {
     let t = theme::tokens(mode);
     let ptr = param.as_ptr();
     let row = iced_widget::row![
-        container(text(param.name()).size(14).color(t.text_dim)).width(Length::Fixed(130.0)),
+        container(text(label).size(14).color(t.text_dim)).width(Length::Fixed(LABEL_WIDTH)),
         iced_widget::toggler(param.value())
             .on_toggle(move |b| Message::ParamBool(ptr, b))
             .style(theme::toggler_style),
@@ -239,23 +259,4 @@ pub fn param_toggle<'a>(param: &'a BoolParam, mode: theme::Mode) -> Element<'a> 
     .spacing(12)
     .align_y(iced_core::Alignment::Center);
     crate::tip(row, crate::help::param(param.name()))
-}
-
-/// Slider + value only (no label); used in the top bar next to the meters.
-pub fn param_slider_compact<'a, P: Param>(
-    param: &'a P,
-    mode: theme::Mode,
-    width: f32,
-) -> Element<'a> {
-    let t = theme::tokens(mode);
-    let value = param.unmodulated_normalized_value();
-    let readout = param.normalized_value_to_string(value, true);
-    let row = iced_widget::row![
-        slider_core(param.as_ptr(), value, width, mode),
-        container(text(readout).size(12).color(t.text_dim)).width(Length::Fixed(64.0))
-    ]
-    .spacing(8)
-    .align_y(iced_core::Alignment::Center);
-    // Top-bar gains are self-explanatory: no hover help here.
-    row.into()
 }

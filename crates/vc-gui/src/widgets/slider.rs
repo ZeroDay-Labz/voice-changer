@@ -22,6 +22,7 @@ pub struct Slider {
 pub struct SliderState {
     dragging: bool,
     last_click: Option<Instant>,
+    wheel: super::Wheel,
 }
 
 const HANDLE_R: f32 = 8.0;
@@ -42,7 +43,8 @@ impl canvas::Program<Message, Theme, iced_renderer::Renderer> for Slider {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<Action<Message>> {
-        use iced_core::mouse::{Button, Event as M, ScrollDelta};
+        use iced_core::mouse::{Button, Event as M};
+        state.wheel.observe(event);
         let cursor = cursor.land();
         match event {
             iced_core::Event::Mouse(M::ButtonPressed(Button::Left)) => {
@@ -86,15 +88,11 @@ impl canvas::Program<Message, Theme, iced_renderer::Renderer> for Slider {
                 Some(Action::publish(Message::ParamEnd(self.ptr)).and_capture())
             }
             iced_core::Event::Mouse(M::WheelScrolled { delta }) => {
-                cursor.position_over(bounds)?;
-                let step = match delta {
-                    ScrollDelta::Lines { y, .. } => *y,
-                    ScrollDelta::Pixels { y, .. } => *y / 40.0,
-                };
+                let step = state.wheel.step(delta, cursor.is_over(bounds))?;
                 Some(
                     Action::publish(Message::ParamJump(
                         self.ptr,
-                        (self.value + step * 0.02).clamp(0.0, 1.0),
+                        (self.value + step).clamp(0.0, 1.0),
                     ))
                     .and_capture(),
                 )
@@ -143,7 +141,16 @@ impl canvas::Program<Message, Theme, iced_renderer::Renderer> for Slider {
             if hovered {
                 Color::WHITE
             } else {
-                Color::from_rgb8(230, 234, 240)
+                Color::from_rgb8(236, 240, 244)
+            },
+        );
+        // A rim, so the handle shows on a light background too.
+        frame.stroke(
+            &Path::circle(Point::new(hx, cy), HANDLE_R),
+            iced_widget::canvas::Stroke {
+                style: iced_widget::canvas::stroke::Style::Solid(self.accent),
+                width: 1.5,
+                ..Default::default()
             },
         );
         vec![frame.into_geometry()]

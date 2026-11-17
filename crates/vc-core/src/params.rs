@@ -22,15 +22,15 @@ pub enum PitchEngine {
 /// end: saved states store the position.
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiSpeed {
-    #[name = "Auto (fastest your machine keeps up with)"]
+    #[name = "Auto (shortest delay that works)"]
     Auto,
-    #[name = "Fast (~0.65 s delay)"]
+    #[name = "Fast (about 0.65 s delay)"]
     Fast,
-    #[name = "Normal (~0.8 s delay)"]
+    #[name = "Normal (about 0.8 s delay)"]
     Normal,
-    #[name = "Safe (~1 s delay)"]
+    #[name = "Safe (about 1 s delay)"]
     Safe,
-    #[name = "Fastest (~0.47 s delay, needs a GPU)"]
+    #[name = "Fastest (about 0.5 s, graphics card)"]
     Fastest,
 }
 

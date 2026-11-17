@@ -16,7 +16,7 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
         if !model.cache.base_models_present {
             col = col.push(base_models_banner(model, mode));
         }
-        col = col.push(importer(model, mode));
+        col = col.push(importer(model, host, mode));
         col = col.push(installed(model, host, mode));
         if let Some(bench) = &model.bench {
             col = col.push(test_bench(bench, host, mode));
@@ -42,7 +42,7 @@ fn test_bench<'a>(bench: &'a crate::BenchState, host: &'a dyn Host, mode: Mode) 
     let t = theme::tokens(mode);
     let busy = bench.recording.is_some();
     let mut rows = column![dim(
-        "Record yourself once, then replay a clip through any voice while you tune it. A clip is only played to Hear myself; your microphone output is silent while it plays, so nobody in a call hears it. Clips stay on this computer.",
+        "Record yourself once, then replay the clip through any voice or effect while you tune it, instead of talking to yourself. Clips stay on this computer.",
         12,
         mode
     )]
@@ -58,7 +58,7 @@ fn test_bench<'a>(bench: &'a crate::BenchState, host: &'a dyn Host, mode: Mode) 
         let record: Element<'a> = match recording {
             Some(progress) => text(format!("Recording… {:.0}%", progress * 100.0))
                 .size(13)
-                .color(theme::CORAL)
+                .color(theme::ink(theme::CORAL, mode))
                 .into(),
             None => button(text(if have { "Record again" } else { "Record 8 s" }).size(13))
                 .style(theme::button_soft)
@@ -81,7 +81,7 @@ fn test_bench<'a>(bench: &'a crate::BenchState, host: &'a dyn Host, mode: Mode) 
         };
         rows = rows.push(
             row![
-                container(text(name).size(14).color(t.text)).width(Length::Fixed(70.0)),
+                container(text(title_case(name)).size(14).color(t.text)).width(Length::Fixed(70.0)),
                 container(dim(what, 12, mode)).width(Length::Fill),
                 record,
                 play,
@@ -94,7 +94,7 @@ fn test_bench<'a>(bench: &'a crate::BenchState, host: &'a dyn Host, mode: Mode) 
         rows = rows.push(
             text("Hear myself is off, so you cannot hear the clip. Turn it on in the top bar.")
                 .size(12)
-                .color(theme::AMBER),
+                .color(theme::ink(theme::AMBER, mode)),
         );
     }
     super::section("Test bench", mode, rows)
@@ -105,9 +105,11 @@ fn base_models_banner<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
     let mut r = row![
         icons::download(18.0, theme::WARN),
         column![
-            text("Base models are missing").size(15).color(theme::WARN),
+            text("One download before AI voices work")
+                .size(15)
+                .color(theme::ink(theme::WARN, mode)),
             dim(
-                "AI voices need ContentVec and RMVPE (about 740 MB, downloaded once).",
+                "AI voices need two helper models (about 740 MB, downloaded once, kept on this computer).",
                 12,
                 mode
             )
@@ -119,7 +121,7 @@ fn base_models_banner<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
     .align_y(Alignment::Center);
     if model.import.is_none() {
         r = r.push(tip(
-            button(text("Download base models").size(13))
+            button(text("Download").size(13))
                 .style(theme::button_primary)
                 .padding([8, 12])
                 .on_press(Message::DownloadBaseModels),
@@ -134,21 +136,61 @@ fn base_models_banner<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
 }
 
 #[cfg(feature = "ai")]
-fn importer<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
+fn title_case(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+/// A bar with a block sliding along it: "working, no idea how long".
+#[cfg(feature = "ai")]
+fn working_bar<'a>(phase: f32) -> Element<'a> {
+    // There and back, so the block does not jump from one end to the other.
+    let pos = if phase < 0.5 {
+        phase * 2.0
+    } else {
+        2.0 - phase * 2.0
+    };
+    let before = (pos * 1000.0) as u16;
+    container(
+        row![
+            iced_widget::space::horizontal().width(Length::FillPortion(before.max(1))),
+            container(iced_widget::space::horizontal())
+                .width(Length::FillPortion(300))
+                .height(Length::Fixed(6.0))
+                .style(|_theme| container::Style {
+                    background: Some(theme::INDIGO.into()),
+                    border: theme::radius(3.0),
+                    ..container::Style::default()
+                }),
+            iced_widget::space::horizontal().width(Length::FillPortion((1000 - before).max(1))),
+        ]
+        .height(Length::Fixed(6.0)),
+    )
+    .width(Length::Fill)
+    .style(|theme| container::Style {
+        background: Some(theme::tokens(theme::mode_of(theme)).meter_bg.into()),
+        border: theme::radius(3.0),
+        ..container::Style::default()
+    })
+    .into()
+}
+
+#[cfg(feature = "ai")]
+fn importer<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> {
     use vc_core::ai::Stage;
     let t = theme::tokens(mode);
     let busy = model.import.is_some();
     let can = !model.import_url.trim().is_empty() && !busy;
     let inputs = row![
-        text_input(
-            "https://huggingface.co/user/voice-model  (or a direct .pth / .onnx / .zip link)",
-            &model.import_url
-        )
-        .on_input(Message::ImportUrlChanged)
-        .on_submit_maybe(can.then_some(Message::StartImport))
-        .size(13)
-        .style(theme::text_input_style)
-        .width(Length::Fill),
+        text_input("Paste a link to a voice", &model.import_url)
+            .on_input(Message::ImportUrlChanged)
+            .on_submit_maybe(can.then_some(Message::StartImport))
+            .size(13)
+            .style(theme::text_input_style)
+            .width(Length::Fill),
         text_input("Name (optional)", &model.import_name)
             .on_input(Message::ImportNameChanged)
             .size(13)
@@ -168,9 +210,23 @@ fn importer<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
     ]
     .spacing(8)
     .align_y(Alignment::Center);
+    let mut inputs = inputs;
+    if host.capabilities().standalone {
+        inputs = inputs.push(tip(
+            button(
+                row![icons::folder(14.0, t.text), text("From a file…").size(13)]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+            )
+            .style(theme::button_soft)
+            .padding([8, 12])
+            .on_press_maybe((!busy).then_some(Message::PickFile(crate::FileRequest::ImportVoice))),
+            crate::help::IMPORT_FILE,
+        ));
+    }
 
     let mut body = column![
-        dim("Paste a voice-models.com voice page, a Hugging Face model page or a direct link. RVC v2 models work; .pth files are converted to ONNX automatically and a matching .index is picked up when present. Each new voice is tried out once so you know what to expect.", 12, mode),
+        dim("Paste the link of a voice from voice-models.com or Hugging Face, or pick a file you already have (you can also drop it on the window). Voices in the RVC format work: .onnx, .pth and .zip files. Each new voice is tried out once so you know what to expect.", 12, mode),
         inputs,
     ]
     .spacing(10);
@@ -190,17 +246,17 @@ fn importer<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
             ),
             Stage::Extracting => ("Unpacking…".into(), None),
             Stage::PreparingConverter => (
-                "Setting up the converter (one-time, downloads ~300 MB of Python packages)…".into(),
+                "Getting the converter ready (once only, about 300 MB to download)…".into(),
                 None,
             ),
             Stage::Converting => (
-                "Converting the model to ONNX (about a minute)…".into(),
+                "Converting the voice so it can be used here (about a minute)…".into(),
                 None,
             ),
             Stage::Checking => ("Trying the voice out (a few seconds)…".into(), None),
             Stage::Checked(result) => (format!("Checked {result}"), Some(1.0)),
             Stage::Done(n) => (format!("Installed “{n}”"), Some(1.0)),
-            Stage::Failed(e) => (format!("Failed: {e}"), None),
+            Stage::Failed(e) => (format!("That did not work: {e}"), None),
             Stage::Idle => (String::new(), None),
         };
         let failed = matches!(stage, Stage::Failed(_));
@@ -233,11 +289,7 @@ fn importer<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
                     .style(theme::progress_style),
             );
         } else if !failed {
-            prog = prog.push(
-                iced_widget::progress_bar(0.0..=1.0, 0.0)
-                    .girth(6.0)
-                    .style(theme::progress_style),
-            );
+            prog = prog.push(working_bar(model.phase));
         }
         body = body.push(
             container(prog)
@@ -245,11 +297,11 @@ fn importer<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
                 .style(theme::raised)
                 .width(Length::Fill),
         );
-        // Keep the last log line visible for the curious.
+        // What exactly is going on, for whoever wants to know.
         if let Ok(log) = job.log.lock()
             && let Some(last) = log.last()
         {
-            body = body.push(dim(last.clone(), 11, mode));
+            body = body.push(dim(format!("Details: {last}"), 11, mode));
         }
     }
     section_accent("Add a voice", theme::INDIGO, mode, body)

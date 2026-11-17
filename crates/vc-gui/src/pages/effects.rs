@@ -1,6 +1,6 @@
 //! Effects: pitch engine and the effect panels, all knobs.
 
-use super::{dim, enum_picker, section, section_accent_with};
+use super::{dim, enum_picker_as, section, section_accent_with};
 use crate::host::Host;
 use crate::theme;
 use crate::theme::Mode;
@@ -15,24 +15,24 @@ pub fn view<'a>(_model: &'a Model, host: &'a dyn Host) -> Element<'a> {
     let mode = host.theme_mode();
     let p = host.params();
     let engine = column![
-        enum_picker(&p.pitch_engine, mode, 220.0),
+        enum_picker_as(&p.pitch_engine, "Method", mode, 220.0),
         dim(
-            "Natural (default) keeps your voice human for small to medium shifts. Fast / Balanced / Smooth are phase-vocoder modes: more robotic on big shifts, lower latency.",
+            "How Pitch and Character are applied. Natural keeps your voice human and suits most presets. Fast, Balanced and Smooth cope better with very large shifts but sound more synthetic; the number is the delay each adds.",
             12,
             mode
         ),
     ]
     .spacing(8);
     column![
-        section("Pitch engine", mode, engine),
+        section("How the pitch is changed", mode, engine),
         row![
             panel(
                 "Voice",
                 theme::ACCENT,
                 mode,
-                &[(&p.pitch, "Pitch"), (&p.formant, "Formant")]
+                &[(&p.pitch, "Pitch"), (&p.formant, "Character")]
             ),
-            panel("Drive", theme::AMBER, mode, &[(&p.drive, "Drive")]),
+            panel("Grit", theme::AMBER, mode, &[(&p.drive, "Grit")]),
             panel(
                 "Robot",
                 theme::CORAL,
@@ -54,7 +54,7 @@ pub fn view<'a>(_model: &'a Model, host: &'a dyn Host) -> Element<'a> {
                 ]
             ),
             panel(
-                "Reverb",
+                "Space",
                 theme::INDIGO,
                 mode,
                 &[

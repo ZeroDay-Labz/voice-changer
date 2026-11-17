@@ -5,8 +5,9 @@
 <h1 align="center">Voice Changer</h1>
 
 <p align="center">
-  A realtime voice changer for Linux that shows up as a microphone called <b>Voice Changer Mic</b>.
-  Natural pitch shifting, effects, presets and local AI voices. Discord, OBS and your softphone just pick the mic.
+  A realtime voice changer for Linux and Windows.
+  Natural pitch shifting, effects, presets and local AI voices, with level meters, a mute button and nothing to configure.
+  On Linux it shows up as a microphone called <b>Voice Changer Mic</b>; on Windows you pick an input and an output.
 </p>
 
 <p align="center">
@@ -22,9 +23,14 @@
 
 ## What is it?
 
-Voice Changer sits between your microphone and everything else. It cleans the signal up,
-changes the voice, and publishes the result as a new PipeWire microphone. Any app that can
-pick a microphone can use it. There is nothing to configure in PulseAudio or JACK.
+Voice Changer sits between your microphone and everything else. It cleans the signal up
+and changes the voice.
+
+- **On Linux** the result is a new microphone, **Voice Changer Mic**. Any app that can pick
+  a microphone can use it. There is nothing to configure in PulseAudio or JACK.
+- **On Windows** you pick a microphone and an output device, and the changed voice plays on
+  that output: headphones, a mixer, an audio interface. No virtual device is created and no
+  sound setting is touched ([more](#windows)).
 
 - **Sounds like a person.** The default **Natural** pitch engine is pitch-synchronous
   (the technique hardware voice transformers use), so shifted voices stay human instead of
@@ -36,9 +42,16 @@ pick a microphone can use it. There is nothing to configure in PulseAudio or JAC
   closer match.
 - **Clean input.** Neural noise suppression (RNNoise) and a voice-only gate run before
   everything else, so fans, keyboards and breaths do not get turned into voice.
-- **One big switch.** ON/OFF in the window, in the tray, on a global shortcut, or from the
-  terminal with `voice-changer toggle`.
-- **Hear myself.** One click plays the processed voice to your headphones.
+- **One big switch, and a mute.** ON/OFF and Mute in the window, in the tray, on global
+  shortcuts, or from the terminal (`voice-changer toggle`, `voice-changer mute`). OFF passes
+  your own voice through; Mute sends nothing: a cough button.
+- **You can see what is going on.** Level meters for the microphone and the output with a
+  scale, a zone to aim for and a clip warning; the delay, including the AI voice's, in the
+  sidebar; problems explained in a sentence next to the button that fixes them.
+- **Pick your devices.** Microphone and output in the top bar. A device that is unplugged
+  is used again by itself when it comes back.
+- **Hear myself.** One click plays the changed voice to the output you picked.
+- **Your own presets.** Save, rename, update, share as a file, import.
 - **Also a plugin.** The same engine and interface load as a **CLAP** plugin in your DAW.
 
 <p align="center">
@@ -58,10 +71,11 @@ pick a microphone can use it. There is nothing to configure in PulseAudio or JAC
 | **Debian, Ubuntu, Mint, Zorin, Pop!_OS** | Download the `.deb`, then `sudo apt install ./voice-changer_*.deb` |
 | **Arch, Manjaro, EndeavourOS** | `git clone` this repository, `cd packaging/aur`, `makepkg -si` |
 | **Any Linux (also Steam Deck desktop mode)** | Download `VoiceChanger.flatpak`, then `flatpak install --user ./VoiceChanger.flatpak`; or unpack the `.tar.gz` and run `./voice-changer` (the CLAP plugin is in the same folder) |
+| **Windows 10 and 11 (preview)** | Download `voice-changer-windows-x64.zip`, unpack it anywhere, start `voice-changer.exe`. Nothing is installed. See [Windows](#windows). |
 | **From source** | See [Building](#building). `scripts/install.sh` builds and installs everything for your user. |
 
-Every asset comes for **x86_64** and **aarch64** (Raspberry Pi 5, Asahi Linux, ARM
-laptops), with a `SHA256SUMS` file next to them.
+Every Linux asset comes for **x86_64** and **aarch64** (Raspberry Pi 5, Asahi Linux, ARM
+laptops); the Windows build is x64. A `SHA256SUMS` file sits next to them.
 
 AI voices run on the processor everywhere. AMD GPUs are used out of the box with the
 `onnxruntime-rocm` package; NVIDIA GPUs after `voice-changer get-runtime --cuda` (see
@@ -71,7 +85,7 @@ and what is missing.
 The packages install the app, the CLAP plugin (`/usr/lib64/clap/` or `/usr/lib/clap/`), a
 launcher and the icon. AI voice models are downloaded separately (see [AI voices](#ai-voices)).
 
-### Requirements
+### Requirements (Linux)
 
 | | |
 |---|---|
@@ -85,27 +99,55 @@ Ubuntu 22.04 and Debian 12 ship PulseAudio as the default sound server; install
 and in, and you are set. **`voice-changer doctor`** tells you exactly what is missing
 and what to install.
 
+### Windows
+
+The Windows version is a **preview**: it is built and tested automatically (including the
+audio path, on Linux, and the AI engine, on Windows), but its author has no Windows machine
+and has not run it on real sound hardware. Please [report](https://github.com/ZeroDay-Labz/voice-changer/issues) what you find.
+
+- **No virtual audio cable, no driver.** Pick your microphone and an output in the top bar.
+  The changed voice plays on that output. Nothing is installed; your sound settings are not
+  touched; delete the folder to remove it.
+- **Good for** a DJ or radio set-up, a podcast through a mixer or an audio interface,
+  monitoring, recording the output of your interface.
+- **Getting the voice into a call or a recording program** needs something that turns an
+  output into an input: a mixer or interface with loopback, or a virtual cable you installed
+  yourself. If you have one, it simply appears in the output list.
+- The first start may show "Windows protected your PC" (the program is not signed): *More
+  info*, then *Run anyway*.
+- AI voices run on the processor. The graphics card (DirectML) can be picked under
+  **Home → AI voice → More settings → Runs on** and is experimental: if it cannot run a
+  voice the processor takes over, and it is left alone after a crash.
+- `.pth` voices need Python 3 installed for the one-time conversion; `.onnx` voices do not.
+
 ## Using it
 
-1. Start **Voice Changer** from your launcher (or run `voice-changer`).
+1. Start **Voice Changer** from your launcher (or run `voice-changer`). The **First steps**
+   card walks you through the microphone, the output and a first voice.
 2. Pick a preset on **Home**, or turn the quick-tweak knobs.
-3. In Discord, OBS, your softphone, choose **Voice Changer Mic** as the input device.
-4. Tick **Hear myself** to check how you sound. Use headphones.
+3. Linux: in Discord, OBS, your softphone, choose **Voice Changer Mic** as the input
+   device. Windows: the voice is already playing on the output you picked.
+4. Linux: press **Hear myself** to check how you sound. Use headphones.
 
 | Where | What |
 |---|---|
-| **Home** | Preset cards with search and favourites, quick tweaks (Pitch, Character, Grit, Space, Echo), the AI voice card |
-| **Voices** | Import AI voices from a link, list and delete installed ones, download the base models |
-| **Effects** | Pitch engine, Voice, Drive, Robot, Echo, Reverb, Tone |
-| **Mixer** | Input and output gain, auto level, limiter, noise suppression, voice-only gate, noise gate |
-| **Settings** | Microphone, hear-myself, audio status, close to tray, start minimized, autostart, hotkey, AI threads and engine, theme, log |
+| **Top bar** | ON/OFF, Mute, Hear myself, the microphone and output meters, the microphone and output pickers |
+| **Home** | Preset cards with search, favourites and an Edit mode (rename, share, delete, import), quick tweaks (Pitch, Character, Grit, Space, Echo), the AI voice card |
+| **Voices** | Add AI voices from a link or a file, list and delete installed ones, download the base models, the test bench |
+| **Effects** | How the pitch is changed, Voice, Grit, Robot, Echo, Space, Tone |
+| **Mixer** | Input and output level, keep my level steady, prevent distortion, background noise removal, voice-only gate, noise gate; on Linux, where the voice is sent |
+| **Settings** | Microphone, output, sound status, delay, dropouts and buffer size, window behaviour, every shortcut, AI threads and engine, theme and size, log |
 
-Knobs: drag up or down, roll the mouse wheel, double-click or right-click to go back to the
-default. Sliders: drag or click anywhere on the rail, wheel, and the same double-click or
-right-click reset. Hover any control for a moment and it explains itself (the top bar is left
-alone; it speaks for itself).
+Knobs: drag up or down, roll the mouse wheel, hold **Shift** for fine steps, double-click or
+right-click to go back to the default. Sliders: drag or click anywhere on the rail, wheel,
+and the same reset. Scrolling a page never changes a control the pointer passes over. Hover
+any control for a moment and it explains itself.
 
-**Where the voice goes.** Any app can pick **Voice Changer Mic** in its own settings. The
+**The meters.** Speak normally and the **Mic** bar should reach the shaded zone (−18 to
+−6 dB). **CLIP** means it was too loud a moment ago: turn the microphone down. The **Out**
+bar is what leaves the voice changer; it turns grey while the voice changer is off.
+
+**Where the voice goes (Linux).** Any app can pick **Voice Changer Mic** in its own settings. The
 Mixer page's *Send the voice to* section does it for you: **Use as the microphone for
 everything** makes it the system default while the app runs (your previous default comes back
 when you turn it off or quit), and the list below sends it to individual recording
@@ -114,14 +156,19 @@ applications, Discord, OBS, a browser tab, without touching anything else.
 | Shortcut | Action |
 |---|---|
 | `Ctrl+M` or `Ctrl+Space` | Toggle on/off (window focused) |
+| `Ctrl+U` | Mute |
 | `Ctrl+H` | Hear myself |
 | `Ctrl+1` … `Ctrl+5` | Home, Voices, Effects, Mixer, Settings |
 | `Ctrl+,` | Settings |
 | `Ctrl+F` | Search presets |
 | `Ctrl+S` | Save the current settings as a preset |
-| `Esc` | Cancel a save or delete prompt |
+| `Esc` | Cancel a save, rename or delete prompt; clear the search |
 | `Ctrl+Q` | Quit |
-| `Ctrl+Shift+M` | Global toggle, from any app (desktop portal; change it under Settings → On/off hotkey) |
+| `Ctrl+Shift+M` | Global on/off, from any app |
+| `Ctrl+Shift+U` | Global mute, from any app |
+
+The global shortcuts go through the desktop portal on Linux (change them under Settings →
+Shortcuts) and are registered directly on Windows. Settings → Shortcuts lists them all.
 
 Closing the window quits and saves your state. Turn on **Close to tray** in Settings if you
 would rather have it keep running in the tray.
@@ -134,8 +181,10 @@ Everything the window does is also a command against the running instance:
 voice-changer                      # window + tray + virtual mic
 voice-changer toggle               # flip on/off (bind this to a key if the portal shortcut is unavailable)
 voice-changer on | off | status
+voice-changer mute                 # mute or unmute; `mute on`, `mute off`
 voice-changer preset Robot         # apply a preset; `presets` lists them
-voice-changer mics                 # list microphones; `mic <node.name>` switches, `mic default` resets
+voice-changer mics                 # list microphones; `mic <name>` switches, `mic default` resets
+voice-changer outputs              # list outputs; `output <name>` switches, `output default` resets
 voice-changer monitor on           # hear yourself; `monitor off`
 voice-changer apps                 # who is recording and whether they get the voice
 voice-changer route Discord on     # send the voice to an application; `route Discord off`
@@ -147,7 +196,7 @@ voice-changer voices remove "Nice Voice"
 voice-changer show | quit
 voice-changer doctor               # check this computer: PipeWire, session manager, mics, GPU, models, tray
 voice-changer --self-test          # run the engine through every preset (no audio devices needed)
-voice-changer --quantum 512        # bigger audio block if you hear dropouts
+voice-changer --quantum 512        # bigger audio block if you hear dropouts (or Settings → Buffer)
 voice-changer --ai-threads 4       # AI inference threads (default: auto, from your CPU)
 voice-changer --help
 ```
@@ -159,7 +208,8 @@ Any **RVC v2** model works, which is the format almost every community voice com
 1. **Base models.** The Voices page offers a one-click download of ContentVec and RMVPE
    (MIT licensed, about 740 MB), or run `scripts/get-models.sh`.
 2. **Add a voice.** Paste a voice-models.com voice page, a Hugging Face model page or a
-   direct `.pth` / `.onnx` / `.zip` link into **Voices → Add a voice**. `.pth` files are converted to ONNX automatically
+   direct `.pth` / `.onnx` / `.zip` link into **Voices → Add a voice**, pick a file with
+   **From a file…**, or drop the file on the window. `.pth` files are converted to ONNX automatically
    (the first conversion sets up a small Python environment, about 300 MB). A matching
    `.index` file is picked up when the repository or zip has one.
 3. **Use it.** Press **Use** on the voice, or pick it on the Home page's AI card.
@@ -268,8 +318,10 @@ built with `--features vst3` (mind Steinberg's licensing terms).
 | Noise suppression | + 10 ms |
 | AI voice | + 0.5–1 s (needs a block of speech to convert) |
 
-The current figure is shown in the sidebar. `--quantum 128` shaves 2.7 ms if your
-interface copes; USB headsets usually do not.
+The current figure, including the AI voice's delay while one is running, is shown in the
+sidebar. Settings → Buffer → *Small* (or `--quantum 128`) shaves 2.7 ms if your interface
+copes; USB headsets usually do not. On Windows add the two devices' own buffers, about
+10 ms each in shared mode.
 
 ## Troubleshooting
 
@@ -293,11 +345,16 @@ portal, and prints the fix for anything missing.
 - **No window and no tray icon.** GNOME needs the AppIndicator extension for a tray; the
   app opens its window instead when "Start minimized" finds no tray. `voice-changer show`
   always brings it up.
-- **Pops or crackle.** Check the sidebar for "dropouts". Start with a bigger block
-  (`voice-changer --quantum 512`), then run `pw-top` while speaking: an `ERR` count rising
-  on your microphone or on `voice_changer.*` nodes confirms PipeWire xruns.
-- **Words get cut.** Turn off **Voice only** in Mixer, or raise **Voice Gate Depth**
-  (e.g. −20 dB) so more passes between words.
+- **Pops or crackle.** Check the sidebar for "dropouts". Pick a larger **Buffer** under
+  Settings → Sound and start Voice Changer again. On Linux, `pw-top` while speaking shows
+  whether PipeWire itself is dropping (`ERR` rising on your microphone or on
+  `voice_changer.*` nodes).
+- **Windows: no sound from the microphone.** Settings → Privacy & security → Microphone:
+  allow desktop apps to use it. Then check the microphone picker in the top bar.
+- **Windows: the meters move but I hear nothing.** Pick the output you are listening on in
+  the top bar (the speaker icon), and check that Mute is not red.
+- **Words get cut.** Turn off **Only let my voice through** in Mixer, or raise **Quiet
+  between words** (e.g. −20 dB) so more passes between words.
 - **No "Voice Changer Mic" in an app.** The node exists only while the app runs. Flatpak
   apps need PipeWire access (`--filesystem=xdg-run/pipewire-0`).
 - **The app runs, the meters move, but nobody hears the changed voice.** The other app is
@@ -319,6 +376,9 @@ portal, and prints the fix for anything missing.
   the microphone.
 
 ## Where your stuff is kept
+
+On Windows everything is under `%APPDATA%\echo\voice-changer\` (`config` and `data`);
+the table below is for Linux.
 
 | | |
 |---|---|
@@ -345,6 +405,11 @@ scripts/install.sh --cpu-only   # without the dynamic runtime loader
 cargo run                       # or just run it from the tree
 ```
 
+On Windows: Rust with the MSVC toolchain, then `cargo build --release -p vc-app -p vc-plugin`
+and `scripts\package-windows.ps1` (fetches the AI engine and assembles the folder).
+`cargo build -p vc-app --features backend-cpal` builds the Windows audio path on Linux,
+which is how it is tested (`scripts/ci/smoke-devices.sh`).
+
 Rust 1.88 or newer. `cargo test --workspace` runs the DSP and index tests;
 `cargo clippy --workspace --all-targets` must stay clean. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -353,18 +418,21 @@ Rust 1.88 or newer. `cargo test --workspace` runs the DSP and index tests;
 | `vc-dsp` | Realtime-safe engine (no allocation or locks in `process`) |
 | `vc-core` | Parameters, presets, pipeline, AI inference and voice library |
 | `vc-gui` | iced interface shared by the app and the plugin |
-| `vc-app` | Standalone: PipeWire virtual mic, window, tray, hotkey, D-Bus, CLI |
+| `vc-app` | Standalone: audio (PipeWire virtual mic on Linux, input and output devices on Windows), window, tray, hotkeys, remote control, CLI |
 | `vc-plugin` | CLAP (and optional VST3) plugin via nice-plug |
 
 ## Notes
 
 - Mono, 48 kHz internally; multichannel plugin inputs are folded to mono and fanned out.
-- The D-Bus interface is `org.voicechanger.Control` on the session bus; the CLI is a thin
-  client for it.
+- On Linux the D-Bus interface is `org.voicechanger.Control` on the session bus and the
+  CLI is a thin client for it. On Windows the CLI talks to the running program over a
+  named pipe.
 - ONNX Runtime upstream dropped its ROCm build; the app loads the distribution's
   `onnxruntime-rocm` library at runtime instead, and Microsoft's CUDA build for NVIDIA.
 - Screenshots in this README are rendered by the app itself:
   `voice-changer --screenshot docs/screenshots/home.png --page home`.
+- `voice-changer --ai-self-test` loads the AI engine and runs a tiny built-in model on the
+  processor and on the graphics card, without needing a voice.
 
 ## License
 

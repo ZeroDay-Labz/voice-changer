@@ -1,8 +1,9 @@
 name: Build and Release
 
-# Runs when a tag like `v0.3.0` is pushed. Produces, for x86_64 and aarch64:
-# a portable tarball (runs on glibc 2.35+: Ubuntu 22.04, Debian 12, Mint 21,
-# Zorin 17 and newer), an RPM, a .deb; plus a Flatpak bundle and checksums.
+# Runs when a tag like `v0.3.0` is pushed. Produces, for Linux x86_64 and
+# aarch64: a portable tarball (runs on glibc 2.35+: Ubuntu 22.04, Debian 12,
+# Mint 21, Zorin 17 and newer), an RPM, a .deb; a Flatpak bundle; a Windows
+# x64 zip; and checksums.
 on:
   push:
     tags:
@@ -17,8 +18,22 @@ env:
   GLIBC_TARGET: "2.35"
 
 jobs:
+  # A tag that does not match the version in Cargo.toml would publish
+  # packages whose names and "About" disagree with the release.
+  version:
+    name: Tag matches the version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          echo "tag $tag, Cargo.toml $version"
+          [ "$tag" = "$version" ] || { echo "::error::tag v$tag does not match version $version in Cargo.toml"; exit 1; }
+
   linux:
     name: Linux ${{ matrix.arch }}
+    needs: version
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -125,6 +140,7 @@ jobs:
 
   flatpak:
     name: Flatpak bundle
+    needs: version
     runs-on: ubuntu-24.04
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
@@ -148,10 +164,40 @@ jobs:
           name: flatpak
           path: VoiceChanger.flatpak
 
+  # A folder that runs from wherever it is unpacked: the program, the CLAP
+  # plugin and the AI engine. Nothing is installed.
+  windows:
+    name: Windows x64
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the app and the CLAP plugin
+        run: cargo build --release -p vc-app -p vc-plugin
+      - name: Package
+        shell: pwsh
+        run: scripts\package-windows.ps1 -Out dist
+      - name: The packaged program starts, passes its self-tests and finds its AI engine
+        shell: pwsh
+        run: |
+          $exe = "dist\voice-changer-windows-x64\voice-changer.exe"
+          & $exe --self-test | Out-Host
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $exe --ai-self-test | Out-Host
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/voice-changer-windows-x64.zip
+
   release:
     name: Publish release
-    needs: [linux, flatpak]
-    if: always() && needs.linux.result == 'success'
+    needs: [linux, flatpak, windows]
+    # The Flatpak may fail without holding the release back; Linux and
+    # Windows may not.
+    if: always() && needs.linux.result == 'success' && needs.windows.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4

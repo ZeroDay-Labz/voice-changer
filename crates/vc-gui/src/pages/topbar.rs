@@ -2,17 +2,31 @@
 
 use crate::host::Host;
 use crate::theme::{self, Mode};
-use crate::widgets::{icons, knob::param_slider_compact, meter::meter};
+use crate::widgets::{icons, meter::meter};
 use crate::{Element, Message, Model, tip};
 use iced_core::{Alignment, Color, Length};
-use iced_widget::{button, column, container, pick_list, row, text, toggler};
-use nice_plug::prelude::*;
+use iced_widget::{button, column, container, pick_list, row, text};
+
+/// Below this width the buttons drop their words and keep their icons.
+const COMPACT_BELOW: f32 = 860.0;
+/// Room the top bar takes, so the page below never jumps.
+const HEIGHT: f32 = 84.0;
 
 pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
+    container(iced_widget::responsive(move |size| {
+        bar(model, host, size.width < COMPACT_BELOW)
+    }))
+    .height(Length::Fixed(HEIGHT))
+    .width(Length::Fill)
+    .into()
+}
+
+fn bar<'a>(model: &'a Model, host: &'a dyn Host, compact: bool) -> Element<'a> {
     let mode = host.theme_mode();
     let t = theme::tokens(mode);
     let p = host.params();
     let on = !p.bypass.value();
+    let muted = p.mute.value();
 
     let power = tip(
         button(
@@ -33,27 +47,57 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
         .style(theme::power_button(on))
         .padding(crate::pad(12.0, 20.0, 12.0, 16.0))
         .on_press(Message::TogglePower),
-        "",
+        if on {
+            crate::help::POWER_ON
+        } else {
+            crate::help::POWER_OFF
+        },
     );
 
-    let mut left = row![power].spacing(10).align_y(Alignment::Center);
+    // Icon and words, or the icon alone when the window is narrow.
+    let labelled = |icon: Element<'a>, label: &'a str| -> Element<'a> {
+        if compact {
+            icon
+        } else {
+            row![icon, text(label).size(14)]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .into()
+        }
+    };
+    let mute = tip(
+        button(labelled(
+            icons::mic_off(18.0, if muted { Color::WHITE } else { t.text }),
+            if muted { "Muted" } else { "Mute" },
+        ))
+        .style(if muted {
+            theme::button_danger_solid
+        } else {
+            theme::button_soft
+        })
+        .padding([10, 14])
+        .on_press(Message::ToggleMute),
+        if muted {
+            crate::help::MUTED
+        } else {
+            crate::help::MUTE
+        },
+    );
+
+    let mut left = row![power, mute].spacing(10).align_y(Alignment::Center);
     if let Some(mon) = host.monitor() {
         left = left.push(tip(
-            button(
-                row![
-                    icons::headphones(
-                        18.0,
-                        if mon {
-                            Color::from_rgb8(8, 30, 40)
-                        } else {
-                            t.text
-                        }
-                    ),
-                    text("Hear myself").size(14)
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            )
+            button(labelled(
+                icons::headphones(
+                    18.0,
+                    if mon {
+                        Color::from_rgb8(8, 30, 40)
+                    } else {
+                        t.text
+                    },
+                ),
+                "Hear myself",
+            ))
             .style(if mon {
                 theme::button_sky
             } else {
@@ -61,18 +105,19 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
             })
             .padding([10, 14])
             .on_press(Message::ToggleMonitor),
-            "",
+            crate::help::HEAR_MYSELF,
         ));
     }
 
     let meters = column![
         meter_line(
-            "In",
+            "Mic",
             model.meters.input,
             model.meters.in_hold,
             !model.meters.gate_open,
-            &p.input_gain,
-            Some(&p.auto_level),
+            model.meters.in_clipped(),
+            false,
+            crate::help::METER_IN,
             mode
         ),
         meter_line(
@@ -80,95 +125,75 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
             model.meters.output,
             model.meters.out_hold,
             !on,
-            &p.output_gain,
-            None,
+            model.meters.out_clipped(),
+            true,
+            crate::help::METER_OUT,
             mode
         ),
     ]
     .spacing(6)
-    .width(Length::FillPortion(3));
+    .width(Length::Fill);
 
-    let mut right = row![].spacing(10).align_y(Alignment::Center);
-    let preset_name = model
-        .current_preset
-        .clone()
-        .unwrap_or_else(|| "Custom".into());
-    right = right.push(tip(
-        container(
-            row![icons::star(13.0, t.text_dim), text(preset_name).size(13)]
-                .spacing(6)
-                .align_y(Alignment::Center),
-        )
-        .padding([6, 12])
-        .style(theme::pill),
-        "",
-    ));
+    let mut bar = row![left, meters].spacing(18).align_y(Alignment::Center);
     let caps = host.capabilities();
     if caps.microphone || caps.output {
+        let width = if compact { 170.0 } else { 200.0 };
         let mut pickers = column![].spacing(6);
         if caps.microphone {
-            pickers = pickers.push(mic_picker(model, host, 200.0, true));
+            pickers = pickers.push(mic_picker(model, host, width, true));
         }
         if caps.output {
-            pickers = pickers.push(output_picker(model, host, 200.0, true));
+            pickers = pickers.push(output_picker(model, host, width, true));
         }
-        right = right.push(pickers);
+        bar = bar.push(pickers);
     }
 
-    container(
-        row![left, meters, right]
-            .spacing(18)
-            .align_y(Alignment::Center)
-            .width(Length::Fill),
-    )
-    .padding(crate::pad(14.0, 24.0, 10.0, 24.0))
-    .width(Length::Fill)
-    .into()
+    container(bar.width(Length::Fill))
+        .padding(crate::pad(14.0, 24.0, 6.0, 24.0))
+        .width(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn meter_line<'a>(
     label: &'a str,
     level: f32,
     hold: f32,
     muted: bool,
-    gain: &'a FloatParam,
-    auto: Option<&'a BoolParam>,
+    clipped: bool,
+    scale: bool,
+    help: &'a str,
     mode: Mode,
 ) -> Element<'a> {
     let t = theme::tokens(mode);
-    let mut r = row![
-        container(text(label).size(12).color(t.text_dim)).width(Length::Fixed(26.0)),
-        meter(level, hold, muted, mode, Length::Fill),
-        container(text(peak_db(hold)).size(11).color(if hold >= 0.99 {
-            theme::DANGER
-        } else {
-            t.text_dim
-        }))
-        .width(Length::Fixed(34.0)),
-        param_slider_compact(gain, mode, 92.0),
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center);
-    if let Some(a) = auto {
-        let ptr = a.as_ptr();
-        r = r.push(tip(
-            toggler(a.value())
-                .label("Auto")
-                .text_size(12)
-                .size(16)
-                .on_toggle(move |b| Message::ParamBool(ptr, b))
-                .style(theme::toggler_style),
-            "",
-        ));
-    }
-    r.into()
+    let readout: Element<'a> = if clipped {
+        text("CLIP").size(11).color(theme::DANGER).into()
+    } else {
+        text(peak_db(hold))
+            .size(11)
+            .color(t.text_dim)
+            .wrapping(iced_core::text::Wrapping::None)
+            .into()
+    };
+    tip(
+        row![
+            container(text(label).size(12).color(t.text_dim)).width(Length::Fixed(26.0)),
+            meter(level, hold, muted, clipped, scale, mode, Length::Fill),
+            container(readout).width(Length::Fixed(46.0)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Start),
+        help,
+    )
 }
 
 fn peak_db(level: f32) -> String {
-    if level <= 1e-4 {
-        "−∞".into()
+    if level <= 1e-3 {
+        // Below the bottom of the scale.
+        "quiet".into()
     } else {
-        format!("{:.0}", 20.0 * level.log10())
+        format!("{:.0} dB", 20.0 * level.log10())
     }
 }
 
@@ -281,37 +306,84 @@ pub fn output_picker<'a>(
     )
 }
 
-/// Latency / compute / dropouts summary for the sidebar.
+/// The delay the voice changer adds, in words a non-engineer reads at a
+/// glance: milliseconds while small, seconds once the AI voice is in.
+pub fn delay_text(host: &dyn Host) -> String {
+    format!("{} delay", delay_value(host))
+}
+
+/// The delay alone: "38 ms" or "about 0.6 s".
+pub fn delay_value(host: &dyn Host) -> String {
+    let ms = host.latency_ms();
+    if ms < 100.0 {
+        format!("{ms:.0} ms")
+    } else {
+        format!("about {:.1} s", ms / 1000.0)
+    }
+}
+
+/// State, preset, delay, dropouts and AI summary for the sidebar.
 pub fn status_pill<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
     let mode = host.theme_mode();
     let t = theme::tokens(mode);
     let mut lines = column![].spacing(2);
     let mut dot = theme::ACCENT;
-    if let Some(a) = &model.cache.audio {
-        match a.state {
-            crate::AudioState::Failed => {
-                dot = theme::DANGER;
-                lines = lines.push(text("Audio not running").size(12).color(theme::DANGER));
-            }
-            crate::AudioState::Reconnecting | crate::AudioState::Starting => {
-                dot = theme::WARN;
-                lines = lines.push(text("Reconnecting audio…").size(12).color(theme::WARN));
-            }
-            crate::AudioState::Running => {
-                let line = match a.listeners {
-                    0 => "No app listening".to_string(),
-                    1 => "1 app listening".to_string(),
-                    n => format!("{n} apps listening"),
-                };
-                lines = lines.push(text(line).size(12).color(if a.listeners == 0 {
-                    t.text_dim
-                } else {
-                    theme::SKY
-                }));
-            }
-        }
+    let p = host.params();
+    // The first line says in words what state the voice is in; the dot's
+    // colour only repeats it.
+    let audio_state = model.cache.audio.as_ref().map(|a| a.state);
+    if p.mute.value() {
+        dot = theme::DANGER;
+        lines = lines.push(text("Muted").size(12).color(theme::DANGER));
+    } else if audio_state == Some(crate::AudioState::Failed) {
+        dot = theme::DANGER;
+        lines = lines.push(text("Audio not running").size(12).color(theme::DANGER));
+    } else if matches!(
+        audio_state,
+        Some(crate::AudioState::Reconnecting | crate::AudioState::Starting)
+    ) {
+        dot = theme::WARN;
+        lines = lines.push(
+            text("Reconnecting audio…")
+                .size(12)
+                .color(theme::ink(theme::WARN, mode)),
+        );
+    } else if p.bypass.value() {
+        dot = t.text_dim;
+        lines = lines.push(text("Off: your own voice").size(12).color(t.text_dim));
+    } else {
+        lines = lines.push(
+            text("Voice changer on")
+                .size(12)
+                .color(theme::ink(theme::ACCENT, mode)),
+        );
     }
-    lines = lines.push(text(format!("{:.1} ms latency", host.latency_ms())).size(12));
+    if let Some(a) = &model.cache.audio
+        && a.state == crate::AudioState::Running
+        && host.capabilities().routing
+    {
+        let line = match a.listeners {
+            0 => "No app listening".to_string(),
+            1 => "1 app listening".to_string(),
+            n => format!("{n} apps listening"),
+        };
+        lines = lines.push(text(line).size(12).color(if a.listeners == 0 {
+            t.text_dim
+        } else {
+            theme::SKY
+        }));
+    }
+    lines = lines.push(
+        text(
+            model
+                .current_preset
+                .clone()
+                .unwrap_or_else(|| "Custom settings".into()),
+        )
+        .size(12)
+        .color(t.text),
+    );
+    lines = lines.push(text(delay_text(host)).size(12).color(t.text_dim));
     if let Some(stats) = host.stats()
         && stats.underruns > 0
     {
@@ -319,7 +391,7 @@ pub fn status_pill<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
         lines = lines.push(
             text(format!("{} dropouts", stats.underruns))
                 .size(12)
-                .color(theme::WARN),
+                .color(theme::ink(theme::WARN, mode)),
         );
     }
     #[cfg(feature = "ai")]
@@ -328,7 +400,11 @@ pub fn status_pill<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
         match ai.state() {
             AiState::Off => {}
             AiState::Loading => {
-                lines = lines.push(text("AI loading…").size(12).color(theme::ACCENT));
+                lines = lines.push(
+                    text("AI loading…")
+                        .size(12)
+                        .color(theme::ink(theme::ACCENT, mode)),
+                );
             }
             AiState::Error => {
                 dot = theme::DANGER;

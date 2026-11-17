@@ -816,31 +816,52 @@ fn run_logged(status: &ImportStatus, cmd: &mut Command) -> Result<()> {
 fn ensure_converter(status: &ImportStatus) -> Result<PathBuf> {
     let tools = tools_dir()?;
     let venv = tools.join("venv");
-    let python = venv.join("bin/python");
+    let python = if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin/python")
+    };
     let script = tools.join("rvc_export.py");
     std::fs::write(&script, EXPORTER_PY)?;
     if !python.is_file() {
         status.set(Stage::PreparingConverter);
         status.note("creating Python environment for the converter (one-time)");
+        // Windows calls it `python` (or `py`); there is no `python3`.
+        let system_python = if cfg!(windows) { "python" } else { "python3" };
         run_logged(
             status,
-            Command::new("python3").args(["-m", "venv"]).arg(&venv),
-        )?;
+            crate::quiet_command(system_python)
+                .args(["-m", "venv"])
+                .arg(&venv),
+        )
+        .with_context(|| {
+            if cfg!(windows) {
+                "this voice is a .pth file, which has to be converted with Python. Install Python 3 from python.org (tick “Add python.exe to PATH”), or get the voice as an .onnx file"
+            } else {
+                "this voice is a .pth file, which has to be converted with Python. Install python3, or get the voice as an .onnx file"
+            }
+        })?;
     }
-    let probe = Command::new(&python)
+    let probe = crate::quiet_command(&python)
         .args(["-c", "import torch, onnx, numpy, onnxscript, scipy"])
         .output();
     if !probe.map(|o| o.status.success()).unwrap_or(false) {
         status.set(Stage::PreparingConverter);
         status.note("installing torch (CPU build, ~300 MB) and ONNX tools");
-        let pip = venv.join("bin/pip");
+        // `python -m pip` rather than the pip program: on Windows pip
+        // cannot replace itself while it runs.
+        let pip = || {
+            let mut c = crate::quiet_command(&python);
+            c.args(["-m", "pip"]);
+            c
+        };
         run_logged(
             status,
-            Command::new(&pip).args(["install", "--quiet", "--upgrade", "pip"]),
+            pip().args(["install", "--quiet", "--upgrade", "pip"]),
         )?;
         run_logged(
             status,
-            Command::new(&pip).args([
+            pip().args([
                 "install",
                 "--quiet",
                 "torch",
@@ -850,7 +871,7 @@ fn ensure_converter(status: &ImportStatus) -> Result<PathBuf> {
         )?;
         run_logged(
             status,
-            Command::new(&pip).args(["install", "--quiet", "onnx", "numpy", "scipy", "onnxscript"]),
+            pip().args(["install", "--quiet", "onnx", "numpy", "scipy", "onnxscript"]),
         )?;
     }
     Ok(python)
@@ -866,7 +887,7 @@ fn convert_pth(pth: &Path, out: &Path, status: &ImportStatus) -> Result<()> {
     let tools = tools_dir()?;
     run_logged(
         status,
-        Command::new(&python)
+        crate::quiet_command(&python)
             .env("VC_TOOLS", &tools)
             .arg(tools.join("rvc_export.py"))
             .arg(pth)
@@ -916,13 +937,13 @@ fn extract_zip(zip_path: &Path, status: &ImportStatus) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("the zip contains no .pth or .onnx model"))
 }
 
-fn import(url: &str, name: Option<&str>, status: &ImportStatus) -> Result<String> {
-    let voices_dir = super::voices_dir().ok_or_else(|| anyhow!("no data directory"))?;
-    std::fs::create_dir_all(&voices_dir)?;
-    let downloads = tools_dir()?.join("downloads");
-    std::fs::create_dir_all(&downloads)?;
-
-    let (file_url, file_name, hint, index_url) = match classify(url)? {
+/// Work out which file a link leads to: (download link, file name, name
+/// suggestion, link to an index file if the page has one).
+fn resolve_source(
+    url: &str,
+    status: &ImportStatus,
+) -> Result<(String, String, String, Option<String>)> {
+    Ok(match classify(url)? {
         Source::Page { url: page } => {
             status.note("reading the voice page".to_string());
             let info = fetch_voice_page(&page)?;
@@ -948,6 +969,31 @@ fn import(url: &str, name: Option<&str>, status: &ImportStatus) -> Result<String
             let repo_name = repo.split('/').nth(1).unwrap_or(&repo).to_string();
             (u, f, repo_name, idx)
         }
+    })
+}
+
+fn import(url: &str, name: Option<&str>, status: &ImportStatus) -> Result<String> {
+    let voices_dir = super::voices_dir().ok_or_else(|| anyhow!("no data directory"))?;
+    std::fs::create_dir_all(&voices_dir)?;
+    let downloads = tools_dir()?.join("downloads");
+    std::fs::create_dir_all(&downloads)?;
+
+    // A file on this computer is copied in; the original is left alone.
+    let local = std::path::Path::new(url);
+    let local = local.is_file().then_some(local);
+    let (file_url, file_name, hint, index_url) = match local {
+        Some(path) => {
+            let file_name = path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "voice".into());
+            let hint = path
+                .file_stem()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "voice".into());
+            (String::new(), file_name, hint, None)
+        }
+        None => resolve_source(url, status)?,
     };
     let display = sanitize(name.filter(|n| !n.trim().is_empty()).unwrap_or(&hint));
     let target = voices_dir.join(format!("{display}.onnx"));
@@ -956,7 +1002,14 @@ fn import(url: &str, name: Option<&str>, status: &ImportStatus) -> Result<String
     }
 
     let downloaded = downloads.join(&file_name);
-    download(&file_url, &downloaded, status)?;
+    match local {
+        Some(path) => {
+            status.note("copying the file".to_string());
+            std::fs::copy(path, &downloaded)
+                .with_context(|| format!("copying {}", path.display()))?;
+        }
+        None => download(&file_url, &downloaded, status)?,
+    }
     status.check_cancel()?;
 
     let lower = file_name.to_ascii_lowercase();

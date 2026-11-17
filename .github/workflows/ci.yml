@@ -29,6 +29,13 @@ jobs:
       - run: cargo build --workspace --verbose
       - run: cargo test --workspace --verbose
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Issue #1: with the processor build of ONNX Runtime 1.22, creating any
+      # AI session aborted the program. This loads that exact library and
+      # runs a model through the same code a voice goes through.
+      - name: AI engine on the processor runtime (regression test for issue 1)
+        run: |
+          scripts/get-onnxruntime.sh
+          target/debug/voice-changer --ai-self-test
       - name: CPU-only build (no GPU loader)
         run: cargo build -p vc-app --no-default-features --features ai
       - name: Lint the pick-your-devices backend (what Windows runs)
@@ -60,6 +67,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Engine self-test (every preset, synthetic speech)
         run: target\debug\voice-changer.exe --self-test
+      - name: AI engine (loads, runs a test model on the processor and through DirectML)
+        shell: pwsh
+        run: |
+          scripts\get-onnxruntime.ps1 -Dir target\debug
+          target\debug\voice-changer.exe --ai-self-test | Out-Host
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Doctor (no sound devices on a runner, so it may report failures)
         shell: pwsh
         run: |

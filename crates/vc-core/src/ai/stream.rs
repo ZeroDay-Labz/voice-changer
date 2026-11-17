@@ -78,6 +78,9 @@ pub struct AiStatus {
     pub blocker_ready: AtomicBool,
     /// The speaker's typical pitch in Hz as learned so far (0 = not yet).
     pub speaker_f0_hz: AtomicF32,
+    /// The delay the AI voice adds right now, in milliseconds (0 while it
+    /// is not converting).
+    pub delay_ms: AtomicF32,
 }
 
 impl AiStatus {
@@ -143,6 +146,16 @@ impl AiStage {
     /// Whether AI conversion is currently in the signal path.
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Relaxed)
+    }
+
+    /// Tell the window how much delay the AI adds at the moment.
+    pub fn publish_delay(&self, sample_rate: f32) {
+        let ms = if self.is_active() {
+            self.latency_samples() as f32 / sample_rate * 1000.0
+        } else {
+            0.0
+        };
+        self.status.delay_ms.store(ms, Ordering::Relaxed);
     }
 
     pub fn latency_samples(&self) -> usize {

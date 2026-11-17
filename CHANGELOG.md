@@ -3,21 +3,83 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.6.0] - 2026-11-17
+
+The interface was reworked for people who are not audio engineers, and there is a first
+Windows version. Checked in a private, hardware-free PipeWire session and on the GitHub
+build machines; see "Not tested" at the end.
+
+### Added
+- **Windows (preview).** A zip that runs from wherever it is unpacked. You pick a
+  microphone and an output device and the changed voice plays on that output: no
+  virtual audio cable, no driver, no change to your sound settings. Tray icon, global
+  shortcuts, start with Windows, `voice-changer toggle` and the other commands, the CLAP
+  plugin and AI voices are included. AI runs on the processor; the graphics card
+  (DirectML) can be picked by hand, is marked experimental, and is left alone after a crash.
+- **Pick the output.** A second picker in the top bar and in Settings chooses where the
+  voice is heard: on Linux where Hear myself plays, on Windows where the changed voice
+  goes. `voice-changer outputs` and `voice-changer output <name>` do the same.
+- **Mute.** A button in the top bar, `Ctrl+U`, a global shortcut (`Ctrl+Shift+U`), a tray
+  entry and `voice-changer mute`. It silences what you send with a short fade, also while
+  the voice changer is off. It is never still on at the next start.
+- **Real level meters.** Microphone and output bars with a dB scale, a shaded zone to aim
+  for and a CLIP flag that stays for a few seconds.
+- **Preset management.** An Edit mode on the preset grid renames, exports and deletes
+  your presets (delete asks first); presets can be imported from a file or by dropping it
+  on the window; **Update** stores changed settings back into the preset they came from;
+  a built-in preset's name cannot be taken; an import never overwrites.
+- **Add a voice from a file**, or drop it on the window.
+- **First steps** card that ticks itself off from what is really happening: the
+  microphone hears you, an output is chosen, a voice is picked. It can be shown again
+  from Settings.
+- **Settings:** buffer size (replaces `--quantum` advice), window size from 85% to 150%,
+  a theme that follows the desktop, and a list of every shortcut.
+- `voice-changer --ai-self-test` loads the AI engine and runs a tiny built-in model, and
+  `doctor` uses it, so "the AI engine works" is checked rather than assumed.
 
 ### Changed
+- **Plain words.** Labels and explanations no longer assume audio or AI vocabulary
+  ("Keep my level steady", "Remove background noise", "Runs on", "Delay"). The AI card
+  shows the few controls most people need; the rest is under **More settings**.
+- **Problems come with their fix.** A missing base model, a missing AI engine or a voice
+  file that is gone is explained in a sentence beside the button that deals with it;
+  the technical message stays available. Error messages stay until dismissed. The
+  window no longer tells you to run commands in a terminal.
+- **The delay shown is the real one**: it includes the AI voice while one is running.
+- The preset name changes to **Custom** as soon as a control no longer matches it.
+- **The mouse wheel no longer changes a control the page scrolls past**; a control takes
+  the wheel only when the pointer was resting on it. Hold Shift for fine steps.
 - **NVIDIA needs only the driver.** `voice-changer get-runtime --cuda` now also downloads
   the NVIDIA libraries the AI needs on the graphics card (CUDA 12.8 and cuDNN 9.10, up
   to 1.7 GB, into `~/.local/lib/voice-changer/cuda`, no root) and the app loads them
-  from there. Libraries the system already has are not downloaded again. Tested without
-  an NVIDIA card: the download, the checksums and the loading of the libraries are
-  verified, a conversion on an NVIDIA GPU is not.
+  from there. Libraries the system already has are not downloaded again.
+- The top bar drops its words and keeps its icons when the window is narrow. The
+  "Send the voice to" panel is no longer repeated on the Settings page.
 
 ### Fixed
+- **Ten controls had no hover explanation** (every Robot, Echo, Space and Tone knob, the
+  voice-index switch): their help was filed under names the parameters no longer had. A
+  test now fails when a control has none.
+- **A dropout every half minute on some devices.** The output queue gave up cushion it
+  needed, found out, took it back, and tried again. It now keeps what a device has shown
+  it needs.
+- **Light theme:** the knob pointer, the meter marks, the slider handle and coloured
+  status text were close to invisible on a light background.
 - **NVIDIA could not be set up on Fedora 42 and later.** The instructions named
   `cuda-toolkit-12` and `cudnn9` from NVIDIA's repository, which only carries CUDA 13
-  for those releases, so the AI stayed on the processor. The doctor and Settings → AI
-  now point to `get-runtime --cuda` instead.
+  for those releases, so the AI stayed on the processor.
+- Picking "Hear myself" off and on again no longer moves it back to the default output.
+
+### Not tested
+- **Windows on real sound hardware.** The Windows build compiles, passes its unit tests
+  and the engine self-test on a GitHub Windows machine, and loads and runs the AI engine
+  there. Its audio path is the same code that is tested end to end on Linux (through ALSA
+  into PipeWire, at 44.1, 48 and 96 kHz). But nobody has listened to it on Windows:
+  latency, crackle, device hot-plug, the tray and the shortcuts are unverified.
+- **DirectML with a real voice** (only a tiny test model, on the build machine's
+  software adapter).
+- **A conversion on an NVIDIA GPU** (the download, the checksums and the loading of the
+  libraries are verified, without an NVIDIA card).
 
 ## [0.5.0] - 2026-11-14
 

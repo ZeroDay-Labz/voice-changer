@@ -128,7 +128,7 @@ pub fn setting_string(b: Option<Backend>) -> String {
 pub fn nvidia_gpus() -> Vec<GpuInfo> {
     NVIDIA
         .get_or_init(|| {
-            let Ok(out) = std::process::Command::new("nvidia-smi")
+            let Ok(out) = crate::quiet_command("nvidia-smi")
                 .args(["--query-gpu=name", "--format=csv,noheader"])
                 .output()
             else {

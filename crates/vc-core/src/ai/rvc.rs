@@ -409,6 +409,94 @@ pub(crate) fn ensure_runtime() -> Result<()> {
     Ok(())
 }
 
+/// Session options for `backend`: the graphics card registered when one is
+/// asked for and can be used, the processor otherwise.
+fn session_builder(
+    make_builder: &dyn Fn() -> Result<ort::session::builder::SessionBuilder>,
+    backend: super::compute::Backend,
+) -> Result<ort::session::builder::SessionBuilder> {
+    #[allow(unused_mut)]
+    let mut builder = make_builder()?;
+    #[cfg(not(feature = "gpu"))]
+    let _ = backend;
+    #[cfg(feature = "gpu")]
+    {
+        use super::compute::{Backend, RuntimeKind};
+        let registered = match (backend, super::compute::runtime_kind()) {
+            (Backend::Rocm { device }, RuntimeKind::Rocm) => Some(append_rocm(&builder, device)),
+            (Backend::Cuda { device }, RuntimeKind::Cuda) => Some(append_cuda(&builder, device)),
+            (Backend::DirectMl { device }, RuntimeKind::DirectMl) => {
+                // DirectML needs both of these off.
+                builder = builder
+                    .with_memory_pattern(false)
+                    .map_err(|e| anyhow!("{e}"))?
+                    .with_parallel_execution(false)
+                    .map_err(|e| anyhow!("{e}"))?;
+                Some(append_directml(&builder, device))
+            }
+            (Backend::Cpu, _) => None,
+            (b, k) => Some(Err(anyhow!(
+                "{} requested but the loaded ONNX Runtime is {:?}",
+                b.api(),
+                k
+            ))),
+        };
+        if let Some(Err(e)) = registered {
+            // A failed registration leaves the options object unusable
+            // (ONNX Runtime 1.22 aborts on it), so start over on the CPU.
+            log::warn!("{e}; this session will run on the CPU");
+            super::compute::mark_gpu_failed(&short_reason(&format!("{e}")));
+            builder = make_builder()?;
+        }
+    }
+    Ok(builder)
+}
+
+/// A model small enough to carry in the program: `y = x + x` on four floats.
+const PROBE_MODEL: [u8; 65] = [
+    8, 8, 66, 2, 16, 13, 58, 57, 10, 14, 10, 1, 120, 10, 1, 120, 18, 1, 121, 34, 3, 65, 100, 100,
+    18, 5, 112, 114, 111, 98, 101, 90, 15, 10, 1, 120, 18, 10, 10, 8, 8, 1, 18, 4, 10, 2, 8, 4, 98,
+    15, 10, 1, 121, 18, 10, 10, 8, 8, 1, 18, 4, 10, 2, 8, 4,
+];
+
+/// Load the AI engine and run a tiny built-in model on `backend`, the same
+/// way a voice is loaded. Says in a sentence where it ran; fails when the
+/// engine is missing or computes nonsense. No voice or download is needed,
+/// so this is what `voice-changer --ai-self-test` and the build servers run.
+pub fn probe(backend: super::compute::Backend) -> Result<String> {
+    ensure_runtime()?;
+    let make_builder = || -> Result<ort::session::builder::SessionBuilder> {
+        Session::builder().map_err(|e| anyhow!("{e}"))
+    };
+    let mut session = session_builder(&make_builder, backend)?
+        .commit_from_memory(&PROBE_MODEL)
+        .map_err(|e| anyhow!("the AI engine could not load a model: {e}"))?;
+    let input = Tensor::from_array((vec![4i64], vec![1.0f32, 2.0, 3.0, 4.0]))?;
+    let outputs = session
+        .run(ort::inputs!["x" => input])
+        .map_err(|e| anyhow!("the AI engine could not run a model: {e}"))?;
+    let data: Vec<f32> = outputs["y"].try_extract_tensor::<f32>()?.1.to_vec();
+    drop(outputs);
+    // Sessions on a graphics card must not be torn down (see
+    // `stream::discard`); this one is 65 bytes of model.
+    if cfg!(feature = "gpu") {
+        std::mem::forget(session);
+    }
+    if data != [2.0, 4.0, 6.0, 8.0] {
+        bail!("the AI engine computed {data:?} instead of [2, 4, 6, 8]");
+    }
+    let ran_on = if super::compute::gpu_failure().is_some() {
+        super::compute::Backend::Cpu
+    } else {
+        backend
+    };
+    Ok(format!(
+        "{} · ran a test model on {}",
+        super::compute::runtime_description(),
+        ran_on.api()
+    ))
+}
+
 impl Rvc {
     pub fn load(paths: &ModelPaths, threads: usize) -> Result<Self> {
         Self::load_on(paths, threads, super::compute::Backend::Cpu)
@@ -423,8 +511,6 @@ impl Rvc {
     ) -> Result<Self> {
         #[cfg(feature = "gpu")]
         init_runtime()?;
-        #[cfg(not(feature = "gpu"))]
-        let _ = backend;
         let make_builder = || -> Result<ort::session::builder::SessionBuilder> {
             Session::builder()
                 .map_err(|e| anyhow!("{e}"))?
@@ -434,42 +520,7 @@ impl Rvc {
                 .map_err(|e| anyhow!("{e}"))
         };
         let open = |p: &PathBuf| -> Result<Session> {
-            let mut builder = make_builder()?;
-            #[cfg(feature = "gpu")]
-            {
-                use super::compute::{Backend, RuntimeKind};
-                let registered = match (backend, super::compute::runtime_kind()) {
-                    (Backend::Rocm { device }, RuntimeKind::Rocm) => {
-                        Some(append_rocm(&builder, device))
-                    }
-                    (Backend::Cuda { device }, RuntimeKind::Cuda) => {
-                        Some(append_cuda(&builder, device))
-                    }
-                    (Backend::DirectMl { device }, RuntimeKind::DirectMl) => {
-                        // DirectML needs both of these off.
-                        builder = builder
-                            .with_memory_pattern(false)
-                            .map_err(|e| anyhow!("{e}"))?
-                            .with_parallel_execution(false)
-                            .map_err(|e| anyhow!("{e}"))?;
-                        Some(append_directml(&builder, device))
-                    }
-                    (Backend::Cpu, _) => None,
-                    (b, k) => Some(Err(anyhow!(
-                        "{} requested but the loaded ONNX Runtime is {:?}",
-                        b.api(),
-                        k
-                    ))),
-                };
-                if let Some(Err(e)) = registered {
-                    // A failed registration leaves the options object unusable
-                    // (ONNX Runtime 1.22 aborts on it), so start over on the CPU.
-                    log::warn!("{e}; this session will run on the CPU");
-                    super::compute::mark_gpu_failed(&short_reason(&format!("{e}")));
-                    builder = make_builder()?;
-                }
-            }
-            builder
+            session_builder(&make_builder, backend)?
                 .commit_from_file(p)
                 .with_context(|| format!("loading {}", p.display()))
         };

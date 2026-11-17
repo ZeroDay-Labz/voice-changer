@@ -36,7 +36,9 @@ pub struct Options {
 pub struct AppHost {
     shared: Arc<Shared>,
     gui: GuiContext,
-    theme: Cell<Mode>,
+    theme: Cell<vc_gui::ThemeChoice>,
+    /// What the desktop uses, for the "same as the desktop" choice.
+    system_theme: Cell<Mode>,
 }
 
 impl AppHost {
@@ -44,7 +46,7 @@ impl AppHost {
         let theme = shared
             .config
             .lock()
-            .map(|c| mode_from(&c.theme))
+            .map(|c| choice_from(&c.theme))
             .unwrap_or_default();
         Self {
             gui: GuiContext::new(Arc::new(StandaloneGuiContext {
@@ -52,7 +54,20 @@ impl AppHost {
             })),
             shared,
             theme: Cell::new(theme),
+            system_theme: Cell::new(Mode::Dark),
         }
+    }
+
+    /// Size of everything in the window (1.0 = normal).
+    fn ui_scale(&self) -> f32 {
+        self.shared
+            .config
+            .lock()
+            .map(|c| c.ui_scale)
+            .ok()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(1.0)
+            .clamp(0.8, 1.5)
     }
 
     fn with_config(&self, f: impl FnOnce(&mut AppConfig)) {
@@ -65,11 +80,13 @@ impl AppHost {
     }
 }
 
-pub fn mode_from(s: &str) -> Mode {
+pub fn choice_from(s: &str) -> vc_gui::ThemeChoice {
     if s.eq_ignore_ascii_case("light") {
-        Mode::Light
+        vc_gui::ThemeChoice::Light
+    } else if s.eq_ignore_ascii_case("system") {
+        vc_gui::ThemeChoice::System
     } else {
-        Mode::Dark
+        vc_gui::ThemeChoice::Dark
     }
 }
 
@@ -84,7 +101,11 @@ impl Host for AppHost {
         &self.shared.meters
     }
     fn theme_mode(&self) -> Mode {
-        self.theme.get()
+        match self.theme.get() {
+            vc_gui::ThemeChoice::Dark => Mode::Dark,
+            vc_gui::ThemeChoice::Light => Mode::Light,
+            vc_gui::ThemeChoice::System => self.system_theme.get(),
+        }
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -93,13 +114,23 @@ impl Host for AppHost {
             output: true,
             routing: PIPEWIRE,
             monitor_toggle: PIPEWIRE,
+            // The desktop portal has its own dialog for this; elsewhere
+            // the shortcuts are fixed for now.
+            hotkey_config: cfg!(target_os = "linux"),
         }
     }
     fn latency_ms(&self) -> f32 {
         let mode: vc_dsp::PitchMode = self.shared.params.pitch_engine.value().into();
         let mut samples = mode.latency_samples(self.shared.sample_rate) as f32;
         samples += self.shared.quantum as f32; // one block of output buffering
-        samples / self.shared.sample_rate * 1000.0
+        #[allow(unused_mut)]
+        let mut ms = samples / self.shared.sample_rate * 1000.0;
+        // The AI voice adds far more than everything else together.
+        #[cfg(feature = "ai")]
+        if let Some(ai) = self.ai_status() {
+            ms += ai.delay_ms.load(Ordering::Relaxed);
+        }
+        ms
     }
     #[cfg(feature = "ai")]
     fn ai_status(&self) -> Option<Arc<vc_core::ai::AiStatus>> {
@@ -211,6 +242,15 @@ impl Host for AppHost {
             autostart: Some(config::autostart_enabled()),
             ai_threads: c.ai_threads,
             first_run: c.first_run,
+            theme: self.theme.get(),
+            ui_scale: Some(c.ui_scale),
+            buffer: Some(c.buffer),
+            mute_hotkey: self
+                .shared
+                .mute_hotkey_trigger
+                .lock()
+                .ok()
+                .and_then(|t| t.clone()),
         }
     }
     fn apply_setting(&self, setting: HostSetting) {
@@ -222,16 +262,22 @@ impl Host for AppHost {
                     log::warn!("autostart: {e}");
                 }
             }
-            HostSetting::Theme(m) => {
-                self.theme.set(m);
+            HostSetting::Theme(choice) => {
+                self.theme.set(choice);
                 self.with_config(|c| {
-                    c.theme = if m == Mode::Light {
-                        "light".into()
-                    } else {
-                        "dark".into()
+                    c.theme = match choice {
+                        vc_gui::ThemeChoice::Light => "light",
+                        vc_gui::ThemeChoice::System => "system",
+                        vc_gui::ThemeChoice::Dark => "dark",
                     }
+                    .into()
                 });
             }
+            HostSetting::UiScale(scale) => {
+                self.with_config(|c| c.ui_scale = scale.clamp(0.8, 1.5));
+            }
+            HostSetting::Buffer(frames) => self.with_config(|c| c.buffer = frames),
+            HostSetting::ShowWelcome => self.with_config(|c| c.first_run = true),
             HostSetting::AiThreads(n) => {
                 self.shared.set_ai_threads(n);
                 self.with_config(|_| {});
@@ -336,6 +382,8 @@ pub struct App {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// The desktop switched between light and dark.
+    SystemTheme(iced::theme::Mode),
     Ui(vc_gui::Message),
     Tick,
     Opened,
@@ -412,14 +460,64 @@ impl App {
     }
 
     fn ui(&mut self, m: vc_gui::Message) -> Task<Message> {
+        // File dialogs belong to the app, not to the shared interface.
+        if let vc_gui::Message::PickFile(request) = &m {
+            return pick_file(request.clone());
+        }
         let task = vc_gui::update(&mut self.model, m, &self.host);
         self.sync_to_shared();
         task.map(Message::Ui)
     }
 }
 
+/// Show the system's file dialog and hand the answer back to the interface.
+fn pick_file(request: vc_gui::FileRequest) -> Task<Message> {
+    use vc_gui::FileRequest;
+    Task::perform(
+        async move {
+            let dialog = rfd::AsyncFileDialog::new();
+            let picked = match &request {
+                FileRequest::ImportPreset => {
+                    dialog
+                        .set_title("Add a preset")
+                        .add_filter("Voice Changer preset", &["ron"])
+                        .pick_file()
+                        .await
+                }
+                FileRequest::ExportPreset(name) => {
+                    dialog
+                        .set_title("Save the preset as a file")
+                        .set_file_name(vc_core::presets::export_file_name(name))
+                        .add_filter("Voice Changer preset", &["ron"])
+                        .save_file()
+                        .await
+                }
+                FileRequest::ImportVoice => {
+                    dialog
+                        .set_title("Add a voice")
+                        .add_filter("Voice models", &["onnx", "pth", "zip"])
+                        .pick_file()
+                        .await
+                }
+            };
+            (request, picked.map(|f| f.path().to_path_buf()))
+        },
+        |(request, path)| Message::Ui(vc_gui::Message::FilePicked(request, path)),
+    )
+}
+
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
+        Message::SystemTheme(mode) => {
+            app.host
+                .system_theme
+                .set(if mode == iced::theme::Mode::Light {
+                    Mode::Light
+                } else {
+                    Mode::Dark
+                });
+            Task::none()
+        }
         Message::Tick => {
             if app.shared.quit.load(Ordering::SeqCst) {
                 return iced::exit();
@@ -477,6 +575,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             use keyboard::key::Named;
             let msg = match key.as_ref() {
                 keyboard::Key::Character("m") => Some(vc_gui::Message::TogglePower),
+                keyboard::Key::Character("u") => Some(vc_gui::Message::ToggleMute),
                 keyboard::Key::Character("h") => Some(vc_gui::Message::ToggleMonitor),
                 keyboard::Key::Character("1") => Some(vc_gui::Message::Go(Page::Home)),
                 keyboard::Key::Character("2") => Some(vc_gui::Message::Go(Page::Voices)),
@@ -545,6 +644,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 _ => Task::none(),
             }
         }
+        Message::Window(iced::window::Event::FileDropped(path)) => {
+            app.ui(vc_gui::Message::FileDropped(path))
+        }
         Message::Window(..) => Task::none(),
         Message::Shot(shot) => {
             if let Some((path, _, _)) = app.screenshot.take() {
@@ -582,6 +684,7 @@ fn subscription(app: &App) -> Subscription<Message> {
         window::close_requests().map(Message::CloseRequested),
         keyboard::listen().map(Message::Keyboard),
         window::events().map(|(_, e)| Message::Window(e)),
+        iced::system::theme_changes().map(Message::SystemTheme),
     ])
 }
 
@@ -610,7 +713,10 @@ pub fn run(shared: Arc<Shared>, options: Options) -> anyhow::Result<()> {
         } else {
             app.open_window()
         };
-        (app, task)
+        (
+            app,
+            Task::batch([task, iced::system::theme().map(Message::SystemTheme)]),
+        )
     };
     // The tray icon and the global shortcuts live on this thread, whose
     // event loop the window is about to run.
@@ -627,6 +733,7 @@ pub fn run(shared: Arc<Shared>, options: Options) -> anyhow::Result<()> {
         .title(|_app: &App, _id| "Voice Changer".to_string())
         .theme(|app: &App, _id| -> Theme { vc_gui::theme::theme(app.host.theme_mode()) })
         .subscription(subscription)
+        .scale_factor(|app: &App, _id| app.host.ui_scale())
         .antialiasing(true)
         .run()
         .map_err(|e| anyhow::anyhow!("window: {e}"));

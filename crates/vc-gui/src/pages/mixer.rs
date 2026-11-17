@@ -5,7 +5,7 @@ use crate::help;
 use crate::host::Host;
 use crate::theme::{self, Mode};
 use crate::widgets::icons;
-use crate::widgets::knob::{knob, param_slider, param_toggle};
+use crate::widgets::knob::{knob, param_slider_as, param_toggle_as};
 use crate::{Element, Message, Model, tip};
 use iced_core::{Alignment, Length};
 use iced_widget::{button, checkbox, column, container, row, text, toggler};
@@ -27,24 +27,49 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
         )
         .center_x(Length::Fill),
         dim(
-            "Drag a knob up or down, roll the mouse wheel over it, or double-click to reset.",
+            "Input is how loud your microphone comes in, Output how loud the changed voice goes out. Drag a knob up or down, or double-click it to reset.",
             12,
             mode
         ),
-        param_toggle(&p.auto_level, mode),
-        kv("Auto gain now", format!("{auto_db:+.1} dB"), mode),
-        param_toggle(&p.limiter, mode),
+        param_toggle_as(&p.auto_level, "Keep my level steady", mode),
     ]
     .spacing(10);
-    let cleanup = column![
-        param_toggle(&p.denoise, mode),
-        param_toggle(&p.voice_only, mode),
-        param_slider(&p.gate_floor, mode, 220.0),
-        param_toggle(&p.gate_enabled, mode),
-        param_slider(&p.gate_threshold, mode, 220.0),
-        dim("Noise suppression and the voice-only gate run before the voice engine, so background noise never becomes voice.", 12, mode),
+    let mut levels = levels;
+    if p.auto_level.value() {
+        levels = levels.push(kv(
+            "Adjusting by",
+            format!("{auto_db:+.1} dB right now"),
+            mode,
+        ));
+    }
+    levels = levels.push(param_toggle_as(&p.limiter, "Prevent distortion", mode));
+    let mut cleanup = column![
+        param_toggle_as(&p.denoise, "Remove background noise", mode),
+        param_toggle_as(&p.voice_only, "Only let my voice through", mode),
     ]
     .spacing(10);
+    if p.voice_only.value() {
+        cleanup = cleanup.push(param_slider_as(
+            &p.gate_floor,
+            "Quiet between words",
+            mode,
+            220.0,
+        ));
+    }
+    cleanup = cleanup.push(param_toggle_as(&p.gate_enabled, "Noise gate", mode));
+    if p.gate_enabled.value() {
+        cleanup = cleanup.push(param_slider_as(
+            &p.gate_threshold,
+            "Gate opens above",
+            mode,
+            220.0,
+        ));
+    }
+    cleanup = cleanup.push(dim(
+        "The clean-up happens before your voice is changed, so fans, keyboards and breaths are never turned into voice.",
+        12,
+        mode,
+    ));
     let mut col = column![
         row![
             section_accent("Levels", theme::SKY, mode, levels),
@@ -54,7 +79,7 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
         .wrap()
     ]
     .spacing(16);
-    if host.capabilities().standalone {
+    if host.capabilities().routing {
         col = col.push(send_to(model, mode));
     }
     col.into()
@@ -91,7 +116,7 @@ pub fn send_to<'a>(model: &'a Model, mode: Mode) -> Element<'a> {
         let (line, color) = match a.listeners {
             0 => (
                 "No app is hearing the voice yet. Pick “Voice Changer Mic” in the app's own input settings, tick the app below, or turn on the switch above.".to_string(),
-                theme::AMBER,
+                theme::ink(theme::AMBER, mode),
             ),
             1 => ("1 app is hearing the voice.".to_string(), theme::SKY),
             n => (format!("{n} apps are hearing the voice."), theme::SKY),

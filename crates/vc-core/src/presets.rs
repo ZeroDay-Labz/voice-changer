@@ -225,13 +225,103 @@ fn file_name_for(name: &str) -> String {
     format!("{}.ron", if s.is_empty() { "preset" } else { s })
 }
 
-/// Write a user preset; returns the file it was saved to.
+fn preset_dir() -> anyhow::Result<PathBuf> {
+    user_preset_dir().ok_or_else(|| anyhow::anyhow!("no settings folder"))
+}
+
+/// Whether a built-in preset has this name (those cannot be replaced).
+pub fn is_factory_name(name: &str) -> bool {
+    factory_presets()
+        .iter()
+        .any(|p| p.name.eq_ignore_ascii_case(name.trim()))
+}
+
+/// Write a user preset; returns the file it was saved to. A user preset of
+/// the same name is replaced.
 pub fn save_preset(preset: &Preset) -> anyhow::Result<PathBuf> {
-    let dir = user_preset_dir().ok_or_else(|| anyhow::anyhow!("no config directory"))?;
-    std::fs::create_dir_all(&dir)?;
+    save_preset_in(&preset_dir()?, preset)
+}
+
+fn save_preset_in(dir: &Path, preset: &Preset) -> anyhow::Result<PathBuf> {
+    if preset.name.trim().is_empty() {
+        anyhow::bail!("a preset needs a name");
+    }
+    if is_factory_name(&preset.name) {
+        anyhow::bail!(
+            "“{}” is a built-in preset; pick another name",
+            preset.name.trim()
+        );
+    }
+    std::fs::create_dir_all(dir)?;
     let path = dir.join(file_name_for(&preset.name));
     std::fs::write(&path, preset.to_ron())?;
     Ok(path)
+}
+
+/// Give the user preset stored at `path` another name. Fails when a preset
+/// of that name exists already.
+pub fn rename_preset(path: &Path, new_name: &str) -> anyhow::Result<PathBuf> {
+    rename_preset_in(&preset_dir()?, path, new_name)
+}
+
+fn rename_preset_in(dir: &Path, path: &Path, new_name: &str) -> anyhow::Result<PathBuf> {
+    let new_name = new_name.trim();
+    let mut preset = Preset::from_ron(&std::fs::read_to_string(path)?)
+        .map_err(|e| anyhow::anyhow!("that preset cannot be read: {e}"))?;
+    if preset.name == new_name {
+        return Ok(path.to_path_buf());
+    }
+    let target = dir.join(file_name_for(new_name));
+    if target.exists() && target != path {
+        anyhow::bail!("there is already a preset called “{new_name}”");
+    }
+    preset.name = new_name.to_string();
+    let saved = save_preset_in(dir, &preset)?;
+    if saved != path {
+        std::fs::remove_file(path)?;
+    }
+    Ok(saved)
+}
+
+/// Add a preset file someone shared. Returns the name it has now: a number
+/// is added when the name is taken, so nothing is ever overwritten.
+pub fn import_preset(file: &Path) -> anyhow::Result<String> {
+    import_preset_into(&preset_dir()?, file)
+}
+
+fn import_preset_into(dir: &Path, file: &Path) -> anyhow::Result<String> {
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| anyhow::anyhow!("that file cannot be read: {e}"))?;
+    let mut preset = Preset::from_ron(&text)
+        .map_err(|_| anyhow::anyhow!("that file is not a Voice Changer preset"))?;
+    let base = if preset.name.trim().is_empty() {
+        file.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Imported".into())
+    } else {
+        preset.name.trim().to_string()
+    };
+    let taken = |name: &str| is_factory_name(name) || dir.join(file_name_for(name)).exists();
+    let mut name = base.clone();
+    let mut n = 2;
+    while taken(&name) {
+        name = format!("{base} {n}");
+        n += 1;
+    }
+    preset.name = name.clone();
+    save_preset_in(dir, &preset)?;
+    Ok(name)
+}
+
+/// Write a preset to a file of the user's choosing.
+pub fn export_preset(preset: &Preset, dest: &Path) -> anyhow::Result<()> {
+    std::fs::write(dest, preset.to_ron())?;
+    Ok(())
+}
+
+/// The file name a preset would be exported under.
+pub fn export_file_name(name: &str) -> String {
+    file_name_for(name)
 }
 
 pub fn delete_preset(path: &Path) -> anyhow::Result<()> {
@@ -242,6 +332,58 @@ pub fn delete_preset(path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vc-presets-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sample(name: &str) -> Preset {
+        let mut p = factory_presets().remove(0);
+        p.name = name.to_string();
+        p
+    }
+
+    #[test]
+    fn built_in_names_cannot_be_taken() {
+        let dir = temp_dir("factory");
+        let name = factory_presets()[0].name.clone();
+        assert!(save_preset_in(&dir, &sample(&name)).is_err());
+        assert!(save_preset_in(&dir, &sample("  ")).is_err());
+        assert!(save_preset_in(&dir, &sample("Mine")).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rename_moves_the_file_and_refuses_a_taken_name() {
+        let dir = temp_dir("rename");
+        let a = save_preset_in(&dir, &sample("First")).unwrap();
+        save_preset_in(&dir, &sample("Second")).unwrap();
+        assert!(rename_preset_in(&dir, &a, "Second").is_err());
+        assert!(a.exists(), "a refused rename leaves the preset alone");
+        let b = rename_preset_in(&dir, &a, "Third").unwrap();
+        assert!(!a.exists() && b.exists());
+        let back = Preset::from_ron(&std::fs::read_to_string(&b).unwrap()).unwrap();
+        assert_eq!(back.name, "Third");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn import_never_overwrites_and_rejects_other_files() {
+        let dir = temp_dir("import");
+        let shared = dir.join("shared.ron");
+        export_preset(&sample("Stage"), &shared).unwrap();
+        let user = dir.join("user");
+        assert_eq!(import_preset_into(&user, &shared).unwrap(), "Stage");
+        assert_eq!(import_preset_into(&user, &shared).unwrap(), "Stage 2");
+        let junk = dir.join("junk.ron");
+        std::fs::write(&junk, "not a preset").unwrap();
+        assert!(import_preset_into(&user, &junk).is_err());
+        assert_eq!(std::fs::read_dir(&user).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn factory_presets_parse_and_only_use_known_ids() {

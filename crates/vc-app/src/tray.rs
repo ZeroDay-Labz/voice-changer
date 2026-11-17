@@ -11,6 +11,7 @@ use crate::control::Shared;
 pub struct VcTray {
     shared: Arc<Shared>,
     enabled: bool,
+    muted: bool,
 }
 
 impl ksni::Tray for VcTray {
@@ -32,16 +33,18 @@ impl ksni::Tray for VcTray {
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        icon_pixmaps(self.enabled)
+        icon_pixmaps(self.enabled && !self.muted)
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
             title: "Voice Changer".into(),
-            description: if self.enabled {
-                "Processing"
+            description: if self.muted {
+                "Muted"
+            } else if self.enabled {
+                "On"
             } else {
-                "Bypassed"
+                "Off: your own voice"
             }
             .into(),
             ..Default::default()
@@ -74,10 +77,20 @@ impl ksni::Tray for VcTray {
 
         vec![
             CheckmarkItem {
-                label: "Enabled".into(),
+                label: "Voice changer on".into(),
                 checked: self.enabled,
                 activate: Box::new(|this: &mut Self| {
                     this.enabled = this.shared.toggle();
+                }),
+                ..Default::default()
+            }
+            .into(),
+            CheckmarkItem {
+                label: "Mute".into(),
+                checked: self.muted,
+                activate: Box::new(|this: &mut Self| {
+                    this.muted = !this.shared.muted();
+                    this.shared.set_muted(this.muted);
                 }),
                 ..Default::default()
             }
@@ -147,6 +160,7 @@ fn icon_pixmaps(enabled: bool) -> Vec<ksni::Icon> {
 pub async fn run(shared: Arc<Shared>, started_hidden: bool) {
     let tray = VcTray {
         enabled: shared.is_enabled(),
+        muted: shared.muted(),
         shared: shared.clone(),
     };
     let handle = match tray.spawn().await {
@@ -160,13 +174,18 @@ pub async fn run(shared: Arc<Shared>, started_hidden: bool) {
             return;
         }
     };
-    let mut last = shared.is_enabled();
+    let mut last = (shared.is_enabled(), shared.muted());
     while !shared.quit.load(std::sync::atomic::Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let now = shared.is_enabled();
+        let now = (shared.is_enabled(), shared.muted());
         if now != last {
             last = now;
-            handle.update(|t| t.enabled = now).await;
+            handle
+                .update(|t| {
+                    t.enabled = now.0;
+                    t.muted = now.1;
+                })
+                .await;
         }
     }
     handle.shutdown().await;

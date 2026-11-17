@@ -85,6 +85,7 @@ impl Pipeline {
         {
             let ai = &mut self.ai;
             self.engine.process_with(buf, |b| ai.process(b));
+            self.ai.publish_delay(self.engine.sample_rate());
         }
         #[cfg(not(feature = "ai"))]
         self.engine.process(buf);

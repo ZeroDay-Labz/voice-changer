@@ -21,6 +21,7 @@ pub use host::{
     HostSetting, HostSettings, HostStats,
 };
 pub use iced_runtime::Task;
+pub use theme::Choice as ThemeChoice;
 pub use theme::Mode;
 
 pub type Element<'a> = iced_core::Element<'a, Message, iced_core::Theme, iced_renderer::Renderer>;
@@ -85,6 +86,7 @@ pub enum Message {
     ParamJump(ParamPtr, f32),
     ToggleFavorite(String),
     TogglePower,
+    ToggleMute,
     ToggleMonitor,
     ApplyPreset(String),
     SearchChanged(String),
@@ -92,7 +94,21 @@ pub enum Message {
     StartSave,
     CancelSave,
     SavePreset,
+    /// Show or hide the rename / export / delete buttons on the presets.
+    TogglePresetEdit,
+    AskDeletePreset(String),
+    CancelDeletePreset,
     DeletePreset(String),
+    StartRenamePreset(String),
+    RenameChanged(String),
+    CommitRename,
+    /// Store the current settings in an existing user preset.
+    UpdatePreset(String),
+    /// Ask the host for a file dialog; the answer comes back as `FilePicked`.
+    PickFile(FileRequest),
+    FilePicked(FileRequest, Option<std::path::PathBuf>),
+    /// A file was dropped on the window.
+    FileDropped(std::path::PathBuf),
     RefreshLibrary,
     SelectMic(Option<String>),
     SelectOutput(Option<String>),
@@ -134,6 +150,19 @@ pub enum Message {
     /// Start the audio side again after a failed start.
     RetryAudio,
     DismissWelcome,
+    /// Show or hide the less-used AI settings on the Home page.
+    ToggleAiAdvanced,
+}
+
+/// What a file dialog is wanted for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileRequest {
+    /// Open: a preset file to add.
+    ImportPreset,
+    /// Save: where to write the named preset.
+    ExportPreset(String),
+    /// Open: a voice model to add.
+    ImportVoice,
 }
 
 pub fn search_id() -> iced_core::widget::Id {
@@ -148,6 +177,20 @@ pub struct Model {
     pub search: String,
     pub save_name: String,
     pub saving: bool,
+    /// The preset cards show their rename / export / delete buttons.
+    pub editing_presets: bool,
+    /// The preset waiting for "really delete?".
+    pub confirm_delete_preset: Option<String>,
+    /// The preset being renamed and the name typed so far.
+    pub renaming: Option<(String, String)>,
+    /// The user preset the current settings started from, offered for
+    /// "Update" once they have been changed.
+    pub last_user_preset: Option<String>,
+    /// The Home page shows the less-used AI settings.
+    pub ai_advanced: bool,
+    /// 0..1, going round while the window is open: drives the "working on
+    /// it" bar of steps whose length is not known.
+    pub phase: f32,
     pub toast: Option<(String, bool, Instant)>,
     pub meters: widgets::meter::Levels,
     /// The test bench, refreshed every tick (`None` = this host has none).
@@ -207,6 +250,12 @@ impl Model {
             search: String::new(),
             save_name: String::new(),
             saving: false,
+            editing_presets: false,
+            confirm_delete_preset: None,
+            renaming: None,
+            last_user_preset: None,
+            ai_advanced: false,
+            phase: 0.0,
             toast: None,
             meters: widgets::meter::Levels::default(),
             bench: None,
@@ -306,6 +355,23 @@ impl Model {
 
     pub fn toast(&mut self, text: impl Into<String>, error: bool) {
         self.toast = Some((text.into(), error, Instant::now()));
+    }
+
+    /// After a control was changed: the preset named in the window is only
+    /// still "the preset" while the settings match it. Otherwise the window
+    /// says Custom, so it never claims a sound that is not what is heard.
+    pub fn preset_still_applies(&mut self, host: &dyn Host) {
+        let Some(name) = &self.current_preset else {
+            return;
+        };
+        let matches = self
+            .presets
+            .iter()
+            .find(|e| e.preset.name == *name)
+            .is_some_and(|e| e.preset.matches(host.params()));
+        if !matches {
+            self.current_preset = None;
+        }
     }
 }
 
@@ -416,6 +482,64 @@ pub fn set_bool(host: &dyn Host, param: &BoolParam, value: bool) {
     gesture(host, param.as_ptr(), param.preview_normalized(value));
 }
 
+/// Store the current settings as the user preset `name`.
+fn store_preset(model: &mut Model, host: &dyn Host, name: &str, replaced: bool) {
+    let preset = Preset::capture(host.params(), name);
+    match vc_core::presets::save_preset(&preset) {
+        Ok(_) => {
+            model.current_preset = Some(name.to_string());
+            model.last_user_preset = Some(name.to_string());
+            model.saving = false;
+            model.refresh();
+            model.toast(
+                if replaced {
+                    format!("Updated “{name}”")
+                } else {
+                    format!("Saved “{name}”")
+                },
+                false,
+            );
+        }
+        Err(e) => model.toast(format!("Could not save: {e}"), true),
+    }
+}
+
+fn import_preset_file(model: &mut Model, path: &std::path::Path) {
+    match vc_core::presets::import_preset(path) {
+        Ok(name) => {
+            model.refresh();
+            model.page = Page::Home;
+            model.toast(format!("Added the preset “{name}”"), false);
+        }
+        Err(e) => model.toast(format!("Could not add that preset: {e}"), true),
+    }
+}
+
+#[cfg(feature = "ai")]
+fn import_voice_file(model: &mut Model, path: &std::path::Path) {
+    if model.import.is_some() {
+        model.toast(
+            "Another voice is still being added. Try again when it is done.",
+            true,
+        );
+        return;
+    }
+    model.page = Page::Voices;
+    model.import = Some(vc_core::ai::library::start_import(
+        path.to_string_lossy().to_string(),
+        None,
+    ));
+}
+
+#[cfg(not(feature = "ai"))]
+fn import_voice_file(model: &mut Model, _path: &std::path::Path) {
+    model.toast("This build has no AI voices.", true);
+}
+
+pub fn rename_id() -> iced_core::widget::Id {
+    iced_core::widget::Id::new("preset-rename")
+}
+
 // ------------------------------------------------------------------ update
 
 pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Message> {
@@ -424,6 +548,7 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
             let now = Instant::now();
             let dt = now.duration_since(model.last_tick).as_secs_f32().min(0.2);
             model.last_tick = now;
+            model.phase = (model.phase + dt * 0.7) % 1.0;
             model.bench = host.bench();
             if now.duration_since(model.last_refresh).as_secs_f32() > 2.0 {
                 model.refresh_cache(host);
@@ -432,7 +557,9 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
             }
             let (i, o, gate) = host.meters().read();
             model.meters.push(i, o, gate, dt);
-            if let Some((_, _, at)) = model.toast
+            // Good news goes away by itself; an error stays until it is read.
+            if let Some((_, error, at)) = model.toast
+                && !error
                 && at.elapsed().as_secs_f32() > 4.0
             {
                 model.toast = None;
@@ -479,19 +606,23 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
         Message::ParamEnd(ptr) => {
             unsafe { host.gui().raw_end_set_parameter(ptr) };
             remember_voice_setting(host, ptr);
+            model.preset_still_applies(host);
         }
         Message::ParamReset(ptr) => {
             let d = unsafe { ptr.default_normalized_value() };
             gesture(host, ptr, d);
             remember_voice_setting(host, ptr);
+            model.preset_still_applies(host);
         }
         Message::ParamBool(ptr, b) => {
             gesture(host, ptr, if b { 1.0 } else { 0.0 });
             remember_voice_setting(host, ptr);
+            model.preset_still_applies(host);
         }
         Message::ParamJump(ptr, v) => {
             gesture(host, ptr, v);
             remember_voice_setting(host, ptr);
+            model.preset_still_applies(host);
         }
         Message::ToggleFavorite(name) => {
             if let Some(i) = model.favorites.iter().position(|f| *f == name) {
@@ -505,6 +636,10 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
             let p = &host.params().bypass;
             set_bool(host, p, !p.value());
         }
+        Message::ToggleMute => {
+            let p = &host.params().mute;
+            set_bool(host, p, !p.value());
+        }
         Message::ToggleMonitor => {
             if let Some(on) = host.monitor() {
                 host.set_monitor(!on);
@@ -514,6 +649,7 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
             if let Some(entry) = model.presets.iter().find(|e| e.preset.name == name) {
                 let preset = entry.preset.clone();
                 preset.apply(host.params(), |ptr, n| gesture(host, ptr, n));
+                model.last_user_preset = (!entry.is_factory()).then(|| name.clone());
                 model.current_preset = Some(name);
             }
         }
@@ -527,19 +663,107 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
         Message::SavePreset => {
             let name = model.save_name.trim().to_string();
             if !name.is_empty() {
-                let preset = Preset::capture(host.params(), &name);
-                match vc_core::presets::save_preset(&preset) {
-                    Ok(_) => {
-                        model.current_preset = Some(name.clone());
-                        model.saving = false;
-                        model.refresh();
-                        model.toast(format!("Saved “{name}”"), false);
+                let replaced = model
+                    .presets
+                    .iter()
+                    .any(|e| !e.is_factory() && e.preset.name.eq_ignore_ascii_case(&name));
+                store_preset(model, host, &name, replaced);
+            }
+        }
+        Message::UpdatePreset(name) => store_preset(model, host, &name, true),
+        Message::TogglePresetEdit => {
+            model.editing_presets = !model.editing_presets;
+            model.confirm_delete_preset = None;
+            model.renaming = None;
+        }
+        Message::AskDeletePreset(name) => {
+            model.renaming = None;
+            model.confirm_delete_preset = Some(name);
+        }
+        Message::CancelDeletePreset => model.confirm_delete_preset = None,
+        Message::StartRenamePreset(name) => {
+            model.confirm_delete_preset = None;
+            model.renaming = Some((name.clone(), name));
+            return iced_runtime::widget::operation::focus(rename_id());
+        }
+        Message::RenameChanged(s) => {
+            if let Some((_, new)) = model.renaming.as_mut() {
+                *new = s;
+            }
+        }
+        Message::CommitRename => {
+            if let Some((old, new)) = model.renaming.take() {
+                let new = new.trim().to_string();
+                let path = model
+                    .presets
+                    .iter()
+                    .find(|e| e.preset.name == old)
+                    .and_then(|e| e.path.clone());
+                if let Some(path) = path
+                    && !new.is_empty()
+                    && new != old
+                {
+                    match vc_core::presets::rename_preset(&path, &new) {
+                        Ok(_) => {
+                            for slot in [&mut model.current_preset, &mut model.last_user_preset] {
+                                if slot.as_deref() == Some(old.as_str()) {
+                                    *slot = Some(new.clone());
+                                }
+                            }
+                            if let Some(f) = model.favorites.iter_mut().find(|f| **f == old) {
+                                *f = new.clone();
+                                save_favorites(&model.favorites);
+                            }
+                            model.refresh();
+                        }
+                        Err(e) => model.toast(format!("Could not rename: {e}"), true),
                     }
-                    Err(e) => model.toast(format!("Could not save: {e}"), true),
                 }
             }
         }
+        Message::PickFile(_) => {
+            // Answered by the host (it owns the file dialogs).
+        }
+        Message::FilePicked(request, path) => {
+            if let Some(path) = path {
+                match request {
+                    FileRequest::ImportPreset => import_preset_file(model, &path),
+                    FileRequest::ExportPreset(name) => {
+                        let found = model
+                            .presets
+                            .iter()
+                            .find(|e| e.preset.name == name)
+                            .map(|e| e.preset.clone());
+                        if let Some(preset) = found {
+                            match vc_core::presets::export_preset(&preset, &path) {
+                                Ok(()) => model
+                                    .toast(format!("Saved “{name}” to {}", path.display()), false),
+                                Err(e) => {
+                                    model.toast(format!("Could not save the file: {e}"), true)
+                                }
+                            }
+                        }
+                    }
+                    FileRequest::ImportVoice => import_voice_file(model, &path),
+                }
+            }
+        }
+        Message::FileDropped(path) => {
+            let ext = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            match ext.as_str() {
+                "ron" => import_preset_file(model, &path),
+                "onnx" | "pth" | "zip" => import_voice_file(model, &path),
+                _ => model.toast(
+                    "That file is neither a preset (.ron) nor a voice (.onnx, .pth, .zip).",
+                    true,
+                ),
+            }
+        }
         Message::DeletePreset(name) => {
+            model.confirm_delete_preset = None;
             if let Some(path) = model
                 .presets
                 .iter()
@@ -548,10 +772,13 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
             {
                 match vc_core::presets::delete_preset(&path) {
                     Ok(()) => {
-                        if model.current_preset.as_deref() == Some(name.as_str()) {
-                            model.current_preset = None;
+                        for slot in [&mut model.current_preset, &mut model.last_user_preset] {
+                            if slot.as_deref() == Some(name.as_str()) {
+                                *slot = None;
+                            }
                         }
                         model.refresh();
+                        model.toast(format!("Deleted “{name}”"), false);
                     }
                     Err(e) => model.toast(format!("Could not delete: {e}"), true),
                 }
@@ -594,6 +821,7 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
             host.apply_setting(HostSetting::DismissWelcome);
             model.cache.settings = host.settings();
         }
+        Message::ToggleAiAdvanced => model.ai_advanced = !model.ai_advanced,
         Message::OpenDataFolder => host.open_data_folder(),
         Message::Quit => host.quit(),
         Message::DismissToast => model.toast = None,
@@ -670,9 +898,13 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
                 let d = unsafe { ptr.default_normalized_value() };
                 gesture(host, ptr, d);
             }
+            model.preset_still_applies(host);
         }
         Message::Escape => {
             model.saving = false;
+            model.renaming = None;
+            model.confirm_delete_preset = None;
+            model.search.clear();
             model.confirm_delete = None;
             model.speaker_edits.clear();
         }
@@ -766,11 +998,22 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
 
     let mut layers = iced_widget::stack![main];
     if let Some((msg, error, _)) = &model.toast {
-        let color = if *error { theme::DANGER } else { theme::ACCENT };
+        let (color, ink) = if *error {
+            (theme::DANGER, iced_core::Color::WHITE)
+        } else {
+            (theme::ACCENT, theme::ON_ACCENT)
+        };
         let toast = container(
             row![
-                text(msg.as_str()).size(14),
-                button(widgets::icons::close(14.0, iced_core::Color::WHITE))
+                if *error {
+                    widgets::icons::alert(16.0, ink)
+                } else {
+                    widgets::icons::check(16.0, ink)
+                },
+                text(msg.as_str())
+                    .size(14)
+                    .wrapping(iced_core::text::Wrapping::WordOrGlyph),
+                button(widgets::icons::close(14.0, ink))
                     .style(theme::button_ghost)
                     .padding(4)
                     .on_press(Message::DismissToast)
@@ -779,9 +1022,10 @@ pub fn view<'a>(model: &'a Model, host: &'a dyn Host) -> Element<'a> {
             .align_y(iced_core::Alignment::Center),
         )
         .padding([10, 14])
+        .max_width(520)
         .style(move |_theme| container::Style {
             background: Some(color.into()),
-            text_color: Some(iced_core::Color::WHITE),
+            text_color: Some(ink),
             border: theme::radius(12.0),
             ..container::Style::default()
         });
@@ -861,4 +1105,222 @@ pub fn tip<'a>(content: impl Into<Element<'a>>, text_: &'a str) -> Element<'a> {
     .delay(std::time::Duration::from_millis(650))
     .gap(8)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nice_plug::context::gui::GuiContext;
+    use std::sync::Arc;
+
+    /// The least a host can be: parameters and nothing else.
+    struct NullGui;
+
+    impl GuiContextInner for NullGui {
+        fn plugin_api(&self) -> PluginApi {
+            PluginApi::Standalone
+        }
+        unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
+        unsafe fn raw_set_parameter_normalized(&self, param: ParamPtr, normalized: f32) {
+            // SAFETY: the pointer comes from `TestHost::params`, which
+            // outlives every call made in a test.
+            unsafe {
+                param._internal_set_normalized_value(normalized);
+            }
+        }
+        unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
+        fn get_state(&self) -> PluginState {
+            PluginState {
+                version: String::new(),
+                params: Default::default(),
+                fields: Default::default(),
+            }
+        }
+        fn set_state(&self, _state: PluginState) {}
+        fn request_restart(&self) {}
+    }
+
+    struct TestHost {
+        params: Arc<vc_core::VcParams>,
+        gui: GuiContext,
+        meters: vc_core::Meters,
+    }
+
+    impl TestHost {
+        fn new() -> Self {
+            Self {
+                params: Arc::new(vc_core::VcParams::default()),
+                gui: GuiContext::new(Arc::new(NullGui)),
+                meters: vc_core::Meters::default(),
+            }
+        }
+    }
+
+    impl Host for TestHost {
+        fn params(&self) -> &vc_core::VcParams {
+            &self.params
+        }
+        fn gui(&self) -> &GuiContext {
+            &self.gui
+        }
+        fn meters(&self) -> &vc_core::Meters {
+            &self.meters
+        }
+        fn theme_mode(&self) -> Mode {
+            Mode::Dark
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        fn latency_ms(&self) -> f32 {
+            0.0
+        }
+    }
+
+    /// Presets are files: keep the tests out of the real settings folder.
+    #[cfg(target_os = "linux")]
+    fn private_settings_folder() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let dir = std::env::temp_dir().join(format!("vc-gui-tests-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            // SAFETY: set once, before any test in this module reads it.
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        });
+    }
+
+    fn send(model: &mut Model, host: &TestHost, m: Message) {
+        let _ = update(model, m, host);
+    }
+
+    #[test]
+    fn mute_is_a_switch_of_its_own() {
+        let host = TestHost::new();
+        let mut model = Model::new();
+        send(&mut model, &host, Message::ToggleMute);
+        assert!(host.params.mute.value());
+        assert!(!host.params.bypass.value(), "muting does not switch off");
+        send(&mut model, &host, Message::ToggleMute);
+        assert!(!host.params.mute.value());
+    }
+
+    #[test]
+    fn the_preset_name_goes_once_a_control_is_changed() {
+        let host = TestHost::new();
+        let mut model = Model::new();
+        let name = model
+            .presets
+            .iter()
+            .find(|e| !e.preset.matches(&host.params))
+            .map(|e| e.preset.name.clone())
+            .expect("a preset that changes something");
+        send(&mut model, &host, Message::ApplyPreset(name.clone()));
+        assert_eq!(model.current_preset.as_deref(), Some(name.as_str()));
+        // Muting and switching off are not part of a voice: the name stays.
+        send(&mut model, &host, Message::ToggleMute);
+        send(&mut model, &host, Message::TogglePower);
+        model.preset_still_applies(&host);
+        assert_eq!(model.current_preset.as_deref(), Some(name.as_str()));
+        // Turning a knob is.
+        let pitch = host.params.pitch.as_ptr();
+        let moved = (host.params.pitch.unmodulated_normalized_value() + 0.2).min(1.0);
+        send(&mut model, &host, Message::ParamJump(pitch, moved));
+        assert_eq!(model.current_preset, None);
+    }
+
+    #[test]
+    fn errors_stay_until_dismissed_and_good_news_leaves() {
+        let host = TestHost::new();
+        let mut model = Model::new();
+        let old = Instant::now() - std::time::Duration::from_secs(30);
+        model.toast = Some(("saved".into(), false, old));
+        send(&mut model, &host, Message::Tick);
+        assert!(model.toast.is_none());
+        model.toast = Some(("that failed".into(), true, old));
+        send(&mut model, &host, Message::Tick);
+        assert!(model.toast.is_some());
+        send(&mut model, &host, Message::DismissToast);
+        assert!(model.toast.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_preset_can_be_saved_renamed_updated_and_deleted() {
+        private_settings_folder();
+        let host = TestHost::new();
+        let mut model = Model::new();
+        let has = |model: &Model, name: &str| model.presets.iter().any(|e| e.preset.name == name);
+
+        // A built-in name is refused, with an error the user can read.
+        let factory = model.presets[0].preset.name.clone();
+        model.save_name = factory.clone();
+        send(&mut model, &host, Message::SavePreset);
+        assert!(model.toast.as_ref().is_some_and(|t| t.1), "an error toast");
+        assert_eq!(
+            model
+                .presets
+                .iter()
+                .filter(|e| e.preset.name == factory)
+                .count(),
+            1
+        );
+
+        model.save_name = "Stage voice".into();
+        send(&mut model, &host, Message::SavePreset);
+        assert!(has(&model, "Stage voice"));
+        assert_eq!(model.current_preset.as_deref(), Some("Stage voice"));
+
+        // Change something: the name goes, and Update puts it back.
+        let pitch = host.params.pitch.as_ptr();
+        send(&mut model, &host, Message::ParamJump(pitch, 0.9));
+        assert_eq!(model.current_preset, None);
+        assert_eq!(model.last_user_preset.as_deref(), Some("Stage voice"));
+        send(
+            &mut model,
+            &host,
+            Message::UpdatePreset("Stage voice".into()),
+        );
+        assert_eq!(model.current_preset.as_deref(), Some("Stage voice"));
+        let stored = model
+            .presets
+            .iter()
+            .find(|e| e.preset.name == "Stage voice")
+            .unwrap();
+        assert!(stored.preset.matches(&host.params));
+
+        send(
+            &mut model,
+            &host,
+            Message::StartRenamePreset("Stage voice".into()),
+        );
+        send(
+            &mut model,
+            &host,
+            Message::RenameChanged("Radio show".into()),
+        );
+        send(&mut model, &host, Message::CommitRename);
+        assert!(has(&model, "Radio show") && !has(&model, "Stage voice"));
+        assert_eq!(model.current_preset.as_deref(), Some("Radio show"));
+
+        // Deleting asks first; Esc backs out.
+        send(
+            &mut model,
+            &host,
+            Message::AskDeletePreset("Radio show".into()),
+        );
+        send(&mut model, &host, Message::Escape);
+        assert!(has(&model, "Radio show"));
+        send(
+            &mut model,
+            &host,
+            Message::AskDeletePreset("Radio show".into()),
+        );
+        send(
+            &mut model,
+            &host,
+            Message::DeletePreset("Radio show".into()),
+        );
+        assert!(!has(&model, "Radio show"));
+        assert_eq!(model.current_preset, None);
+    }
 }

@@ -77,8 +77,11 @@ impl Host for PluginHost {
         Some(self.ai_status.clone())
     }
     fn apply_setting(&self, setting: HostSetting) {
-        if let HostSetting::Theme(m) = setting {
-            self.theme.set(m);
+        if let HostSetting::Theme(choice) = setting {
+            self.theme.set(match choice {
+                vc_gui::ThemeChoice::Light => Mode::Light,
+                _ => Mode::Dark,
+            });
         }
     }
 }

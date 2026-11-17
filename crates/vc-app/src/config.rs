@@ -21,8 +21,12 @@ pub struct AppConfig {
     /// Closing the window hides to the tray instead of quitting.
     pub close_to_tray: bool,
     pub last_preset: Option<String>,
-    /// "dark" or "light".
+    /// "dark", "light" or "system".
     pub theme: String,
+    /// Size of everything in the window: 1.0 is normal.
+    pub ui_scale: f32,
+    /// Audio block size in frames; 0 = the default (256).
+    pub buffer: u32,
     /// Make the virtual mic the session's default microphone while running.
     pub set_as_default: bool,
     /// Last window geometry: x, y, width, height (NaN position = let the desktop choose).
@@ -47,6 +51,8 @@ impl Default for AppConfig {
             close_to_tray: false,
             last_preset: None,
             theme: "dark".into(),
+            ui_scale: 1.0,
+            buffer: 0,
             set_as_default: false,
             window: None,
             ai_threads: 0,

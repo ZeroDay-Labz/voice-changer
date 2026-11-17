@@ -62,8 +62,9 @@ struct Cli {
 
     /// Requested block size in frames. 256 is safe for USB headsets; 128
     /// shaves 2.7 ms if your interface copes.
-    #[arg(long, default_value_t = 256)]
-    quantum: u32,
+    /// Overrides the Buffer setting.
+    #[arg(long)]
+    quantum: Option<u32>,
 
     /// Start bypassed (passes the mic through untouched).
     #[arg(long)]
@@ -133,6 +134,10 @@ struct Cli {
     /// Run the engine through every preset on synthetic speech and exit (no audio devices needed).
     #[arg(long)]
     self_test: bool,
+
+    /// Check that the AI engine loads and runs a test model (no voice needed), then exit.
+    #[arg(long, hide = true)]
+    ai_self_test: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -198,6 +203,37 @@ enum Command {
     },
 }
 
+/// Load the AI engine and run a tiny built-in model: on the processor, and
+/// on the graphics card where this machine and this build have one to offer.
+#[cfg(feature = "ai")]
+fn ai_self_test() -> Result<()> {
+    use vc_core::ai::{compute, rvc};
+    println!("processor: {}", rvc::probe(compute::Backend::Cpu)?);
+    let mut gpu = compute::resolve("auto");
+    if gpu == compute::Backend::Cpu && compute::runtime_kind() == compute::RuntimeKind::DirectMl {
+        // DirectML is never picked by Auto; try it because we were asked to.
+        gpu = compute::Backend::DirectMl { device: 0 };
+    }
+    if gpu != compute::Backend::Cpu {
+        match rvc::probe(gpu) {
+            Ok(line) => println!("graphics card: {line}"),
+            Err(e) => println!("graphics card: not usable ({e:#})"),
+        }
+        if let Some(why) = compute::gpu_failure() {
+            println!("graphics card: {why}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "ai"))]
+fn ai_self_test() -> Result<()> {
+    anyhow::bail!("this build has no AI support")
+}
+
+/// Audio block size in frames unless the user chose another.
+const DEFAULT_QUANTUM: u32 = 256;
+
 /// Whether the remote control uses the local socket rather than D-Bus:
 /// always off Linux, and on Linux when `VC_IPC=socket` asks for it (tests).
 fn use_socket() -> bool {
@@ -238,7 +274,10 @@ fn main() -> Result<()> {
         return get_runtime(*cuda);
     }
     if cli.self_test {
-        return selftest::run(cli.rate, cli.quantum);
+        return selftest::run(cli.rate, cli.quantum.unwrap_or(DEFAULT_QUANTUM));
+    }
+    if cli.ai_self_test {
+        return ai_self_test();
     }
     if let Some(cmd) = cli.command {
         return remote(cmd);
@@ -281,9 +320,14 @@ fn main() -> Result<()> {
     }
     params.set_ai_threads(cfg.ai_threads);
     params.set_my_pitch_hz(cfg.my_pitch_hz);
+    let quantum = cli
+        .quantum
+        .or((cfg.buffer > 0).then_some(cfg.buffer))
+        .unwrap_or(DEFAULT_QUANTUM)
+        .clamp(64, 4096);
     let audio_config = audio::AudioConfig {
         rate: cli.rate,
-        quantum: cli.quantum,
+        quantum,
         capture_target: cfg.mic.clone(),
         source_name: cli.source_name.clone(),
         input_wav: match &cli.input_wav {
@@ -318,7 +362,7 @@ fn main() -> Result<()> {
     let shared = Shared::new(
         params,
         cli.rate as f32,
-        cli.quantum,
+        quantum,
         audio,
         audio_config,
         stats,
@@ -513,7 +557,7 @@ fn main() -> Result<()> {
             stats.skipped_callbacks.load(Ordering::Relaxed),
             stats.process_avg_us.load(Ordering::Relaxed),
             stats.process_max_us.load(Ordering::Relaxed),
-            cli.quantum as u64 * 1_000_000 / cli.rate as u64,
+            quantum as u64 * 1_000_000 / cli.rate as u64,
         );
     }
     // Everything is saved and torn down; skip slow Wayland/D-Bus destructors.

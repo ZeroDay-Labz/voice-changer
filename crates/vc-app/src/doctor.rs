@@ -419,6 +419,26 @@ fn common_checks(out: &mut Vec<Finding>) {
                     "ONNX Runtime",
                     format!("{} ({:?} build)", p.display(), kind),
                 ));
+                // Loading it and running a tiny model says more than
+                // finding the file. (Not with the ROCm build, which takes
+                // seconds to start and is checked when a voice loads.)
+                if matches!(
+                    kind,
+                    compute::RuntimeKind::Cpu | compute::RuntimeKind::DirectMl
+                ) {
+                    match vc_core::ai::rvc::probe(compute::Backend::Cpu) {
+                        Ok(_) => out.push(Finding::ok("AI engine", "loads and runs a test model")),
+                        Err(e) => out.push(Finding::fail(
+                            "AI engine",
+                            format!("{e:#}"),
+                            if cfg!(windows) {
+                                "Unpack the whole download again: onnxruntime.dll next to voice-changer.exe is missing or damaged."
+                            } else {
+                                "Run `voice-changer get-runtime` to fetch a fresh copy."
+                            },
+                        )),
+                    }
+                }
                 if let Some(note) = compute::rocm_note() {
                     out.push(Finding::warn("ROCm runtime", note, "Nothing to do unless this machine has an AMD GPU that ROCm should see; then check that the amdgpu driver and rocminfo work."));
                 }
@@ -427,8 +447,16 @@ fn common_checks(out: &mut Vec<Finding>) {
                 if cfg!(feature = "gpu") {
                     out.push(Finding::warn(
                         "ONNX Runtime",
-                        "no libonnxruntime.so found",
-                        "AI voices need it. Reinstall the package, or run `voice-changer get-runtime` (AMD: `dnf install onnxruntime-rocm`; NVIDIA: `voice-changer get-runtime --cuda`).",
+                        if cfg!(windows) {
+                            "onnxruntime.dll was not found next to voice-changer.exe"
+                        } else {
+                            "no libonnxruntime.so found"
+                        },
+                        if cfg!(windows) {
+                            "AI voices need it. Unpack the whole download again, keeping every file next to voice-changer.exe."
+                        } else {
+                            "AI voices need it. Reinstall the package, or run `voice-changer get-runtime` (AMD: `dnf install onnxruntime-rocm`; NVIDIA: `voice-changer get-runtime --cuda`)."
+                        },
                     ));
                 } else {
                     out.push(Finding::ok("ONNX Runtime", "built in (CPU)"));
@@ -439,7 +467,8 @@ fn common_checks(out: &mut Vec<Finding>) {
         // runtime, the CUDA 12 libraries and cuDNN 9. `get-runtime --cuda`
         // fetches all three. Say which is missing.
         let nvidia = compute::nvidia_gpus();
-        if !nvidia.is_empty() && cfg!(feature = "gpu") {
+        // (Linux only: on Windows the graphics card goes through DirectML.)
+        if !nvidia.is_empty() && cfg!(feature = "gpu") && !cfg!(windows) {
             let names = nvidia
                 .iter()
                 .map(|g| g.name.as_str())

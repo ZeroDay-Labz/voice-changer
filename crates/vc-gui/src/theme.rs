@@ -16,6 +16,20 @@ pub const CORAL: Color = Color::from_rgb8(255, 122, 107);
 pub const SKY: Color = Color::from_rgb8(94, 196, 245);
 pub const VIOLET: Color = Color::from_rgb8(181, 140, 255);
 
+/// `c` as a text colour: unchanged on the dark theme, darkened on the light
+/// one, where the bright accents are too pale to read on white.
+pub fn ink(c: Color, mode: Mode) -> Color {
+    match mode {
+        Mode::Dark => c,
+        Mode::Light => Color {
+            r: c.r * 0.58,
+            g: c.g * 0.58,
+            b: c.b * 0.58,
+            a: c.a,
+        },
+    }
+}
+
 /// A translucent tint of `c` for backgrounds.
 pub const fn tint(c: Color, a: f32) -> Color {
     Color { a, ..c }
@@ -26,6 +40,16 @@ pub enum Mode {
     #[default]
     Dark,
     Light,
+}
+
+/// What the user picked under Appearance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Choice {
+    #[default]
+    Dark,
+    Light,
+    /// Whatever the desktop uses.
+    System,
 }
 
 pub struct Tokens {
@@ -226,6 +250,21 @@ pub fn button_danger(theme: &Theme, status: button::Status) -> button::Style {
         10.0,
     )(theme, status)
 }
+
+/// A filled red button: something is switched off that the user must notice
+/// (muted).
+pub fn button_danger_solid(theme: &Theme, status: button::Status) -> button::Style {
+    btn(
+        DANGER,
+        Color::from_rgb(0.95, 0.42, 0.42),
+        Color::WHITE,
+        10.0,
+    )(theme, status)
+}
+
+/// Text that sits on the green accent (buttons, toasts): dark, since white
+/// on this green is hard to read.
+pub const ON_ACCENT: Color = Color::from_rgb8(8, 30, 22);
 
 /// Sidebar navigation entry; `active` highlights the current page in its colour.
 pub fn nav_button(active: bool, accent: Color) -> impl Fn(&Theme, button::Status) -> button::Style {

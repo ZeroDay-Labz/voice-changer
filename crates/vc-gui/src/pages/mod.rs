@@ -76,6 +76,19 @@ pub fn enum_picker<'a, T>(param: &'a EnumParam<T>, mode: Mode, width: f32) -> El
 where
     T: Enum + PartialEq + Clone + 'static,
 {
+    enum_picker_as(param, param.name(), mode, width)
+}
+
+/// Like [`enum_picker`], with the label in the words of the page it is on.
+pub fn enum_picker_as<'a, T>(
+    param: &'a EnumParam<T>,
+    label: &'a str,
+    mode: Mode,
+    width: f32,
+) -> Element<'a>
+where
+    T: Enum + PartialEq + Clone + 'static,
+{
     let t = theme::tokens(mode);
     let variants: &'static [&'static str] = T::variants();
     let idx = param.value().to_index();
@@ -90,9 +103,11 @@ where
         },
     )
     .style(theme::pick_list_style)
+    .text_size(13)
     .width(Length::Fixed(width));
     let row = row![
-        container(text(param.name()).size(14).color(t.text_dim)).width(Length::Fixed(130.0)),
+        container(text(label).size(14).color(t.text_dim))
+            .width(Length::Fixed(crate::widgets::knob::LABEL_WIDTH)),
         picker
     ]
     .spacing(12)
@@ -146,8 +161,11 @@ pub fn section_accent_with<'a>(
 pub fn kv<'a>(key: &'a str, value: impl Into<String>, mode: Mode) -> Element<'a> {
     let t = theme::tokens(mode);
     row![
-        container(text(key).size(13).color(t.text_dim)).width(Length::Fixed(130.0)),
-        text(value.into()).size(13)
+        container(text(key).size(13).color(t.text_dim))
+            .width(Length::Fixed(crate::widgets::knob::LABEL_WIDTH)),
+        text(value.into())
+            .size(13)
+            .wrapping(iced_core::text::Wrapping::WordOrGlyph)
     ]
     .spacing(12)
     .into()

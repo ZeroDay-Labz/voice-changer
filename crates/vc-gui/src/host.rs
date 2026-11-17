@@ -15,6 +15,8 @@ pub struct Capabilities {
     /// "Hear myself" can be switched on and off. False where the output
     /// device always plays the voice.
     pub monitor_toggle: bool,
+    /// The global shortcuts can be changed from the window.
+    pub hotkey_config: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -29,7 +31,13 @@ pub enum HostSetting {
     CloseToTray(bool),
     StartMinimized(bool),
     Autostart(bool),
-    Theme(crate::theme::Mode),
+    Theme(crate::theme::Choice),
+    /// Size of everything in the window: 1.0 is normal.
+    UiScale(f32),
+    /// Audio block size in frames (0 = the default); used from the next start.
+    Buffer(u32),
+    /// Show the first steps card again.
+    ShowWelcome,
     /// AI inference threads: 0 = Auto.
     AiThreads(u32),
     /// The welcome card was read.
@@ -45,6 +53,14 @@ pub struct HostSettings {
     pub ai_threads: u32,
     /// Show the welcome card.
     pub first_run: bool,
+    pub theme: crate::theme::Choice,
+    /// Size of everything in the window; `None` where the host decides.
+    pub ui_scale: Option<f32>,
+    /// Audio block size in frames (0 = the default); `None` where the host
+    /// decides.
+    pub buffer: Option<u32>,
+    /// The mute shortcut as text, when one is bound.
+    pub mute_hotkey: Option<String>,
 }
 
 /// Where the audio side stands (standalone only).

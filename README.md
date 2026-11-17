@@ -218,7 +218,7 @@ The app loads ONNX Runtime at start and uses whichever it finds first:
 | Runtime | Where it comes from | Result |
 |---|---|---|
 | ROCm build | Fedora: `sudo dnf install onnxruntime-rocm` (or `ORT_DYLIB_PATH`) | AMD GPUs appear under Compute |
-| CUDA build | `voice-changer get-runtime --cuda` (needs NVIDIA's driver, CUDA 12 runtime and cuDNN 9) | NVIDIA GPUs appear under Compute |
+| CUDA build | `voice-changer get-runtime --cuda` (needs only NVIDIA's driver) | NVIDIA GPUs appear under Compute |
 | CPU build | bundled with the packages, `voice-changer get-runtime`, or the distribution's `onnxruntime` | CPU only |
 
 Settings → AI shows which library is loaded. The first load of a voice on an AMD GPU
@@ -233,16 +233,23 @@ does the same from the terminal. Lower it if other programs stutter while the AI
 **NVIDIA.** Nothing is needed for the app, the effects or AI voices on the processor.
 To run the AI on the graphics card:
 
-1. Install the driver and the CUDA 12 runtime with cuDNN 9. Fedora: RPM Fusion's
-   `xorg-x11-drv-nvidia-cuda` plus `cuda-toolkit-12` and `cudnn9` from NVIDIA's
-   repository. Ubuntu: `nvidia-driver-5xx`, `cuda-toolkit-12-x`, `cudnn9-cuda-12`.
-   Arch: `cuda`, `cudnn`.
+1. Install NVIDIA's driver so that `nvidia-smi` works (Fedora: RPM Fusion's
+   `akmod-nvidia` and `xorg-x11-drv-nvidia-cuda`; Ubuntu: `nvidia-driver-5xx`;
+   Arch: `nvidia-utils`). No CUDA toolkit is needed.
 2. `voice-changer get-runtime --cuda` downloads Microsoft's CUDA build of ONNX Runtime
-   into `~/.local/lib/voice-changer/cuda`.
+   and the NVIDIA libraries it needs (CUDA 12 and cuDNN 9) into
+   `~/.local/lib/voice-changer/cuda`: up to 1.7 GB to download, up to 3 GB on disk, no
+   root. Libraries the system already has are not downloaded again. It needs `curl`,
+   `tar` and `unzip`.
 3. `voice-changer doctor` says whether everything was found; then start the app and pick
    the GPU under Compute (Auto chooses it).
 
-If a piece is missing the AI runs on the processor and Settings → AI says which piece.
+The CUDA 13 that current distributions package (Fedora 42 and later) cannot be used
+instead: the runtime is built against CUDA 12, which is why the libraries are
+downloaded. They are NVIDIA's own builds, from PyPI, checked against pinned checksums,
+and stay under NVIDIA's licence. Delete `~/.local/lib/voice-changer/cuda` to remove
+them. If a piece is missing the AI runs on the processor and Settings → AI says which
+piece.
 The same binary serves AMD, NVIDIA and CPU-only machines.
 
 ## Plugin

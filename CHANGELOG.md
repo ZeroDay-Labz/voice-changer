@@ -3,6 +3,22 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+- **NVIDIA needs only the driver.** `voice-changer get-runtime --cuda` now also downloads
+  the NVIDIA libraries the AI needs on the graphics card (CUDA 12.8 and cuDNN 9.10, up
+  to 1.7 GB, into `~/.local/lib/voice-changer/cuda`, no root) and the app loads them
+  from there. Libraries the system already has are not downloaded again. Tested without
+  an NVIDIA card: the download, the checksums and the loading of the libraries are
+  verified, a conversion on an NVIDIA GPU is not.
+
+### Fixed
+- **NVIDIA could not be set up on Fedora 42 and later.** The instructions named
+  `cuda-toolkit-12` and `cudnn9` from NVIDIA's repository, which only carries CUDA 13
+  for those releases, so the AI stayed on the processor. The doctor and Settings → AI
+  now point to `get-runtime --cuda` instead.
+
 ## [0.5.0] - 2026-11-14
 
 Measured on a Ryzen 9 5950X with a Radeon RX 6900 XT, on public test recordings (a

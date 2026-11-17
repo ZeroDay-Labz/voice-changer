@@ -169,7 +169,7 @@ enum Command {
     Doctor,
     /// Download the AI engine (ONNX Runtime) into ~/.local/lib/voice-changer: the CPU build, or with --cuda the NVIDIA build.
     GetRuntime {
-        /// The NVIDIA (CUDA 12) build instead of the CPU one.
+        /// The NVIDIA build instead of the CPU one, with NVIDIA's CUDA 12 and cuDNN 9 libraries (up to 1.7 GB; only the driver has to be installed).
         #[arg(long)]
         cuda: bool,
     },
@@ -493,11 +493,8 @@ fn get_runtime(cuda: bool) -> Result<()> {
     let status = child.wait()?;
     if !status.success() {
         anyhow::bail!(
-            "the download did not finish (it needs curl and tar, and a network connection)"
+            "the download did not finish (it needs curl, tar and unzip, a network connection and, with --cuda, 3 GB of disk space); run it again to continue"
         );
-    }
-    if cuda {
-        println!("Now run `voice-changer doctor` to check that CUDA 12 and cuDNN 9 are found.");
     }
     Ok(())
 }

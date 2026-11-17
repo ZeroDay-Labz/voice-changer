@@ -55,3 +55,19 @@ required-features = ["ai"]
 [[example]]
 name = "index_probe"
 required-features = ["ai"]
+
+[[example]]
+name = "ai_latency"
+required-features = ["ai"]
+
+[[example]]
+name = "ai_score"
+required-features = ["ai"]
+
+[[example]]
+name = "events_probe"
+required-features = ["ai"]
+
+[[example]]
+name = "voice_check"
+required-features = ["ai"]

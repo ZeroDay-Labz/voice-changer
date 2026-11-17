@@ -8,7 +8,7 @@ version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-repository = "https://github.com/echo/voice_changer"
+repository = "https://github.com/ZeroDay-Labz/voice-changer"
 
 [workspace.dependencies]
 # plugin framework (maintained nih-plug fork)

@@ -354,7 +354,8 @@ pub fn run_checks() -> Vec<Finding> {
             }
         }
         // NVIDIA needs three things beyond the driver: our CUDA build of the
-        // runtime, the CUDA 12 libraries and cuDNN 9. Say which is missing.
+        // runtime, the CUDA 12 libraries and cuDNN 9. `get-runtime --cuda`
+        // fetches all three. Say which is missing.
         let nvidia = compute::nvidia_gpus();
         if !nvidia.is_empty() && cfg!(feature = "gpu") {
             let names = nvidia
@@ -373,7 +374,7 @@ pub fn run_checks() -> Vec<Finding> {
                     out.push(Finding::warn(
                         "NVIDIA GPU",
                         format!("{names}: {missing}, AI runs on the CPU"),
-                        "Install the CUDA 12 runtime and cuDNN 9 (Fedora: cuda-toolkit-12 and cudnn9 from NVIDIA's repository; Ubuntu: cuda-toolkit-12-x and cudnn9-cuda-12; Arch: cuda and cudnn).",
+                        "Run `voice-changer get-runtime --cuda` again: it downloads NVIDIA's CUDA 12 and cuDNN 9 libraries (CUDA 13 from your distribution cannot be used instead). Then start the app again.",
                     ));
                 } else {
                     out.push(Finding::ok(

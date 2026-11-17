@@ -135,7 +135,8 @@ pub fn nvidia_gpus() -> Vec<GpuInfo> {
 }
 
 /// Microsoft's CUDA build of ONNX Runtime, installed by
-/// `scripts/get-onnxruntime.sh --cuda` (override with ORT_CUDA_DYLIB_PATH).
+/// `scripts/get-onnxruntime.sh --cuda` together with NVIDIA's libraries
+/// (override with ORT_CUDA_DYLIB_PATH).
 pub fn cuda_runtime_lib() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("ORT_CUDA_DYLIB_PATH") {
         let p = PathBuf::from(p);
@@ -162,38 +163,57 @@ pub fn cuda_runtime_lib() -> Option<PathBuf> {
 }
 
 /// The NVIDIA libraries Microsoft's CUDA build of ONNX Runtime links
-/// against: the CUDA 12 runtime and cuDNN 9.
+/// against: the CUDA 12 runtime and cuDNN 9. In an order in which each can
+/// be loaded on its own.
 pub const CUDA_LIBS: [&str; 7] = [
     "libcudart.so.12",
-    "libcublas.so.12",
     "libcublasLt.so.12",
+    "libcublas.so.12",
     "libcufft.so.11",
     "libcurand.so.10",
     "libnvrtc.so.12",
     "libcudnn.so.9",
 ];
 
-/// Which of [`CUDA_LIBS`] the dynamic loader cannot find. Cached.
+/// Which of [`CUDA_LIBS`] cannot be loaded. Cached.
+///
+/// `get-runtime --cuda` puts NVIDIA's libraries next to the CUDA build of
+/// ONNX Runtime, a folder the dynamic loader does not search (the CUDA
+/// provider has no RUNPATH). Each one is therefore loaded from there by its
+/// full path first; once loaded, the provider's dependency on the same
+/// name resolves to it. What is not in that folder is looked up on the
+/// system. NVIDIA's libraries find each other (cuDNN's parts, the NVRTC
+/// built-ins) through their own `$ORIGIN` RUNPATH.
 pub fn missing_cuda_libs() -> Vec<&'static str> {
     static CACHE: OnceLock<Vec<&'static str>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
             #[cfg(feature = "gpu")]
             {
+                let beside = cuda_runtime_lib().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                // SAFETY: these are NVIDIA's own runtime libraries; loading
+                // one runs only its initialisers. Kept open (the provider
+                // needs them anyway).
+                let load = |name: &std::ffi::OsStr| match unsafe { libloading::Library::new(name) }
+                {
+                    Ok(lib) => {
+                        std::mem::forget(lib);
+                        true
+                    }
+                    Err(e) => {
+                        log::debug!("{}: {e}", name.to_string_lossy());
+                        false
+                    }
+                };
                 CUDA_LIBS
                     .iter()
                     .copied()
                     .filter(|name| {
-                        // SAFETY: these are NVIDIA's own runtime libraries;
-                        // loading one runs only its initialisers. Kept open
-                        // (the provider needs them anyway).
-                        match unsafe { libloading::Library::new(name) } {
-                            Ok(lib) => {
-                                std::mem::forget(lib);
-                                false
-                            }
-                            Err(_) => true,
-                        }
+                        let local = beside
+                            .as_ref()
+                            .map(|d| d.join(name))
+                            .filter(|p| p.is_file());
+                        !(local.is_some_and(|p| load(p.as_os_str())) || load(name.as_ref()))
                     })
                     .collect()
             }
@@ -211,9 +231,9 @@ pub fn missing_cuda_summary() -> Option<String> {
     if missing.is_empty() {
         None
     } else if missing.len() == CUDA_LIBS.len() {
-        Some("the CUDA 12 runtime and cuDNN 9 are not installed".into())
+        Some("the CUDA 12 and cuDNN 9 libraries are missing".into())
     } else if missing == ["libcudnn.so.9"] {
-        Some("cuDNN 9 is not installed (libcudnn.so.9)".into())
+        Some("cuDNN 9 is missing (libcudnn.so.9)".into())
     } else {
         Some(format!("{} not found", missing.join(", ")))
     }
@@ -239,7 +259,7 @@ pub fn gpu_failure() -> Option<String> {
         && let Some(missing) = missing_cuda_summary()
     {
         return Some(format!(
-            "The NVIDIA GPU cannot be used yet: {missing}. Install the CUDA 12 runtime and cuDNN 9, then restart. The AI runs on the CPU meanwhile."
+            "The NVIDIA GPU cannot be used yet: {missing}. Run `voice-changer get-runtime --cuda` to download them, then restart. The AI runs on the CPU meanwhile."
         ));
     }
     GPU_FAILED
@@ -409,7 +429,7 @@ pub fn gpu_note() -> Option<String> {
         return Some("GPU support needs the gpu build.".into());
     }
     if !nvidia_gpus().is_empty() {
-        return Some("NVIDIA GPU found. Run `voice-changer get-runtime --cuda` (it also needs the CUDA 12 runtime and cuDNN 9), then restart.".into());
+        return Some("NVIDIA GPU found. Run `voice-changer get-runtime --cuda` (a 1.7 GB download), then restart.".into());
     }
     if rocm_runtime_lib().is_some() {
         return Some("No AMD GPU detected by ROCm; the AI runs on the CPU runtime.".into());

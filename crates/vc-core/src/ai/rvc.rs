@@ -391,7 +391,6 @@ const MIN_VOICED_FRAMES: usize = 3;
 
 /// The useful end of an ONNX Runtime error: what follows the last
 /// "with error:" (the loader's own message), cut to one short line.
-#[cfg(feature = "gpu")]
 pub(crate) fn short_reason(error: &str) -> String {
     let tail = error.rsplit("with error:").next().unwrap_or(error);
     let line = tail.lines().next().unwrap_or(tail).trim();

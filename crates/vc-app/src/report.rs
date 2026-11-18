@@ -35,11 +35,14 @@ fn system_version() -> Option<String> {
 #[cfg(not(windows))]
 fn graphics_cards() -> Vec<String> {
     // Only what has already been looked up: asking now can take seconds.
-    vc_core::ai::compute::gpus_if_probed()
+    #[cfg(feature = "ai")]
+    return vc_core::ai::compute::gpus_if_probed()
         .unwrap_or_default()
         .into_iter()
         .map(|g| format!("{} ({})", g.name, g.api))
-        .collect()
+        .collect();
+    #[cfg(not(feature = "ai"))]
+    Vec::new()
 }
 
 #[cfg(windows)]

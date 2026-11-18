@@ -63,6 +63,11 @@
   </supports>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.6.2" date="2026-11-18">
+      <description>
+        <p>A voice that fails on the graphics card now runs on the processor by itself. Problems are explained in one sentence with a button that fixes them, and a new button copies a problem report to paste when asking for help.</p>
+      </description>
+    </release>
     <release version="0.6.1" date="2026-11-18">
       <description>
         <p>Restores the Flatpak, which 0.6.0 was published without, and downloads ONNX Runtime from a source that still exists.</p>

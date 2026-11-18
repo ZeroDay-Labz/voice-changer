@@ -70,10 +70,13 @@ fn audio_card<'a>(model: &'a Model, mode: Mode) -> Option<Element<'a>> {
                             .on_press(Message::RetryAudio),
                         help::RETRY_AUDIO
                     ),
-                    button(text("See the log").size(13))
-                        .style(theme::button_soft)
-                        .padding([8, 14])
-                        .on_press(Message::Go(crate::Page::Settings)),
+                    tip(
+                        button(text("Copy problem report").size(13))
+                            .style(theme::button_soft)
+                            .padding([8, 14])
+                            .on_press(Message::CopyReport),
+                        help::COPY_REPORT
+                    ),
                 ]
                 .spacing(12)
                 .align_y(Alignment::Center),
@@ -242,21 +245,49 @@ fn welcome<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> 
     {
         changed |= p.ai_enabled.value() && !p.ai_voice().is_empty();
     }
-    steps.push(
-        column![
-            head(steps.len() + 1, "Pick a voice", changed),
-            indent(
-                dim(
-                    "Click a preset below and talk. The ON button at the top left switches between the changed voice and your own.",
-                    12,
-                    mode
-                )
-                .into()
-            ),
+    let mut voice_step = column![
+        head(steps.len() + 1, "Pick a voice", changed),
+        indent(
+            dim(
+                "Click a preset below and talk. The ON button at the top left switches between the changed voice and your own.",
+                12,
+                mode
+            )
+            .into()
+        ),
+    ]
+    .spacing(6);
+    // The usual reasons for "I picked one and nothing happens", each with
+    // the button that undoes it.
+    let fix = |words: &'a str, label: &'a str, msg: Message| -> Element<'a> {
+        row![
+            text(words)
+                .size(12)
+                .color(theme::ink(theme::WARN, mode))
+                .wrapping(iced_core::text::Wrapping::WordOrGlyph),
+            button(text(label).size(12))
+                .style(theme::button_soft)
+                .padding([3, 10])
+                .on_press(msg),
         ]
-        .spacing(6)
-        .into(),
-    );
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+    };
+    if p.mute.value() {
+        voice_step = voice_step.push(indent(fix(
+            "You are muted: nobody hears you.",
+            "Unmute",
+            Message::ToggleMute,
+        )));
+    } else if p.bypass.value() {
+        voice_step = voice_step.push(indent(fix(
+            "The voice changer is switched off, so your own voice goes through.",
+            "Switch on",
+            Message::TogglePower,
+        )));
+    }
+    steps.push(voice_step.into());
 
     // 4. Other programs (where there is a virtual microphone).
     if caps.routing {
@@ -745,7 +776,25 @@ fn ai_card<'a>(model: &'a Model, host: &'a dyn Host, mode: Mode) -> Element<'a> 
         );
     }
     main = main.push(param_slider_as(&p.ai_pitch, "Pitch", mode, 170.0));
-    main = main.push(super::enum_picker_as(&p.ai_speed, "Delay", mode, 240.0));
+    // "Fastest" only works with the AI on a graphics card: do not offer it
+    // where it would just stutter.
+    let on_gpu = {
+        use vc_core::ai::compute;
+        compute::gpus_if_probed().is_some_and(|g| !g.is_empty())
+            && compute::resolve(&p.ai_device()) != compute::Backend::Cpu
+    };
+    let hidden: &[usize] = if on_gpu {
+        &[]
+    } else {
+        &[vc_core::AiSpeed::Fastest as usize]
+    };
+    main = main.push(super::enum_picker_without(
+        &p.ai_speed,
+        "Delay",
+        hidden,
+        mode,
+        240.0,
+    ));
     main = main.push(param_toggle_as(&p.ai_block_noises, "Block coughs", mode));
     if p.ai_block_noises.value() {
         let ready = status
@@ -1055,28 +1104,7 @@ fn capitalize(s: &str) -> String {
 #[cfg(feature = "ai")]
 fn ai_problem<'a>(model: &'a Model, raw: String, mode: Mode) -> Element<'a> {
     let t = theme::tokens(mode);
-    let lower = raw.to_lowercase();
-    let (headline, action): (&str, Option<(&str, Message)>) = if !model.cache.base_models_present {
-        (
-            "The AI needs its base models first (about 740 MB, downloaded once).",
-            Some(("Download", Message::DownloadBaseModels)),
-        )
-    } else if lower.contains("onnx runtime") || lower.contains("onnxruntime") {
-        (
-            "The AI engine is missing or could not be loaded.",
-            Some(("Open Settings", Message::Go(crate::Page::Settings))),
-        )
-    } else if lower.contains("no such file") || lower.contains("not found") {
-        (
-            "The voice's file is gone. Pick another voice, or add it again.",
-            Some(("Manage voices", Message::Go(crate::Page::Voices))),
-        )
-    } else {
-        (
-            "The voice could not be loaded. It is tried again every half minute; picking another voice tries at once.",
-            Some(("See the log", Message::Go(crate::Page::Settings))),
-        )
-    };
+    let (headline, action) = ai_problem_advice(&raw, model.cache.base_models_present);
     let mut line = row![
         icons::alert(18.0, theme::DANGER),
         text(headline)
@@ -1096,9 +1124,109 @@ fn ai_problem<'a>(model: &'a Model, raw: String, mode: Mode) -> Element<'a> {
                 .on_press_maybe((!busy).then_some(msg)),
         );
     }
-    container(column![line, dim(format!("Details: {raw}"), 11, mode)].spacing(6))
+    let mut body = column![line, problem_tools(model)].spacing(6);
+    if model.problem_details {
+        body = body.push(dim(raw, 11, mode));
+    }
+    container(body)
         .padding(12)
         .width(Length::Fill)
         .style(theme::panel_accent(theme::DANGER))
         .into()
+}
+
+/// "Copy problem report" and the switch for the technical text.
+fn problem_tools<'a>(model: &'a Model) -> Element<'a> {
+    row![
+        tip(
+            button(text("Copy problem report").size(12))
+                .style(theme::button_ghost)
+                .padding([3, 8])
+                .on_press(Message::CopyReport),
+            help::COPY_REPORT
+        ),
+        button(
+            text(if model.problem_details {
+                "Hide details"
+            } else {
+                "Details"
+            })
+            .size(12)
+        )
+        .style(theme::button_ghost)
+        .padding([3, 8])
+        .on_press(Message::ToggleProblemDetails),
+    ]
+    .spacing(6)
+    .into()
+}
+
+/// What to tell the user about an AI error, and the one button that helps.
+#[cfg(feature = "ai")]
+fn ai_problem_advice(
+    raw: &str,
+    base_models_present: bool,
+) -> (&'static str, Option<(&'static str, Message)>) {
+    let lower = raw.to_lowercase();
+    if !base_models_present {
+        (
+            "The AI needs its base models first (about 740 MB, downloaded once).",
+            Some(("Download", Message::DownloadBaseModels)),
+        )
+    } else if lower.contains("dmlexecutionprovider")
+        || lower.contains("directml")
+        || lower.contains("execution provider")
+    {
+        (
+            "Your graphics card could not run this voice. The processor can: it works on every computer.",
+            Some(("Use the processor", Message::SelectDevice("cpu".into()))),
+        )
+    } else if lower.contains("onnx runtime) was not found")
+        || lower.contains("ai engine could not")
+        || lower.contains("libonnxruntime")
+    {
+        (
+            "The AI engine is missing or could not be loaded.",
+            Some(("Open Settings", Message::Go(crate::Page::Settings))),
+        )
+    } else if lower.contains("no such file")
+        || lower.contains("not found")
+        || lower.contains("file is missing")
+    {
+        (
+            "The voice's file is gone. Pick another voice, or add it again.",
+            Some(("Manage voices", Message::Go(crate::Page::Voices))),
+        )
+    } else {
+        (
+            "The voice could not be loaded. It is tried again every half minute; picking another voice tries at once.",
+            None,
+        )
+    }
+}
+
+#[cfg(all(test, feature = "ai"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_graphics_card_failure_is_not_called_a_missing_engine() {
+        // What a Radeon user on Windows got (0.6.1).
+        let raw = "Non-zero status code returned while running Reshape node. Name:'node_view_50' Status Message: D:\\a\\_work\\1\\s\\onnxruntime\\core\\providers\\dml\\DmlExecutionProvider\\src\\MLOperatorAuthorImpl.cpp(2595)\\onnxruntime.dll!00007FFDA2AB2DB5";
+        let (headline, action) = ai_problem_advice(raw, true);
+        assert!(headline.contains("graphics card"), "{headline}");
+        assert!(matches!(action, Some((_, Message::SelectDevice(d))) if d == "cpu"));
+    }
+
+    #[test]
+    fn a_missing_engine_is_still_recognised() {
+        let (headline, _) = ai_problem_advice(
+            "The AI engine (ONNX Runtime) was not found: install it.",
+            true,
+        );
+        assert!(headline.contains("engine"), "{headline}");
+        let (headline, action) = ai_problem_advice("anything", false);
+        assert!(headline.contains("base models"));
+        assert!(matches!(action, Some((_, Message::DownloadBaseModels))));
+    }
 }

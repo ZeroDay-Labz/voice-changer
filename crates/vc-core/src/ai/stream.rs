@@ -567,7 +567,9 @@ fn worker_loop(
             // New window shapes: compile/tune kernels now, not on live audio.
             if let Some(l) = loaded.as_mut() {
                 let tail16 = (block + crossfade + tail_margin) / 3 + synth_context;
-                l.rvc.warm_up(l.to16k.output_len(window_len), tail16);
+                // A failure shows up again on the first real block, where
+                // it is handled.
+                let _ = l.rvc.warm_up(l.to16k.output_len(window_len), tail16);
             }
             settle = SETTLE_BLOCKS;
         }
@@ -616,10 +618,42 @@ fn worker_loop(
                     super::compute::resolve(&w.device),
                     super::compute::Backend::DirectMl { .. }
                 ) && super::compute::directml_begin();
-                match load(&w.voice, w.threads, &w.device, sr) {
-                    Ok(mut l) => {
-                        let tail16 = (block + crossfade + tail_margin) / 3 + synth_context;
-                        l.rvc.warm_up(l.to16k.output_len(window_len), tail16);
+                let tail16 = (block + crossfade + tail_margin) / 3 + synth_context;
+                // Loaded means it has run once on the real window: a model
+                // that loads on a graphics card can still fail to run there.
+                let try_load = |force_cpu: bool| -> anyhow::Result<Loaded> {
+                    let mut l = load(&w.voice, w.threads, &w.device, sr, force_cpu)?;
+                    match l.rvc.warm_up(l.to16k.output_len(window_len), tail16) {
+                        Ok(()) => Ok(l),
+                        Err(e) => {
+                            release(Some(l));
+                            Err(e)
+                        }
+                    }
+                };
+                let on_gpu = !matches!(
+                    super::compute::resolve(&w.device),
+                    super::compute::Backend::Cpu
+                );
+                let mut attempt = try_load(false);
+                if let Err(e) = &attempt
+                    && on_gpu
+                {
+                    // Blame the graphics card only when the same voice works
+                    // on the processor; otherwise the voice is the problem.
+                    log::warn!(
+                        "the voice failed on the graphics card ({e:#}); trying the processor"
+                    );
+                    if let Ok(l) = try_load(true) {
+                        super::compute::mark_gpu_failed(&format!(
+                            "it could not run this voice: {}",
+                            super::rvc::short_reason(&format!("{e:#}"))
+                        ));
+                        attempt = Ok(l);
+                    }
+                }
+                match attempt {
+                    Ok(l) => {
                         if directml {
                             super::compute::directml_ok();
                         }
@@ -792,6 +826,18 @@ fn worker_loop(
                 log::error!("AI inference failed ({infer_failures}): {e:#}");
                 status.set(AiState::Error, format!("{e:#}"));
                 active.store(false, Ordering::Relaxed);
+                // DirectML passed the warm-up and failed later: it is not
+                // going to get better, and the reload below lands on the
+                // processor.
+                if matches!(
+                    super::compute::resolve(&l.device),
+                    super::compute::Backend::DirectMl { .. }
+                ) {
+                    super::compute::mark_gpu_failed(&format!(
+                        "it stopped working: {}",
+                        super::rvc::short_reason(&format!("{e:#}"))
+                    ));
+                }
                 let taken = loaded.take();
                 let was = taken.as_ref().map(|l| Wanted {
                     voice: l.voice.clone(),
@@ -940,6 +986,7 @@ fn load(
     threads: usize,
     device: &str,
     sample_rate: usize,
+    force_cpu: bool,
 ) -> anyhow::Result<Loaded> {
     if !voice.is_file() {
         anyhow::bail!(
@@ -956,7 +1003,11 @@ fn load(
             dir.display()
         )
     })?;
-    let backend = super::compute::resolve(device);
+    let backend = if force_cpu {
+        super::compute::Backend::Cpu
+    } else {
+        super::compute::resolve(device)
+    };
     log::info!(
         "loading AI voice on {} with {threads} thread{}",
         backend.label(&super::compute::gpus()),

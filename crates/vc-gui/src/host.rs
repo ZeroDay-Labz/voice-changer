@@ -194,6 +194,11 @@ pub trait Host {
         HostSettings::default()
     }
     fn apply_setting(&self, _setting: HostSetting) {}
+    /// Facts about this computer for the problem report (system version,
+    /// graphics cards), one per line.
+    fn system_lines(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn log_lines(&self) -> Vec<String> {
         Vec::new()
     }

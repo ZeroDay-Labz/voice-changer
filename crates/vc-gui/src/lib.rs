@@ -152,6 +152,11 @@ pub enum Message {
     DismissWelcome,
     /// Show or hide the less-used AI settings on the Home page.
     ToggleAiAdvanced,
+    /// Show or hide the technical text under a problem.
+    ToggleProblemDetails,
+    /// Put a description of this computer and what went wrong on the
+    /// clipboard, to paste into a message asking for help.
+    CopyReport,
 }
 
 /// What a file dialog is wanted for.
@@ -188,6 +193,8 @@ pub struct Model {
     pub last_user_preset: Option<String>,
     /// The Home page shows the less-used AI settings.
     pub ai_advanced: bool,
+    /// A problem card shows its technical text.
+    pub problem_details: bool,
     /// 0..1, going round while the window is open: drives the "working on
     /// it" bar of steps whose length is not known.
     pub phase: f32,
@@ -255,6 +262,7 @@ impl Model {
             renaming: None,
             last_user_preset: None,
             ai_advanced: false,
+            problem_details: false,
             phase: 0.0,
             toast: None,
             meters: widgets::meter::Levels::default(),
@@ -542,6 +550,61 @@ pub fn rename_id() -> iced_core::widget::Id {
 
 // ------------------------------------------------------------------ update
 
+/// Everything someone helping needs to know, as text: the program, the
+/// computer, what the audio and the AI say, and the end of the log. Nothing
+/// personal beyond device names and file paths that appear in the log.
+pub fn problem_report(host: &dyn Host) -> String {
+    let mut out = vec![
+        format!("Voice Changer {}", env!("CARGO_PKG_VERSION")),
+        format!(
+            "System: {} {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ),
+    ];
+    out.extend(host.system_lines());
+    if let Some(h) = host.hardware() {
+        out.push(format!("Computer: {}", h.line));
+    }
+    if let Some(r) = host.runtime_description() {
+        out.push(format!("AI engine: {r}"));
+    }
+    #[cfg(feature = "ai")]
+    {
+        use vc_core::ai::compute;
+        let p = host.params();
+        out.push(format!("AI runs on (setting): {}", p.ai_device()));
+        if let Some(why) = compute::gpu_failure() {
+            out.push(format!("Graphics card: {why}"));
+        }
+        out.push(format!(
+            "AI voice: {}",
+            if p.ai_voice().is_empty() {
+                "none".to_string()
+            } else {
+                std::path::Path::new(&p.ai_voice())
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            }
+        ));
+        if let Some(st) = host.ai_status() {
+            out.push(format!("AI status: {:?}: {}", st.state(), st.message()));
+        }
+    }
+    if let Some(a) = host.audio_status() {
+        out.push(format!("Audio: {:?} {}", a.state, a.message));
+    }
+    let lines = host.log_lines();
+    if !lines.is_empty() {
+        out.push(String::new());
+        out.push("Log (most recent last):".into());
+        let from = lines.len().saturating_sub(40);
+        out.extend(lines[from..].iter().cloned());
+    }
+    out.join("\n")
+}
+
 pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Message> {
     match message {
         Message::Tick => {
@@ -822,6 +885,15 @@ pub fn update(model: &mut Model, message: Message, host: &dyn Host) -> Task<Mess
             model.cache.settings = host.settings();
         }
         Message::ToggleAiAdvanced => model.ai_advanced = !model.ai_advanced,
+        Message::ToggleProblemDetails => model.problem_details = !model.problem_details,
+        Message::CopyReport => {
+            let report = problem_report(host);
+            model.toast(
+                "Copied. Paste it into your message when you ask for help.",
+                false,
+            );
+            return iced_runtime::clipboard::write(report);
+        }
         Message::OpenDataFolder => host.open_data_folder(),
         Message::Quit => host.quit(),
         Message::DismissToast => model.toast = None,
@@ -1191,6 +1263,22 @@ mod tests {
 
     fn send(model: &mut Model, host: &TestHost, m: Message) {
         let _ = update(model, m, host);
+    }
+
+    #[test]
+    fn the_problem_report_says_what_runs_and_tells_the_user_it_was_copied() {
+        let host = TestHost::new();
+        let mut model = Model::new();
+        let report = problem_report(&host);
+        assert!(report.starts_with(&format!("Voice Changer {}", env!("CARGO_PKG_VERSION"))));
+        assert!(report.contains("System: "), "{report}");
+        send(&mut model, &host, Message::CopyReport);
+        assert!(
+            model
+                .toast
+                .as_ref()
+                .is_some_and(|t| t.0.starts_with("Copied"))
+        );
     }
 
     #[test]

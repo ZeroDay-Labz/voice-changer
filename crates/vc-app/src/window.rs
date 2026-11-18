@@ -350,6 +350,9 @@ impl Host for AppHost {
     fn log_lines(&self) -> Vec<String> {
         crate::logger::lines()
     }
+    fn system_lines(&self) -> Vec<String> {
+        crate::report::system_lines()
+    }
     fn open_data_folder(&self) {
         if let Some(dir) = directories::ProjectDirs::from("", "echo", "voice-changer")
             .map(|d| d.data_dir().to_path_buf())

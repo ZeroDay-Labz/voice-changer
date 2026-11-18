@@ -144,6 +144,7 @@ pub const RUNTIME: &str =
     "The AI engine library in use. The ROCm or CUDA one lets the AI run on your graphics card.";
 pub const AI_THREADS: &str = "How many processor threads the AI may use. Auto keeps one core free for audio and the window and never exceeds what your machine has. Lower it if other programs stutter while the AI runs; raise it if the AI cannot keep up.";
 pub const RETRY_AUDIO: &str = "Try to connect to the audio system again.";
+pub const COPY_REPORT: &str = "Copies what went wrong and what this computer has, as text. Paste it into your message when you ask for help.";
 pub const WELCOME_DONE: &str =
     "Hide this card. Everything in it stays available on the Settings and Mixer pages.";
 pub const LISTENERS: &str = "Applications currently receiving the voice from Voice Changer Mic.";

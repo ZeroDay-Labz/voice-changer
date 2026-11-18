@@ -3,6 +3,32 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.2] - 2026-11-18
+
+### Added
+- **Copy problem report.** A button on every problem card and beside the log in Settings
+  copies what went wrong together with the program version, the system, the graphics
+  cards and their drivers, and the end of the log: paste it when asking for help.
+- **First steps says why nothing is heard**: muted, or switched off, each with the button
+  that undoes it.
+
+### Changed
+- **Problem cards are one plain sentence and a button that fixes it.** A graphics card
+  that cannot run a voice offers "Use the processor"; the technical text is behind
+  "Details".
+- **"Fastest (graphics card)" is only offered in Delay when the AI really runs on a
+  graphics card.** On Windows, and on computers without a usable card, it could only
+  stutter.
+
+### Fixed
+- **A voice that fails on the graphics card now runs on the processor instead** of
+  showing an error and retrying forever. Reported on Windows with a Radeon RX 7600M XT,
+  where DirectML loads the voice and then fails on one of its steps. The voice is tested
+  once on load; if it fails there and works on the processor, the processor is used until
+  restart and the AI card says why. This has not been tried on a Windows computer.
+- The error card no longer says "The AI engine is missing" for problems that are not
+  that.
+
 ## [0.6.1] - 2026-11-18
 
 ### Fixed

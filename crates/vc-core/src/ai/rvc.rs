@@ -392,7 +392,7 @@ const MIN_VOICED_FRAMES: usize = 3;
 /// The useful end of an ONNX Runtime error: what follows the last
 /// "with error:" (the loader's own message), cut to one short line.
 #[cfg(feature = "gpu")]
-fn short_reason(error: &str) -> String {
+pub(crate) fn short_reason(error: &str) -> String {
     let tail = error.rsplit("with error:").next().unwrap_or(error);
     let line = tail.lines().next().unwrap_or(tail).trim();
     let mut short: String = line.chars().take(120).collect();
@@ -601,8 +601,9 @@ impl Rvc {
     /// Run one inference on quiet noise with the given window/tail sizes.
     /// GPU providers compile kernels per tensor shape on first use (seconds
     /// to tens of seconds on ROCm), so streaming code warms up with its
-    /// exact window before the first real block.
-    pub fn warm_up(&mut self, window16k: usize, tail16k: usize) {
+    /// exact window before the first real block. An error means the models
+    /// cannot run on this backend at all.
+    pub fn warm_up(&mut self, window16k: usize, tail16k: usize) -> Result<()> {
         let t0 = Instant::now();
         let mut rng = Gauss(0xD1B5_4A32_D192_ED03);
         let mut warm = vec![0.0f32; window16k.max(2048)];
@@ -612,12 +613,18 @@ impl Rvc {
         }
         let mut out = Vec::new();
         match self.infer_tail(&warm, tail16k, 0.0, 0, &mut out) {
-            Err(e) => log::warn!("warm-up inference failed: {e:#}"),
-            Ok(_) => log::info!(
-                "models warmed up for a {:.2} s window in {:.0} ms",
-                window16k as f32 / 16_000.0,
-                t0.elapsed().as_secs_f32() * 1000.0
-            ),
+            Err(e) => {
+                log::warn!("warm-up inference failed: {e:#}");
+                Err(e)
+            }
+            Ok(_) => {
+                log::info!(
+                    "models warmed up for a {:.2} s window in {:.0} ms",
+                    window16k as f32 / 16_000.0,
+                    t0.elapsed().as_secs_f32() * 1000.0
+                );
+                Ok(())
+            }
         }
     }
 

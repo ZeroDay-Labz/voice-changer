@@ -30,6 +30,7 @@ mod ipc;
 #[cfg(target_os = "linux")]
 mod launcher;
 mod logger;
+mod report;
 mod selftest;
 #[cfg(target_os = "linux")]
 mod tray;

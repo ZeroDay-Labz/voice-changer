@@ -158,7 +158,7 @@ fn main() -> anyhow::Result<()> {
     rvc.warm_up(
         (16_000.0 * window_s) as usize,
         (16_000.0 * window_s) as usize,
-    );
+    )?;
 
     let (audio, rate) = match &input {
         Some(p) => read_wav(p)?,

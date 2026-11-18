@@ -482,7 +482,19 @@ fn logs<'a>(host: &'a dyn Host, mode: Mode) -> Element<'a> {
         .on_press(Message::OpenDataFolder),
         help::OPEN_DATA,
     );
-    section_with("Log", open, mode, body)
+    let copy = tip(
+        button(text("Copy problem report").size(13))
+            .style(theme::button_soft)
+            .padding([6, 10])
+            .on_press(Message::CopyReport),
+        help::COPY_REPORT,
+    );
+    section_with(
+        "Log",
+        row![copy, open].spacing(8).align_y(Alignment::Center),
+        mode,
+        body,
+    )
 }
 
 fn about<'a>(host: &'a dyn Host, mode: Mode) -> Element<'a> {

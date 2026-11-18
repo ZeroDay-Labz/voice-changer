@@ -89,13 +89,35 @@ pub fn enum_picker_as<'a, T>(
 where
     T: Enum + PartialEq + Clone + 'static,
 {
+    enum_picker_without(param, label, &[], mode, width)
+}
+
+/// Like [`enum_picker_as`], leaving out the choices at the positions in
+/// `hidden` (ones that cannot work on this computer). The choice in use is
+/// always listed.
+pub fn enum_picker_without<'a, T>(
+    param: &'a EnumParam<T>,
+    label: &'a str,
+    hidden: &[usize],
+    mode: Mode,
+    width: f32,
+) -> Element<'a>
+where
+    T: Enum + PartialEq + Clone + 'static,
+{
     let t = theme::tokens(mode);
     let variants: &'static [&'static str] = T::variants();
     let idx = param.value().to_index();
     let ptr = param.as_ptr();
     let n = variants.len().max(2) as f32 - 1.0;
+    let offered: Vec<&'static str> = variants
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i == idx || !hidden.contains(i))
+        .map(|(_, v)| *v)
+        .collect();
     let picker = pick_list(
-        variants,
+        offered,
         variants.get(idx).copied(),
         move |label: &'static str| {
             let i = variants.iter().position(|v| *v == label).unwrap_or(0);

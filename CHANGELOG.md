@@ -3,12 +3,16 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.6.1] - 2026-11-17
+## [0.6.1] - 2026-11-18
 
 ### Fixed
 - **The Flatpak is back.** 0.6.0 was published without it: a library added for the file
   dialogs needed a newer Rust than the Flatpak build environment has. It is pinned to a
-  version that builds there. Nothing else changed.
+  version that builds there.
+- **`voice-changer get-runtime` works again.** Microsoft's ONNX Runtime repository
+  disappeared from GitHub on 17 November 2026 and every download from it fails, in 0.6.0
+  and earlier too. The runtime now comes from Microsoft's NuGet packages: the same 1.22.0
+  libraries, byte for byte, and the download is now checked against a checksum.
 
 ## [0.6.0] - 2026-11-17
 

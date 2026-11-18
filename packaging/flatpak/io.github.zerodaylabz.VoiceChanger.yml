@@ -80,20 +80,21 @@ modules:
       - /bin
       - /share
 
+  # Microsoft's NuGet package: a zip with the library for both architectures.
   - name: onnxruntime
     buildsystem: simple
     build-commands:
-      - install -d /app/lib/voice-changer
-      - cp -P lib/libonnxruntime.so* /app/lib/voice-changer/
+      - python3 -m zipfile -e ort.nupkg ort
+      - case "$(uname -m)" in x86_64) rid=linux-x64 ;; *) rid=linux-arm64 ;; esac;
+        install -Dm755 ort/runtimes/$rid/native/libonnxruntime.so
+        /app/lib/voice-changer/libonnxruntime.so.1.22.0
+      - ln -s libonnxruntime.so.1.22.0 /app/lib/voice-changer/libonnxruntime.so.1
+      - ln -s libonnxruntime.so.1.22.0 /app/lib/voice-changer/libonnxruntime.so
     sources:
-      - type: archive
-        only-arches: [x86_64]
-        url: https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz
-        sha256: 8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3
-      - type: archive
-        only-arches: [aarch64]
-        url: https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-aarch64-1.22.0.tgz
-        sha256: bb76395092d150b52c7092dc6b8f2fe4d80f0f3bf0416d2f269193e347e24702
+      - type: file
+        url: https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.22.0/microsoft.ml.onnxruntime.1.22.0.nupkg
+        sha256: d571e63a2329baacb713f441e65ad75284de354db6e1ac435fe4bebbb417986a
+        dest-filename: ort.nupkg
 
   - name: voice-changer
     buildsystem: simple

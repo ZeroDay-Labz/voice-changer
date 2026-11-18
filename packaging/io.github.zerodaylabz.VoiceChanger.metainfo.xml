@@ -63,9 +63,9 @@
   </supports>
   <content_rating type="oars-1.1" />
   <releases>
-    <release version="0.6.1" date="2026-11-17">
+    <release version="0.6.1" date="2026-11-18">
       <description>
-        <p>Restores the Flatpak, which 0.6.0 was published without.</p>
+        <p>Restores the Flatpak, which 0.6.0 was published without, and downloads ONNX Runtime from a source that still exists.</p>
       </description>
     </release>
     <release version="0.6.0" date="2026-11-17">

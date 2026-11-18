@@ -30,26 +30,70 @@ case "$MACHINE" in
     arm64) ARCH=aarch64 ;;
     *) echo "unsupported architecture $MACHINE" >&2; exit 1 ;;
 esac
-if [[ $CUDA == 1 ]]; then NAME="onnxruntime-linux-$ARCH-gpu-$VERSION"; else NAME="onnxruntime-linux-$ARCH-$VERSION"; fi
-URL="https://github.com/microsoft/onnxruntime/releases/download/v$VERSION/$NAME.tgz"
+# Microsoft's NuGet packages: plain zip files with the libraries in
+# runtimes/linux-*/native. (The GitHub release archives this used to fetch
+# went away with the repository in November 2026; the libraries in here are
+# byte for byte the same.) Checksums are for the version above; another
+# ORT_VERSION is downloaded unchecked.
+NUGET="https://api.nuget.org/v3-flatcontainer"
+case "$ARCH" in x64) RID=linux-x64 ;; *) RID=linux-arm64 ;; esac
+if [[ $CUDA == 1 ]]; then
+    if [[ "$ARCH" != x64 ]]; then
+        echo "Microsoft publishes the CUDA build of ONNX Runtime for x86_64 only." >&2
+        exit 1
+    fi
+    PKG=microsoft.ml.onnxruntime.gpu.linux
+    SUM=d3dabd8235b7a04a67838a3b93437420f1a709528a8d8611e08bedbb08206d1d
+else
+    PKG=microsoft.ml.onnxruntime
+    SUM=d571e63a2329baacb713f441e65ad75284de354db6e1ac435fe4bebbb417986a
+fi
+if [[ "$VERSION" != 1.22.0 ]]; then SUM=""; fi
+URL="$NUGET/$PKG/$VERSION/$PKG.$VERSION.nupkg"
 mkdir -p "$DIR"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+unpack_runtime() { # package, directory: the libraries for this machine
+    if command -v unzip >/dev/null; then
+        unzip -q -j -o "$1" "runtimes/$RID/native/*.so" -d "$2"
+    elif command -v python3 >/dev/null; then
+        python3 -c 'import os, sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+for n in z.namelist():
+    if n.startswith("runtimes/" + sys.argv[3] + "/native/") and n.endswith(".so"):
+        with open(os.path.join(sys.argv[2], os.path.basename(n)), "wb") as f:
+            f.write(z.read(n))' "$1" "$2" "$RID"
+    else
+        echo "unzip (or python3) is needed to unpack ONNX Runtime" >&2
+        return 1
+    fi
+}
 if [[ $CUDA == 1 && -f "$DIR/libonnxruntime.so.$VERSION" && -f "$DIR/libonnxruntime_providers_cuda.so" ]]; then
     # A second run only fetches what an interrupted first one left out.
     echo "ONNX Runtime $VERSION (CUDA): already in $DIR"
 else
     echo "downloading $URL"
-    curl -fL --progress-bar -o "$TMP/ort.tgz" "$URL"
-    tar -xzf "$TMP/ort.tgz" -C "$TMP"
+    curl -fL --retry 3 --progress-bar -o "$TMP/ort.zip" "$URL"
+    if [[ -n "$SUM" ]] && ! echo "$SUM  $TMP/ort.zip" | sha256sum -c --quiet -; then
+        echo "the download of ONNX Runtime is damaged (checksum mismatch); run this again" >&2
+        exit 1
+    fi
+    mkdir "$TMP/libs"
+    unpack_runtime "$TMP/ort.zip" "$TMP/libs"
+    rm -f "$TMP/ort.zip"
+    # The packages carry the library without its version; the app reads the
+    # version from the file name.
+    mv "$TMP/libs/libonnxruntime.so" "$TMP/libs/libonnxruntime.so.$VERSION"
+    chmod 755 "$TMP/libs"/*.so*
     if [[ $CUDA == 1 ]]; then
         # The CUDA provider is a separate library the runtime loads from its
         # own folder; without it the GPU can never be used.
-        cp "$TMP/$NAME/lib/libonnxruntime"*.so* "$DIR/"
+        cp "$TMP/libs"/libonnxruntime*.so* "$DIR/"
     else
-        cp "$TMP/$NAME/lib/libonnxruntime.so"* "$DIR/"
+        cp "$TMP/libs/libonnxruntime.so.$VERSION" "$DIR/"
     fi
 fi
+ln -sf "libonnxruntime.so.$VERSION" "$DIR/libonnxruntime.so.1" 2>/dev/null || true
 ln -sf "libonnxruntime.so.$VERSION" "$DIR/libonnxruntime.so" 2>/dev/null || true
 if [[ $CUDA != 1 ]]; then
     echo "ONNX Runtime $VERSION installed in $DIR"

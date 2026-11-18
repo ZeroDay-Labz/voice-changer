@@ -38,7 +38,7 @@ serde = { workspace = true }
 ron = { workspace = true }
 # Remote control over a local socket (Windows; Linux uses D-Bus).
 interprocess = "2.4.8"
-rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 
 # Linux: native PipeWire (virtual microphone, routing), tray, portal hotkey,
 # D-Bus remote control.

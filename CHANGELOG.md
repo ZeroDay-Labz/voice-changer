@@ -3,6 +3,13 @@
 All notable changes to Voice Changer are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.1] - 2026-11-17
+
+### Fixed
+- **The Flatpak is back.** 0.6.0 was published without it: a library added for the file
+  dialogs needed a newer Rust than the Flatpak build environment has. It is pinned to a
+  version that builds there. Nothing else changed.
+
 ## [0.6.0] - 2026-11-17
 
 The interface was reworked for people who are not audio engineers, and there is a first

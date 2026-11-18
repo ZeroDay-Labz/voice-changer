@@ -63,6 +63,11 @@
   </supports>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.6.1" date="2026-11-17">
+      <description>
+        <p>Restores the Flatpak, which 0.6.0 was published without.</p>
+      </description>
+    </release>
     <release version="0.6.0" date="2026-11-17">
       <description>
         <p>A reworked interface: level meters with a scale and a clip warning, a Mute button and shortcut, an output picker, presets you can rename, update, share and import, first steps that tick themselves off, plain-language labels, and problems explained next to the button that fixes them. The delay shown now includes the AI voice. Scrolling a page no longer changes controls. NVIDIA set-up needs only the driver. There is also a first Windows version.</p>
